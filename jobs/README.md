@@ -9,6 +9,10 @@
 - 모든 Job은 필수 필드(`name`, `description`, `schedule`, `trigger`, `input`, `steps`, `output`, `tools`, `model`, `safety`, `status`)를 포함해야 합니다.
 - 검증: `scripts/examples/validate-job-registry.sh`
 
+## 카탈로그
+
+- 2026-05-12 기준 생성/정리된 9개 Job 설명: [docs/11-job-registry-catalog-2026-05-12.md](../docs/11-job-registry-catalog-2026-05-12.md)
+
 ## 분류
 
 - `daily/`
@@ -16,3 +20,4 @@
 - `monitoring/`
 - `research/`
 - `maintenance/`
+- `examples/` — 공개용 draft 예시 Job

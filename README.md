@@ -23,7 +23,7 @@
 
 ## 문서 목차
 
-Canonical 문서는 아래 00~10 세트입니다. 과거 초안/보조 문서는 `docs/archive/`에 보존합니다.
+Canonical 문서는 아래 00~10 세트입니다. 2026-05-12 Job Registry 카탈로그는 11번 문서로 함께 제공합니다. 과거 초안/보조 문서는 `docs/archive/`에 보존합니다.
 
 1. [Overview](docs/00-overview.md)
 2. [Architecture](docs/01-architecture.md)
@@ -36,6 +36,7 @@ Canonical 문서는 아래 00~10 세트입니다. 과거 초안/보조 문서는
 9. [Provider Routing](docs/08-provider-routing.md)
 10. [Delegation](docs/09-delegation.md)
 11. [Operation Guide](docs/10-operation-guide.md)
+12. [Job Registry 카탈로그 (2026-05-12)](docs/11-job-registry-catalog-2026-05-12.md)
 
 ## 디렉터리
 
@@ -52,6 +53,8 @@ skills/      공개용 skill 예시
 ## Job Registry 방식
 
 이 저장소의 `jobs/`는 사람이 수동으로만 YAML을 추가하는 폴더가 아닙니다. 운영자는 Hermes에게 “매주 GitHub 요약 Job을 추가해줘”처럼 요청하고, Hermes가 `prompts/workflows/add-job-to-repo.md` 절차에 따라 적절한 하위 디렉터리에 YAML을 생성/수정합니다. 변경 전후에는 secret scan과 schema validation을 수행합니다.
+
+- 2026-05-12 기준 생성/정리된 9개 Job 설명: [Job Registry 카탈로그](docs/11-job-registry-catalog-2026-05-12.md)
 
 ## 보안 원칙
 
