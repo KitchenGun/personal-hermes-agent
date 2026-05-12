@@ -1,0 +1,13 @@
+flowchart TD
+  D[Discord / Webhook / API Event] --> A[Gateway Auth and Scope Check]
+  A --> C[Command Classification]
+  C -->|general_question| H[Hermes Chat]
+  C -->|run_job| J[Load Job Registry Item]
+  C -->|add_or_update_job_registry| W[Add Job Workflow]
+  C -->|delegate| X[Delegated Agent]
+  C -->|unsafe| R[Reject or Ask for Scope]
+  H --> O[Sanitized Response]
+  J --> O
+  W --> V[Validate + Secret Scan]
+  V --> O
+  X --> O

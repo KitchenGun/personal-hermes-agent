@@ -1,0 +1,23 @@
+name: repo_health_check
+description: "Check repository hygiene, documentation freshness, and sanitized-publication rules."
+schedule: "0 10 * * 1"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repository_path: "<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>"
+steps:
+  - "Run secret scan script."
+  - "Validate Job Registry required fields."
+  - "Check git status and stale documentation notes."
+output:
+  destination: "<YOUR_MAINTENANCE_CHANNEL>"
+  format: markdown
+tools:
+  - shell
+  - git
+model: "${HERMES_CODING_MODEL}"
+safety:
+  write_access: "report-only-by-default"
+  secrets: "fail-on-detection"
+status: enabled

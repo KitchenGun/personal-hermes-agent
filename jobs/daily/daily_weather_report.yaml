@@ -1,0 +1,22 @@
+name: daily_weather_report
+description: "Collect a sanitized daily weather summary for the configured location placeholder."
+schedule: "0 7 * * *"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  location: "<YOUR_CITY_OR_REGION>"
+steps:
+  - "Fetch public weather information from an approved source."
+  - "Summarize temperature, precipitation, and notable alerts."
+  - "Remove exact personal location details before output."
+output:
+  destination: "<YOUR_DAILY_REPORT_CHANNEL>"
+  format: markdown
+tools:
+  - web_fetch
+model: "${HERMES_FAST_MODEL}"
+safety:
+  secrets: "do-not-include"
+  pii: "coarsen-location"
+status: enabled

@@ -1,0 +1,14 @@
+flowchart TD
+  U[User / Discord / API] --> G[Gateway]
+  G --> H[Hermes Core]
+  H --> PR[Provider Router]
+  H --> JR[Job Registry jobs/**/*.yaml]
+  H --> SK[Skills]
+  H --> T[Tools]
+  H --> M[Memory Candidate Pipeline]
+  C[Cron Runner] --> JR
+  C --> H
+  JR --> V[Registry Validator]
+  M --> A[User Approval]
+  A --> MS[(Private Memory Store - not in repo)]
+  T --> O[Sanitized Outputs]

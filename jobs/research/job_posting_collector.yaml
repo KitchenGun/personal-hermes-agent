@@ -1,0 +1,25 @@
+name: job_posting_collector
+description: "Collect public job postings matching configured role and location placeholders."
+schedule: "0 8 * * 2,4"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  roles:
+    - "<YOUR_TARGET_ROLE>"
+  regions:
+    - "<YOUR_TARGET_REGION>"
+steps:
+  - "Search approved public job sources."
+  - "Filter by role, seniority, and remote preference placeholders."
+  - "Summarize title, company, location, and link."
+output:
+  destination: "<YOUR_JOB_ALERT_CHANNEL>"
+  format: markdown
+tools:
+  - web_search
+model: "${HERMES_FAST_MODEL}"
+safety:
+  sources: "public-only"
+  pii: "do-not-infer"
+status: enabled

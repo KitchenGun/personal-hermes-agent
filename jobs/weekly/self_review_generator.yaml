@@ -1,0 +1,23 @@
+name: self_review_generator
+description: "Generate a weekly self-review from sanitized task summaries and completed Job outputs."
+schedule: "0 20 * * 0"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  sources:
+    - "<YOUR_SANITIZED_TASK_SUMMARY_SOURCE>"
+steps:
+  - "Aggregate completed work summaries."
+  - "Identify wins, blockers, and next actions."
+  - "Separate memory candidates from immediate tasks."
+output:
+  destination: "<YOUR_SELF_REVIEW_CHANNEL>"
+  format: markdown
+tools:
+  - file_read
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  memory: "candidate-only"
+  pii: "redact"
+status: enabled

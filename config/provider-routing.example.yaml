@@ -1,0 +1,18 @@
+routing:
+  default: "${HERMES_REASONING_MODEL}"
+  rules:
+    - match: "simple_summary"
+      model: "${HERMES_FAST_MODEL}"
+      reason: "low-latency summary work"
+    - match: "research_digest"
+      model: "${HERMES_RESEARCH_MODEL}"
+      reason: "source-aware public research"
+    - match: "code_or_repo_change"
+      model: "${HERMES_CODING_MODEL}"
+      reason: "file edits, validation, git status"
+    - match: "delegation_or_planning"
+      model: "${HERMES_REASONING_MODEL}"
+      reason: "multi-step reasoning"
+safety:
+  disallow_secret_training_data: true
+  require_placeholder_public_configs: true

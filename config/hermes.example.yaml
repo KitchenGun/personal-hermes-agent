@@ -1,0 +1,37 @@
+profile: public-sanitized-hermes
+runtime:
+  timezone: "${HERMES_TIMEZONE}"
+  default_model: "${HERMES_DEFAULT_MODEL}"
+  mode: "profile-example"
+security:
+  publishable: true
+  secrets_policy: "placeholders-only"
+  forbidden_paths:
+    - ".env"
+    - "memory/"
+    - "logs/"
+    - "sessions/"
+    - "db/"
+job_registry:
+  root: "jobs"
+  add_workflow_prompt: "prompts/workflows/add-job-to-repo.md"
+  required_fields:
+    - name
+    - description
+    - schedule
+    - trigger
+    - input
+    - steps
+    - output
+    - tools
+    - model
+    - safety
+    - status
+gateway:
+  discord:
+    enabled: true
+    token_env: "DISCORD_BOT_TOKEN"
+    default_channel_id: "<YOUR_DISCORD_CHANNEL_ID>"
+memory:
+  extraction_prompt: "prompts/workflows/memory-extraction.md"
+  write_policy: "user-approval-required"

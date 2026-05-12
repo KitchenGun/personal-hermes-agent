@@ -1,0 +1,24 @@
+name: weekly_github_summary
+description: "Summarize weekly GitHub activity for configured public or authorized repositories."
+schedule: "0 18 * * 5"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repositories:
+    - "<YOUR_REPOSITORY_SLUG>"
+steps:
+  - "Collect commits, pull requests, issues, and releases for the week."
+  - "Group changes by repository and theme."
+  - "Highlight follow-up tasks without exposing private tokens."
+output:
+  destination: "<YOUR_WEEKLY_SUMMARY_CHANNEL>"
+  format: markdown
+tools:
+  - github_api
+  - git
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  secrets: "redact"
+  private_repos: "authorized-only"
+status: enabled

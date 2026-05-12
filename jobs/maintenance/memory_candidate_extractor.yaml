@@ -1,0 +1,23 @@
+name: memory_candidate_extractor
+description: "Extract candidate long-term memories from sanitized summaries for user approval."
+schedule: "0 21 * * *"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  source: "<YOUR_SANITIZED_SUMMARY_SOURCE>"
+steps:
+  - "Read sanitized summaries only."
+  - "Identify durable preferences, facts, and recurring project context."
+  - "Reject secrets, transient facts, and private identifiers."
+  - "Emit candidates for explicit user approval."
+output:
+  destination: "<YOUR_MEMORY_REVIEW_CHANNEL>"
+  format: yaml
+tools:
+  - file_read
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  approval: "required-before-write"
+  secrets: "reject"
+status: enabled

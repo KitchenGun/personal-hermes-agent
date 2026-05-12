@@ -1,0 +1,11 @@
+flowchart TD
+  R[User asks Hermes to add/update Job] --> P[Parse requirements]
+  P --> W[Use prompts/workflows/add-job-to-repo.md]
+  W --> Y[Create or update jobs/category/name.yaml]
+  Y --> F[Check required fields]
+  F --> S[Secret scan]
+  S --> D[Show diff/status to user]
+  C[Cron Runner] --> L[Load enabled registry Jobs]
+  L --> E[Execute via Job Prompt]
+  E --> O[Output sanitized result]
+  E --> M[Emit memory candidates only]

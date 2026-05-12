@@ -1,0 +1,25 @@
+name: ai_trend_collector
+description: "Collect public AI trend headlines and produce a short research digest."
+schedule: "0 9 * * 1,3,5"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  topics:
+    - "AI agents"
+    - "model routing"
+    - "developer tools"
+steps:
+  - "Search approved public sources."
+  - "Deduplicate overlapping stories."
+  - "Summarize trends with source links."
+output:
+  destination: "<YOUR_RESEARCH_DIGEST_CHANNEL>"
+  format: markdown
+tools:
+  - web_search
+model: "${HERMES_RESEARCH_MODEL}"
+safety:
+  sources: "public-only"
+  claims: "cite-sources"
+status: enabled

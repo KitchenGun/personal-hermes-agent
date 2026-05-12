@@ -1,0 +1,10 @@
+flowchart TB
+  PublicRepo[Public Repo: personal-hermes-agent] --> Docs[Docs / Examples / Templates]
+  PrivateRuntime[Private Runtime] --> Secrets[Secrets]
+  PrivateRuntime --> Sessions[Sessions]
+  PrivateRuntime --> Logs[Logs]
+  PrivateRuntime --> DB[DB / Gateway State]
+  Docs -. no copy .- Secrets
+  Docs -. no copy .- Sessions
+  Docs -. no copy .- Logs
+  Docs -. no copy .- DB

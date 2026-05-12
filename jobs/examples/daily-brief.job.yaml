@@ -1,0 +1,29 @@
+name: daily-brief-example
+description: Daily briefing example that summarizes calendar, task, and weather inputs without exposing personal data.
+schedule: "0 9 * * *"
+trigger: cron
+input:
+  sources:
+    - example-calendar-feed
+    - example-task-list
+    - example-weather-provider
+  privacy: use_synthetic_or_redacted_inputs_only
+steps:
+  - collect_allowed_sources
+  - summarize_today
+  - produce_markdown_brief
+output:
+  format: markdown
+  path: artifacts/public/daily-brief-example.md
+tools:
+  - web
+  - calendar
+  - file
+model:
+  provider: <YOUR_PROVIDER>
+  name: <YOUR_SUMMARY_MODEL>
+safety:
+  network: disabled_by_default
+  pii_policy: synthesize_or_redact
+  secrets: never_print
+status: draft

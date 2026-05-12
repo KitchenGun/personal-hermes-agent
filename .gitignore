@@ -1,0 +1,50 @@
+# Runtime and local secrets
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+secrets/
+private/
+
+# Hermes runtime state (never publish)
+.hermes-state/
+.gateway-state/
+.memory/
+memory/
+logs/
+sessions/
+db/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Python / Node / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Credential/key material
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+oauth*.json
+credentials*.json
+token*.json
+auth.json
+google_token.json
+google_client_secret.json

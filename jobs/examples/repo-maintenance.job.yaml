@@ -1,0 +1,30 @@
+name: repo-maintenance-example
+description: Manual repository maintenance check for docs links, example config validity, and secret hygiene.
+schedule: manual
+trigger: manual
+input:
+  repository_path: ./
+  checks:
+    - docs_links
+    - secret_scan
+    - example_config_validation
+steps:
+  - inspect_file_tree
+  - run_secret_scan
+  - validate_job_registry
+  - write_public_report
+output:
+  format: markdown
+  path: artifacts/public/repo-maintenance-report.md
+tools:
+  - terminal
+  - file
+  - git
+model:
+  provider: <YOUR_PROVIDER>
+  name: <YOUR_REVIEW_MODEL>
+safety:
+  writes: require_review
+  secrets: fail_on_detection
+  destructive_commands: forbidden
+status: draft
