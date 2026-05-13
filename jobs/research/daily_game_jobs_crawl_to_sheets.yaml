@@ -1,0 +1,28 @@
+name: daily_game_jobs_crawl_to_sheets
+description: "Collect public game-industry job postings and append newly seen sanitized records to a spreadsheet placeholder."
+schedule: "0 8 * * *"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  job_sources:
+    - "<YOUR_PUBLIC_JOB_SOURCE>"
+  canonical_output: "<YOUR_CANONICAL_JOB_POSTINGS_SOURCE>"
+  spreadsheet_target: "<YOUR_SPREADSHEET_TARGET>"
+steps:
+  - "Crawl approved public job posting sources."
+  - "Normalize title, company, location, role category, and public link."
+  - "Compare with the canonical seen-postings source to avoid duplicates."
+  - "Append newly seen public postings to the spreadsheet target placeholder."
+output:
+  destination: "<YOUR_JOB_PIPELINE_STATUS_CHANNEL>"
+  format: markdown
+tools:
+  - web_fetch
+  - sheets_append
+model: "${HERMES_FAST_MODEL}"
+safety:
+  sources: "public-postings-only"
+  secrets: "do-not-include-sheet-ids-or-api-keys"
+  pii: "do-not-collect-applicant-data"
+status: enabled

@@ -1,0 +1,27 @@
+name: mail_notify_discord
+description: "Poll approved mailbox placeholders and send sanitized new-mail notifications to a configured channel placeholder."
+schedule: "every 5m"
+trigger:
+  type: interval
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  mailbox_sources:
+    - "<YOUR_MAILBOX_SOURCE>"
+  dedupe_state: "<YOUR_DEDUPLICATION_STATE_PATH>"
+steps:
+  - "Check approved mailbox sources for new messages."
+  - "Deduplicate messages using a sanitized local state reference."
+  - "Summarize sender label, subject, and received time without exposing message body secrets."
+  - "Send a notification to the configured delivery channel placeholder."
+output:
+  destination: "<YOUR_MAIL_NOTIFICATION_CHANNEL>"
+  format: markdown
+tools:
+  - mail_read
+  - notification_send
+model: "${HERMES_FAST_MODEL}"
+safety:
+  sources: "approved-mailboxes-only"
+  secrets: "redact-message-bodies-and-credentials"
+  pii: "do-not-expand-recipient-identities"
+status: enabled

@@ -1,0 +1,23 @@
+name: daily_calendar_briefing
+description: "Create a sanitized daily calendar briefing from an approved calendar source placeholder."
+schedule: "30 7 * * *"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  calendar_source: "<YOUR_CALENDAR_SOURCE>"
+  date_window: "today"
+steps:
+  - "Read events from the approved calendar source placeholder."
+  - "Summarize time, title, and preparation notes without exposing private attendee details."
+  - "Redact private locations, meeting links, and personal identifiers."
+output:
+  destination: "<YOUR_DAILY_BRIEFING_CHANNEL>"
+  format: markdown
+tools:
+  - calendar_read
+model: "${HERMES_FAST_MODEL}"
+safety:
+  secrets: "do-not-include"
+  pii: "redact-attendees-and-private-locations"
+status: enabled

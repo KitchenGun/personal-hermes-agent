@@ -1,6 +1,6 @@
 name: daily_weather_report
 description: "Collect a sanitized daily weather summary for the configured location placeholder."
-schedule: "0 7 * * *"
+schedule: "0 8 * * *"
 trigger:
   type: cron
   timezone: "${HERMES_TIMEZONE}"

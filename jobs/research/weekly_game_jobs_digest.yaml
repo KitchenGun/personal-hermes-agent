@@ -1,0 +1,27 @@
+name: weekly_game_jobs_digest
+description: "Generate a sanitized weekly digest of public game-industry job postings that match configured profile placeholders."
+schedule: "0 9 * * 1"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  canonical_postings: "<YOUR_CANONICAL_JOB_POSTINGS_SOURCE>"
+  target_profile: "<YOUR_TARGET_ROLE_PROFILE>"
+  regions:
+    - "<YOUR_TARGET_REGION>"
+steps:
+  - "Read the approved canonical postings source."
+  - "Filter postings by role, seniority, technology, and region placeholders."
+  - "Group matches by company, role type, and application priority."
+  - "Produce a weekly digest with links to public postings only."
+output:
+  destination: "<YOUR_WEEKLY_JOB_DIGEST_CHANNEL>"
+  format: markdown
+tools:
+  - file_read
+  - notification_send
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  sources: "public-postings-only"
+  pii: "do-not-infer-candidate-private-data"
+status: enabled
