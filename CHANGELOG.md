@@ -2,11 +2,11 @@
 
 ## Unreleased
 
+- 날짜별 Job Registry 카탈로그를 `docs/job-registry.md` 단일 기준 문서로 통합.
+- README에 현재 Orchestrator / Profile 구조를 추가하고 `config/hermes.example.yaml`, architecture 문서, gateway/job registry 경계를 연결.
 - 2026-05-13 기준 추가 Job 4개(`daily_calendar_briefing`, `mail_notify_discord`, `daily_game_jobs_crawl_to_sheets`, `weekly_game_jobs_digest`)를 sanitized Job Registry 예시로 반영.
 - `daily_weather_report` 공개 schedule을 매일 08:00 기준으로 갱신.
-- 최신 Job Registry 카탈로그 문서(`docs/12-job-registry-catalog-2026-05-13.md`) 추가.
-- 2026-05-12 기준 Job Registry 항목 9개를 설명하는 한글 카탈로그 문서(`docs/11-job-registry-catalog-2026-05-12.md`) 추가.
-- README와 jobs README에서 Job Registry 카탈로그 링크를 문서 목차와 Job Registry 방식/카탈로그 섹션에 노출.
+- README, docs/02-jobs.md, jobs README에서 Job Registry 카탈로그 링크를 단일 기준 문서로 연결.
 - 공개용 sanitized Hermes 운영 프로필 저장소로 재구성.
 - 요청된 docs 파일명(`00-overview.md` ~ `10-operation-guide.md`) 추가.
 - Hermes 대화 기반 Job Registry 구조와 예시 Job YAML 추가.
