@@ -37,5 +37,5 @@
 
 ## 공개 카탈로그
 
-- Job Registry 카탈로그: 현재 공개 저장소에 반영된 13개 Job을 설명하는 [docs/job-registry.md](job-registry.md)
+- Job Registry 카탈로그: 현재 공개 저장소에 반영된 14개 Job을 설명하는 [docs/job-registry.md](job-registry.md)
 - 카탈로그는 실제 token, OAuth secret, Discord ID, 로그, 세션, DB, gateway state, 개인 메모리 원문을 포함하지 않고 placeholder/sanitized 예시만 설명합니다.

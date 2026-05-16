@@ -1,0 +1,38 @@
+name: workout_automation_safeguards
+description: "Model the approval and write-safety boundary for future workout scheduling automation."
+schedule: manual
+trigger:
+  type: command
+  commands:
+    - "/workout confirm <token>"
+    - "/workout deny <token>"
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  spreadsheet_url: "<YOUR_WORKOUT_SPREADSHEET_URL>"
+  sheet_range: "<YOUR_WORKOUT_SHEET_RANGE>"
+  calendar_id: "<YOUR_WORKOUT_CALENDAR_ID>"
+  pending_plan_source: "<YOUR_PENDING_WORKOUT_PLAN_SOURCE>"
+steps:
+  - "Generate a pending workout plan with a high-entropy confirmation token."
+  - "Ignore free-text approval such as ordinary yes/confirm messages."
+  - "Accept only deterministic token commands: /workout confirm <token> or /workout deny <token>."
+  - "Resolve Google Sheets gid through sheet metadata to a quoted A1 range."
+  - "Fail closed when gid, sheet metadata, token, or pending plan state is missing."
+  - "Refuse Google Calendar writes unless the pending plan is explicitly confirmed."
+  - "Use deterministic Hermes event IDs plus hermes_marker and spec_hash for idempotent calendar upsert."
+output:
+  destination: "<YOUR_WORKOUT_REVIEW_CHANNEL>"
+  format: markdown
+tools:
+  - sheets_read
+  - calendar_write
+  - notification_send
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  confirmation: "token-command-required"
+  token_entropy: "128-bit-minimum"
+  calendar_write: "confirmed-plan-only"
+  idempotency: "deterministic-event-id-and-spec-hash"
+  sheets_gid: "metadata-resolved-fail-closed"
+  secrets: "do-not-include-google-or-discord-secrets"
+status: enabled

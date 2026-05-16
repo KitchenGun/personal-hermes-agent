@@ -21,6 +21,7 @@
 | 11 | `weekly_github_summary` | [`jobs/weekly/weekly_github_summary.yaml`](../jobs/weekly/weekly_github_summary.yaml) | weekly | 매주 금요일 18:00 | enabled | 허가된 저장소의 커밋, PR, 이슈, 릴리스를 주간 요약합니다. |
 | 12 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
 | 13 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
+| 14 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
 
 ## 항목별 설명
 
@@ -128,6 +129,14 @@
 - **주요 단계**: 파일 트리 점검, secret scan 실행, Job Registry 검증, 공개 리포트 작성.
 - **출력**: `artifacts/public/repo-maintenance-report.md` 경로 예시.
 - **안전 기준**: 쓰기는 review 필요, secret 탐지 시 실패, destructive command 금지.
+
+### `workout_automation_safeguards`
+
+- **목적**: 운동 일정 자동화처럼 Calendar write가 포함될 수 있는 workflow를 명시적 확인 토큰 뒤에만 실행하도록 모델링합니다.
+- **입력**: `<YOUR_WORKOUT_SPREADSHEET_URL>`, `<YOUR_WORKOUT_SHEET_RANGE>`, `<YOUR_WORKOUT_CALENDAR_ID>`, `<YOUR_PENDING_WORKOUT_PLAN_SOURCE>` placeholder.
+- **주요 단계**: 고엔트로피 확인 토큰 생성, `/workout confirm <token>` 또는 `/workout deny <token>`만 승인 명령으로 인정, Google Sheets `gid` metadata 해석, 확인되지 않은 Calendar write 차단, deterministic event ID와 `hermes_marker`/`spec_hash` 기반 upsert.
+- **출력**: `<YOUR_WORKOUT_REVIEW_CHANNEL>` placeholder 대상으로 승인 대기 또는 결과 markdown 생성.
+- **안전 기준**: free-text 승인은 무시하고, token/gid/pending plan 상태가 없으면 fail-closed 처리하며, Google/Discord secret은 공개 예시에 포함하지 않습니다.
 
 ## 운영 메모
 
