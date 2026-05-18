@@ -1,0 +1,27 @@
+name: reuse_first_audit
+description: "Audit recent work for missed reuse opportunities before adding more custom code."
+schedule: "0 17 * * 5"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repository: "<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>"
+  lookback: "7d"
+steps:
+  - "Review recent commits, changed docs, and changed jobs."
+  - "Identify new code or workflows that may duplicate existing local patterns."
+  - "Check whether relevant skills, MCP tools, official docs, or public implementations were considered."
+  - "Flag only actionable reuse opportunities with low security and licensing risk."
+  - "Emit a short report with keep, replace, or investigate recommendations."
+output:
+  destination: "<YOUR_MAINTENANCE_CHANNEL>"
+  format: markdown
+tools:
+  - git
+  - file_read
+  - web_search
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  approval: "report-only"
+  secrets: "redact"
+status: enabled

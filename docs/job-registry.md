@@ -11,17 +11,18 @@
 | 1 | `daily_calendar_briefing` | [`jobs/daily/daily_calendar_briefing.yaml`](../jobs/daily/daily_calendar_briefing.yaml) | daily | 매일 07:30 | enabled | 승인된 캘린더 소스 placeholder에서 당일 일정을 읽어 private 세부 정보를 제거한 브리핑을 만듭니다. |
 | 2 | `daily_weather_report` | [`jobs/daily/daily_weather_report.yaml`](../jobs/daily/daily_weather_report.yaml) | daily | 매일 08:00 | enabled | 공개 날씨 정보를 요약해 일일 리포트 채널 placeholder로 전달합니다. |
 | 3 | `memory_candidate_extractor` | [`jobs/maintenance/memory_candidate_extractor.yaml`](../jobs/maintenance/memory_candidate_extractor.yaml) | maintenance | 매일 21:00 | enabled | sanitized 요약에서 장기 기억 후보를 추출하고 승인 전 쓰기를 금지합니다. |
-| 4 | `mail_notify_discord` | [`jobs/monitoring/mail_notify_discord.yaml`](../jobs/monitoring/mail_notify_discord.yaml) | monitoring | 5분 간격 | enabled | 승인된 메일함 placeholder를 점검해 새 메일 알림을 sanitized 형태로 전달합니다. |
-| 5 | `repo_health_check` | [`jobs/monitoring/repo_health_check.yaml`](../jobs/monitoring/repo_health_check.yaml) | monitoring | 매주 월요일 10:00 | enabled | secret scan, Job Registry 필드 검증, 문서 신선도를 점검합니다. |
-| 6 | `ai_trend_collector` | [`jobs/research/ai_trend_collector.yaml`](../jobs/research/ai_trend_collector.yaml) | research | 월/수/금 09:00 | enabled | 공개 AI 트렌드 자료를 수집·중복 제거·출처 포함 요약합니다. |
-| 7 | `daily_game_jobs_crawl_to_sheets` | [`jobs/research/daily_game_jobs_crawl_to_sheets.yaml`](../jobs/research/daily_game_jobs_crawl_to_sheets.yaml) | research | 매일 08:00 | enabled | 공개 게임 업계 채용 소스를 수집해 새 항목을 spreadsheet placeholder에 추가합니다. |
-| 8 | `job_posting_collector` | [`jobs/research/job_posting_collector.yaml`](../jobs/research/job_posting_collector.yaml) | research | 화/목 08:00 | enabled | 역할·지역 placeholder에 맞는 공개 채용 정보를 요약합니다. |
-| 9 | `weekly_game_jobs_digest` | [`jobs/research/weekly_game_jobs_digest.yaml`](../jobs/research/weekly_game_jobs_digest.yaml) | research | 매주 월요일 09:00 | enabled | 정제된 공개 게임 업계 채용 목록에서 주간 매칭 digest를 생성합니다. |
-| 10 | `self_review_generator` | [`jobs/weekly/self_review_generator.yaml`](../jobs/weekly/self_review_generator.yaml) | weekly | 매주 일요일 20:00 | enabled | 주간 작업 요약에서 성과, 막힘, 다음 행동을 정리합니다. |
-| 11 | `weekly_github_summary` | [`jobs/weekly/weekly_github_summary.yaml`](../jobs/weekly/weekly_github_summary.yaml) | weekly | 매주 금요일 18:00 | enabled | 허가된 저장소의 커밋, PR, 이슈, 릴리스를 주간 요약합니다. |
-| 12 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
-| 13 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
-| 14 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
+| 4 | `reuse_first_audit` | [`jobs/maintenance/reuse_first_audit.yaml`](../jobs/maintenance/reuse_first_audit.yaml) | maintenance | 매주 금요일 17:00 | enabled | 최근 작업에서 기존 코드, skill, MCP, 공식 문서, 공개 구현 재사용 기회를 놓쳤는지 점검합니다. |
+| 5 | `mail_notify_discord` | [`jobs/monitoring/mail_notify_discord.yaml`](../jobs/monitoring/mail_notify_discord.yaml) | monitoring | 5분 간격 | enabled | 승인된 메일함 placeholder를 점검해 새 메일 알림을 sanitized 형태로 전달합니다. |
+| 6 | `repo_health_check` | [`jobs/monitoring/repo_health_check.yaml`](../jobs/monitoring/repo_health_check.yaml) | monitoring | 매주 월요일 10:00 | enabled | secret scan, Job Registry 필드 검증, 문서 신선도를 점검합니다. |
+| 7 | `ai_trend_collector` | [`jobs/research/ai_trend_collector.yaml`](../jobs/research/ai_trend_collector.yaml) | research | 월/수/금 09:00 | enabled | 공개 AI 트렌드 자료를 수집·중복 제거·출처 포함 요약합니다. |
+| 8 | `daily_game_jobs_crawl_to_sheets` | [`jobs/research/daily_game_jobs_crawl_to_sheets.yaml`](../jobs/research/daily_game_jobs_crawl_to_sheets.yaml) | research | 매일 08:00 | enabled | 공개 게임 업계 채용 소스를 수집해 새 항목을 spreadsheet placeholder에 추가합니다. |
+| 9 | `job_posting_collector` | [`jobs/research/job_posting_collector.yaml`](../jobs/research/job_posting_collector.yaml) | research | 화/목 08:00 | enabled | 역할·지역 placeholder에 맞는 공개 채용 정보를 요약합니다. |
+| 10 | `weekly_game_jobs_digest` | [`jobs/research/weekly_game_jobs_digest.yaml`](../jobs/research/weekly_game_jobs_digest.yaml) | research | 매주 월요일 09:00 | enabled | 정제된 공개 게임 업계 채용 목록에서 주간 매칭 digest를 생성합니다. |
+| 11 | `self_review_generator` | [`jobs/weekly/self_review_generator.yaml`](../jobs/weekly/self_review_generator.yaml) | weekly | 매주 일요일 20:00 | enabled | 주간 작업 요약에서 성과, 막힘, 다음 행동을 정리합니다. |
+| 12 | `weekly_github_summary` | [`jobs/weekly/weekly_github_summary.yaml`](../jobs/weekly/weekly_github_summary.yaml) | weekly | 매주 금요일 18:00 | enabled | 허가된 저장소의 커밋, PR, 이슈, 릴리스를 주간 요약합니다. |
+| 13 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
+| 14 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
+| 15 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
 
 ## 항목별 설명
 
@@ -49,6 +50,14 @@
 - **주요 단계**: 정제 요약만 읽기, durable preference/fact/context 식별, secret·일시적 사실·개인 식별자 거부, 사용자 승인용 후보 출력.
 - **출력**: `<YOUR_MEMORY_REVIEW_CHANNEL>` placeholder 대상으로 YAML 형식 후보 제공.
 - **안전 기준**: 승인 전 메모리 쓰기 금지, secret 후보 즉시 거부.
+
+### `reuse_first_audit`
+
+- **목적**: 최근 작업에서 기존 구현, skill, MCP tool, 공식 문서, 공개 구현을 재사용할 기회를 놓쳤는지 점검합니다.
+- **입력**: `<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>` placeholder와 최근 7일 변경 범위.
+- **주요 단계**: 최근 변경 검토, 중복 구현 후보 식별, 사용 가능한 재사용 경로 확인, 실행 가능한 권고만 보고.
+- **출력**: `<YOUR_MAINTENANCE_CHANNEL>` placeholder 대상으로 markdown 리포트 생성.
+- **안전 기준**: report-only로 동작하며 secret은 redact합니다.
 
 ### `mail_notify_discord`
 
