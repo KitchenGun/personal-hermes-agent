@@ -12,9 +12,12 @@ skills/
     code-review-skill/SKILL.md
 ```
 
+Hermes에서 실제 탐색 대상이 되려면 `~/.hermes/config.yaml`의 `skills.external_dirs`에 이 저장소의 `skills/` 경로를 추가합니다.
+
 ## 작성 원칙
 
 - 명확한 목적, 입력, 단계, 출력, 안전 제한을 포함합니다.
+- `SKILL.md`에는 `name`, `description`, `version`, `metadata.hermes.category` frontmatter를 둡니다.
 - 실제 credential이나 private endpoint는 포함하지 않습니다.
 - Job에서 필요한 경우 `tools`와 함께 참조합니다.
 

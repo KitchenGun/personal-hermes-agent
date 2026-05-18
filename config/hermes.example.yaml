@@ -35,3 +35,6 @@ gateway:
 memory:
   extraction_prompt: "prompts/workflows/memory-extraction.md"
   write_policy: "user-approval-required"
+skills:
+  external_dirs:
+    - "${HERMES_EXTERNAL_SKILLS_DIR}"

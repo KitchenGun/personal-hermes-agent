@@ -1,3 +1,15 @@
+---
+name: reuse-first-implementation
+description: "Find local code, available tools, skills, official docs, and proven public implementations before writing new code."
+version: 1.0.0
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [reuse, implementation, research]
+    category: development
+    requires_toolsets: [file]
+---
+
 # Reuse-First Implementation Skill
 
 ## Purpose
