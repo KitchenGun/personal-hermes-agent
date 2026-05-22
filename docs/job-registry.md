@@ -20,9 +20,10 @@
 | 10 | `weekly_game_jobs_digest` | [`jobs/research/weekly_game_jobs_digest.yaml`](../jobs/research/weekly_game_jobs_digest.yaml) | research | 매주 월요일 09:00 | enabled | 정제된 공개 게임 업계 채용 목록에서 주간 매칭 digest를 생성합니다. |
 | 11 | `self_review_generator` | [`jobs/weekly/self_review_generator.yaml`](../jobs/weekly/self_review_generator.yaml) | weekly | 매주 일요일 20:00 | enabled | 주간 작업 요약에서 성과, 막힘, 다음 행동을 정리합니다. |
 | 12 | `weekly_github_summary` | [`jobs/weekly/weekly_github_summary.yaml`](../jobs/weekly/weekly_github_summary.yaml) | weekly | 매주 금요일 18:00 | enabled | 허가된 저장소의 커밋, PR, 이슈, 릴리스를 주간 요약합니다. |
-| 13 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
-| 14 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
-| 15 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
+| 13 | `weekly_hermes_agent_status_update` | [`jobs/weekly/weekly_hermes_agent_status_update.yaml`](../jobs/weekly/weekly_hermes_agent_status_update.yaml) | weekly | 매주 토요일 10:00 | enabled | 로컬 Hermes CLI와 ACP 상태를 점검하고 공개 안전 상태 문서를 갱신합니다. |
+| 14 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
+| 15 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
+| 16 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
 
 ## 항목별 설명
 
@@ -122,6 +123,14 @@
 - **주요 단계**: 한 주간 커밋·PR·이슈·릴리스 수집, 저장소와 주제별 그룹화, 토큰을 노출하지 않는 후속 작업 정리.
 - **출력**: `<YOUR_WEEKLY_SUMMARY_CHANNEL>` placeholder 대상으로 markdown 요약 제공.
 - **안전 기준**: secret은 redact하고, private repository는 승인된 범위에서만 다룹니다.
+
+### `weekly_hermes_agent_status_update`
+
+- **목적**: 로컬 Hermes Agent 상태와 ACP readiness를 매주 토요일 점검하고 공개 안전 상태 문서를 갱신합니다.
+- **입력**: `<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>`, `hermes`, `docs/12-current-hermes-status.md`.
+- **주요 단계**: `hermes --version` 실행, `hermes acp --check` 실행, update 상태 확인, raw local path 제거, 상태 문서 및 changelog 갱신.
+- **출력**: `<YOUR_MAINTENANCE_CHANNEL>` placeholder 대상으로 markdown 상태 요약 생성.
+- **안전 기준**: raw path, token, session, log, DB, gateway state는 저장하지 않고 secret scan과 Job Registry 검증 후에만 publish합니다.
 
 ### `daily-brief-example`
 

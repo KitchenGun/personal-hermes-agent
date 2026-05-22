@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 현재 Hermes Agent 상태 문서(`docs/12-current-hermes-status.md`)와 매주 토요일 갱신 Job(`weekly_hermes_agent_status_update`)을 추가.
 - 운동 일정 자동화 안전장치(`workout_automation_safeguards`)를 Job Registry에 추가하고, 확인 토큰·Sheets gid·Calendar upsert 안전 기준을 문서화.
 - 날짜별 Job Registry 카탈로그를 `docs/job-registry.md` 단일 기준 문서로 통합.
 - README에 현재 Orchestrator / Profile 구조를 추가하고 `config/hermes.example.yaml`, architecture 문서, gateway/job registry 경계를 연결.

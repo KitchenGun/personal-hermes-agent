@@ -1,0 +1,30 @@
+name: weekly_hermes_agent_status_update
+description: "Check the local Hermes Agent health and refresh the sanitized public status snapshot every Saturday."
+schedule: "0 10 * * 6"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repository_path: "<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>"
+  hermes_command: "hermes"
+  status_document: "docs/12-current-hermes-status.md"
+steps:
+  - "Run `hermes --version` and record only sanitized version/status fields."
+  - "Run `hermes acp --check` and record pass/fail without raw private paths."
+  - "Check whether Hermes reports up to date or requires an update."
+  - "Update the public status document and changelog with sanitized values only."
+  - "Run secret scan and Job Registry validation before committing."
+output:
+  destination: "<YOUR_MAINTENANCE_CHANNEL>"
+  format: markdown
+tools:
+  - shell
+  - git
+  - hermes_cli
+model: "${HERMES_CODING_MODEL}"
+safety:
+  secrets: "fail-on-detection"
+  local_paths: "replace-with-placeholders"
+  raw_logs: "do-not-persist"
+  write_access: "repository-docs-only"
+status: enabled
