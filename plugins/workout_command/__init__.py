@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import asyncio
 import datetime as dt
 import importlib.util
 import json
@@ -196,14 +197,18 @@ def pre_gateway_dispatch(event, gateway, session_store=None):
 
     cfg = load_config()
     if not _is_allowed_channel(event, cfg):
-        _schedule_send(
-            gateway,
-            source,
-            "이 `/workout` 명령은 지정된 운동기록 채널에서만 사용할 수 있습니다.",
-            reply_to=str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "") or None,
-        )
+        _schedule_event_response(event, gateway, "이 `/workout` 명령은 지정된 운동기록 채널에서만 사용할 수 있습니다.")
         return {"action": "skip", "reason": "workout_wrong_channel"}
 
+    try:
+        asyncio.get_running_loop().create_task(_handle_gateway_event(event, gateway, cfg))
+    except RuntimeError:
+        logger.warning("workout_command: no running event loop for gateway event")
+    return {"action": "skip", "reason": "workout_command"}
+
+
+async def _handle_gateway_event(event, gateway, cfg: WorkoutConfig) -> None:
+    source = event.source
     reply_to = str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "") or None
     context = {
         "platform": _platform_name(source),
@@ -211,29 +216,30 @@ def pre_gateway_dispatch(event, gateway, session_store=None):
         "user_id": str(getattr(source, "user_id", "") or ""),
         "reply_to": reply_to,
     }
+    text = getattr(event, "text", "") or ""
     if text.strip().startswith("/"):
         raw = re.sub(r"^/workout(?:\s+)?", "", text.strip(), flags=re.I)
-        response = handle_workout(raw, context=context, cfg=cfg)
+        response = await asyncio.to_thread(handle_workout, raw, context=context, cfg=cfg)
     else:
-        response = handle_routine_text(text, context=context, cfg=cfg)
-    _schedule_send(gateway, source, response, reply_to=reply_to)
-    return {"action": "skip", "reason": "workout_command"}
+        response = await asyncio.to_thread(handle_routine_text, text, context=context, cfg=cfg)
+    await _send(gateway, source, response, reply_to=reply_to)
 
 
-def _schedule_send(gateway, source, text: str, reply_to: str | None = None):
-    import asyncio
-
-    async def _send():
-        adapter = getattr(gateway, "adapters", {}).get(getattr(source, "platform", None))
-        if adapter is None:
-            logger.warning("workout_command: no adapter for %s", getattr(source, "platform", None))
-            return
-        await adapter.send(str(source.chat_id), text, reply_to=reply_to)
-
+def _schedule_event_response(event, gateway, text: str) -> None:
+    source = event.source
+    reply_to = str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "") or None
     try:
-        asyncio.get_running_loop().create_task(_send())
+        asyncio.get_running_loop().create_task(_send(gateway, source, text, reply_to=reply_to))
     except RuntimeError:
-        return None
+        logger.warning("workout_command: no running event loop for response")
+
+
+async def _send(gateway, source, text: str, reply_to: str | None = None) -> None:
+    adapter = getattr(gateway, "adapters", {}).get(getattr(source, "platform", None))
+    if adapter is None:
+        logger.warning("workout_command: no adapter for %s", getattr(source, "platform", None))
+        return
+    await adapter.send(str(source.chat_id), text, reply_to=reply_to)
 
 
 def _google_module():
