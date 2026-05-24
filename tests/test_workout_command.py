@@ -70,6 +70,12 @@ def test_help_and_unknown_command_do_not_need_sheets():
     assert "알 수 없는" in workout.handle_workout("bad", cfg=cfg())
 
 
+def test_plain_workout_prefix_is_supported():
+    assert workout._is_workout_text("workout help") is True
+    assert workout._is_workout_text("WORKOUT today") is True
+    assert workout._is_workout_text("workoutlog") is False
+
+
 def test_sheet_title_extracts_quoted_title():
     assert workout._sheet_title("운동기록!A:H") == "운동기록"
     assert workout._sheet_title("'인바디'!A:G") == "인바디"

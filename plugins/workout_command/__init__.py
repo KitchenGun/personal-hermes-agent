@@ -182,6 +182,8 @@ def _is_workout_text(text: str) -> bool:
     stripped = (text or "").strip()
     if stripped.startswith("/"):
         return bool(re.match(r"^/workout(?:\s|$)", stripped, re.I))
+    if re.match(r"^workout(?:\s|$)", stripped, re.I):
+        return True
     return stripped in {"이대로 확정", "취소"} or any(word in stripped for word in ("변경", "운동 제외"))
 
 
@@ -230,6 +232,9 @@ async def _handle_gateway_event(event, gateway, cfg: WorkoutConfig) -> None:
     text = getattr(event, "text", "") or ""
     if text.strip().startswith("/"):
         raw = re.sub(r"^/workout(?:\s+)?", "", text.strip(), flags=re.I)
+        response = await asyncio.to_thread(handle_workout, raw, context=context, cfg=cfg)
+    elif re.match(r"^workout(?:\s|$)", text.strip(), re.I):
+        raw = re.sub(r"^workout(?:\s+)?", "", text.strip(), flags=re.I)
         response = await asyncio.to_thread(handle_workout, raw, context=context, cfg=cfg)
     else:
         response = await asyncio.to_thread(handle_routine_text, text, context=context, cfg=cfg)
