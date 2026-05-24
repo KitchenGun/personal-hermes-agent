@@ -29,8 +29,8 @@ def test_parse_workout_log_multiline():
     )
 
     assert len(rows) == 2
-    assert rows[0][1:] == ["2026-05-19", "등", "바벨로우", "30", "8", "4", "바벨로우 30kg 8회 4세트"]
-    assert rows[1][3:7] == ["렛풀다운", "31.8", "10", "6"]
+    assert rows[0] == ["2026-05-19", "", "등", "바벨로우", "30kg", "8회", "4", ""]
+    assert rows[1][3:7] == ["렛풀다운", "31.8kg", "10회", "6"]
 
 
 def test_parse_workout_log_single_line():
@@ -46,7 +46,9 @@ def test_parse_workout_log_freeform_activity():
     rows = workout.parse_workout_log("토요일 9-13시 에어소프트게임으로 운동 대체", cfg())
 
     assert len(rows) == 1
-    assert rows[0][3] == "토요일 9-13시 에어소프트게임으로 운동 대체"
+    assert rows[0][2] == "유산소"
+    assert rows[0][3] == "에어소프트게임으로 운동 대체"
+    assert rows[0][5] == "09:00-13:00"
 
 
 def test_action_log_alias():
@@ -60,7 +62,8 @@ def test_parse_inbody():
         cfg(),
     )
 
-    assert rows[0][1:] == ["2026-05-19 20:10", "78.1", "30.5", "30.7", "인바디 사진 입력", rows[0][-1]]
+    assert rows[0][:8] == ["2026-05-19 20:10", "", "", "", "", "78.1", "30.5", "30.7"]
+    assert rows[0][20] == "인바디 사진 입력"
 
 
 def test_channel_allowlist_only_target_channel():
@@ -88,9 +91,46 @@ def test_plain_workout_prefix_is_supported():
     assert workout._is_workout_text("workoutlog") is False
 
 
+def test_load_config_does_not_fallback_to_lifelog(monkeypatch):
+    monkeypatch.delenv("WORKOUT_SPREADSHEET_ID", raising=False)
+    monkeypatch.delenv("WORKOUT_SPREADSHEET_URL", raising=False)
+    monkeypatch.setattr(
+        workout,
+        "_load_yaml_config",
+        lambda: {
+            "workout": {"google": {"workout_range": "운동기록!A:H"}},
+            "lifelog": {"google": {"spreadsheet_id": "lifelog-sheet-id"}},
+        },
+    )
+
+    loaded = workout.load_config()
+
+    assert loaded.spreadsheet_id == ""
+
+
 def test_sheet_title_extracts_quoted_title():
     assert workout._sheet_title("운동기록!A:H") == "운동기록"
     assert workout._sheet_title("'인바디'!A:G") == "인바디"
+
+
+def test_undo_rejects_mismatched_spreadsheet(monkeypatch):
+    monkeypatch.setattr(
+        workout,
+        "_consume_undo",
+        lambda context: {"spreadsheet_id": "other-sheet", "range": "'운동기록'!A2:H2", "kind": "log"},
+    )
+
+    assert "시트가 현재 설정과 달라" in workout._handle_undo(cfg(), {})
+
+
+def test_undo_protects_header_row(monkeypatch):
+    monkeypatch.setattr(
+        workout,
+        "_consume_undo",
+        lambda context: {"spreadsheet_id": "sheet-id", "range": "'운동기록'!A1:H1", "kind": "log"},
+    )
+
+    assert "헤더 행 보호" in workout._handle_undo(cfg(), {})
 
 
 def test_register_does_not_add_native_slash_by_default(monkeypatch):

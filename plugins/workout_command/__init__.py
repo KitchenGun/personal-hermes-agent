@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKOUT_RANGE = "운동기록!A:H"
-DEFAULT_INBODY_RANGE = "인바디!A:G"
+DEFAULT_INBODY_RANGE = "인바디!A:U"
 DEFAULT_TIMEZONE = "Asia/Seoul"
 STATE_DIR = Path.home() / ".hermes" / "workout_command"
 UNDO_FILE = STATE_DIR / "undo.json"
@@ -34,6 +34,15 @@ GOOGLE_API = (
     / "scripts"
     / "google_api.py"
 )
+WEEKDAY_MAP = {
+    "월요일": 0,
+    "화요일": 1,
+    "수요일": 2,
+    "목요일": 3,
+    "금요일": 4,
+    "토요일": 5,
+    "일요일": 6,
+}
 
 
 HELP_TEXT = """\
@@ -141,14 +150,10 @@ def load_config() -> WorkoutConfig:
     section = data.get("workout", {}) if isinstance(data.get("workout"), dict) else {}
     google = section.get("google", {}) if isinstance(section.get("google"), dict) else {}
     discord = section.get("discord", {}) if isinstance(section.get("discord"), dict) else {}
-    lifelog = data.get("lifelog", {}) if isinstance(data.get("lifelog"), dict) else {}
-    lifelog_google = lifelog.get("google", {}) if isinstance(lifelog.get("google"), dict) else {}
-
     env_spreadsheet = os.environ.get("WORKOUT_SPREADSHEET_ID") or os.environ.get("WORKOUT_SPREADSHEET_URL", "")
     cfg_spreadsheet = (
         google.get("spreadsheet_id")
         or google.get("spreadsheet_url")
-        or lifelog_google.get("spreadsheet_id")
         or ""
     )
     channel_env = os.environ.get("WORKOUT_DISCORD_CHANNEL_ID", "")
@@ -370,11 +375,12 @@ def _write_undo(data: dict[str, Any]) -> None:
     tmp.replace(UNDO_FILE)
 
 
-def _save_undo(context: dict[str, str], range_name: str, kind: str) -> None:
+def _save_undo(context: dict[str, str], cfg: WorkoutConfig, range_name: str, kind: str) -> None:
     if not range_name:
         return
     data = _read_undo()
     data[_undo_key(context)] = {
+        "spreadsheet_id": cfg.spreadsheet_id,
         "range": range_name,
         "kind": kind,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -388,6 +394,13 @@ def _consume_undo(context: dict[str, str]) -> dict[str, Any] | None:
     item = data.pop(key, None)
     _write_undo(data)
     return item if isinstance(item, dict) else None
+
+
+def _range_start_row(range_name: str) -> int | None:
+    match = re.search(r"![A-Z]+(\d+)", range_name or "", re.I)
+    if not match:
+        match = re.search(r"^[A-Z]+(\d+)", range_name or "", re.I)
+    return int(match.group(1)) if match else None
 
 
 def _split_subcommand(raw_args: str) -> tuple[str, str]:
@@ -422,15 +435,56 @@ def _num(text: str) -> str:
     return match.group(0) if match else ""
 
 
+def _date_from_text(text: str, cfg: WorkoutConfig) -> str:
+    now = _now(cfg)
+    match = re.search(r"(20\d{2})[-./년 ]\s*(\d{1,2})[-./월 ]\s*(\d{1,2})", text or "")
+    if match:
+        return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    base = now.date()
+    if "그제" in text:
+        return (base - dt.timedelta(days=2)).isoformat()
+    if "어제" in text:
+        return (base - dt.timedelta(days=1)).isoformat()
+    for name, target in WEEKDAY_MAP.items():
+        if name in text:
+            delta = (base.weekday() - target) % 7
+            return (base - dt.timedelta(days=delta)).isoformat()
+    return base.isoformat()
+
+
+def _time_range(text: str) -> str:
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(?:-|~|부터)\s*(\d{1,2})(?::(\d{2}))?\s*시?", text or "")
+    if not match:
+        return ""
+    start = f"{int(match.group(1)):02d}:{int(match.group(2) or 0):02d}"
+    end = f"{int(match.group(3)):02d}:{int(match.group(4) or 0):02d}"
+    return f"{start}-{end}"
+
+
+def _clean_activity(text: str) -> str:
+    cleaned = re.sub(r"(오늘|어제|그제|월요일|화요일|수요일|목요일|금요일|토요일|일요일)", "", text or "")
+    cleaned = re.sub(r"(20\d{2})[-./년 ]\s*(\d{1,2})[-./월 ]\s*(\d{1,2})", "", cleaned)
+    cleaned = re.sub(r"\d{1,2}(?::\d{2})?\s*(?:-|~|부터)\s*\d{1,2}(?::\d{2})?\s*시?", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip(" -~")
+
+
+def _infer_part(part: str, text: str) -> str:
+    if part:
+        return part
+    if re.search(r"유산소|러닝|걷|산책|스텝밀|에어소프트|게임", text or ""):
+        return "유산소"
+    return ""
+
+
 def parse_workout_log(body: str, cfg: WorkoutConfig) -> list[list[Any]]:
     lines = _normalize_body(body)
-    date = _now(cfg).date().isoformat()
+    date = _date_from_text(body, cfg)
     part = ""
     exercises: list[str] = []
     for line in lines:
         value = _kv_value(line, "날짜", "date")
         if value:
-            date = value
+            date = _date_from_text(value, cfg)
             continue
         if not part and ":" not in line and not re.search(r"\d+\s*kg|\d+\s*회|\d+\s*세트", line):
             part = line
@@ -442,27 +496,27 @@ def parse_workout_log(body: str, cfg: WorkoutConfig) -> list[list[Any]]:
             part = ""
         else:
             raise WorkoutError("운동 항목을 찾지 못했습니다.")
-    created_at = _now(cfg).isoformat(timespec="seconds")
     rows = []
     for exercise in exercises:
         match = re.match(
-            r"(?P<name>.+?)\s+(?P<weight>\d+(?:\.\d+)?)\s*kg\s+(?P<reps>\d+)\s*회\s+(?P<sets>\d+)\s*세트",
+            r"(?P<name>.+?)\s+(?P<weight>\d+(?:\.\d+)?)\s*kg\s+(?P<reps>\d+(?:\.\d+)?)\s*(?P<unit>회|개)\s+(?P<sets>\d+)\s*세트",
             exercise,
             re.I,
         )
         if match:
             rows.append([
-                created_at,
                 date,
-                part,
+                "",
+                _infer_part(part, exercise),
                 match.group("name").strip(),
-                match.group("weight"),
-                match.group("reps"),
+                f"{match.group('weight')}kg",
+                f"{match.group('reps')}{match.group('unit')}",
                 match.group("sets"),
-                exercise,
+                "",
             ])
         else:
-            rows.append([created_at, date, part, exercise, "", "", "", exercise])
+            cleaned = _clean_activity(exercise) or exercise
+            rows.append([date, "", _infer_part(part, cleaned), cleaned, "", _time_range(exercise), "", ""])
     return rows
 
 
@@ -471,9 +525,25 @@ def parse_inbody(body: str, cfg: WorkoutConfig) -> list[list[Any]]:
     for line in _normalize_body(body):
         for key, aliases in {
             "checked_at": ("검사일시", "검사일", "date"),
+            "condition": ("측정조건", "condition"),
+            "height": ("신장", "height"),
+            "age": ("나이", "age"),
+            "gender": ("성별", "gender"),
             "weight": ("체중", "weight"),
             "muscle": ("골격근량", "skeletal muscle"),
             "fat": ("체지방률", "body fat"),
+            "fat_mass": ("체지방량",),
+            "bmi": ("BMI",),
+            "bmr": ("기초대사량",),
+            "score": ("인바디점수",),
+            "abdominal_fat": ("복부지방률",),
+            "visceral_fat": ("내장지방레벨",),
+            "lean_mass": ("제지방량",),
+            "recommended_calorie": ("권장섭취열량",),
+            "target_weight": ("적정체중",),
+            "weight_control": ("체중조절",),
+            "fat_control": ("지방조절",),
+            "muscle_control": ("근육조절",),
             "memo": ("메모", "memo"),
         }.items():
             found = _kv_value(line, *aliases)
@@ -481,27 +551,40 @@ def parse_inbody(body: str, cfg: WorkoutConfig) -> list[list[Any]]:
                 values[key] = found
     if not values.get("checked_at"):
         values["checked_at"] = _now(cfg).isoformat(timespec="minutes")
-    created_at = _now(cfg).isoformat(timespec="seconds")
     return [[
-        created_at,
         values.get("checked_at", ""),
+        values.get("condition", ""),
+        _num(values.get("height", "")),
+        _num(values.get("age", "")),
+        values.get("gender", ""),
         _num(values.get("weight", "")),
         _num(values.get("muscle", "")),
         _num(values.get("fat", "")),
+        _num(values.get("fat_mass", "")),
+        _num(values.get("bmi", "")),
+        _num(values.get("bmr", "")),
+        _num(values.get("score", "")),
+        _num(values.get("abdominal_fat", "")),
+        _num(values.get("visceral_fat", "")),
+        _num(values.get("lean_mass", "")),
+        _num(values.get("recommended_calorie", "")),
+        _num(values.get("target_weight", "")),
+        _num(values.get("weight_control", "")),
+        _num(values.get("fat_control", "")),
+        _num(values.get("muscle_control", "")),
         values.get("memo", ""),
-        body.strip(),
     ]]
 
 
 def _format_workout_row(row: list[Any]) -> str:
     values = [str(x) for x in row]
     if len(values) >= 8:
-        date, part, name, weight, reps, sets = values[1:7]
+        date, _, part, name, weight, reps, sets = values[:7]
         detail = name
         if weight:
-            detail += f" {weight}kg"
+            detail += f" {weight}"
         if reps:
-            detail += f" {reps}회"
+            detail += f" {reps}"
         if sets:
             detail += f" {sets}세트"
         return f"- {date} {part} {detail}".strip()
@@ -511,20 +594,20 @@ def _format_workout_row(row: list[Any]) -> str:
 def _handle_log(body: str, cfg: WorkoutConfig, context: dict[str, str]) -> str:
     rows = parse_workout_log(body, cfg)
     updated_range = append_rows(cfg, cfg.workout_range, rows)
-    _save_undo(context, updated_range, "log")
+    _save_undo(context, cfg, updated_range, "log")
     return f"운동기록 {len(rows)}건을 시트에 추가했습니다."
 
 
 def _handle_inbody(body: str, cfg: WorkoutConfig, context: dict[str, str]) -> str:
     rows = parse_inbody(body, cfg)
     updated_range = append_rows(cfg, cfg.inbody_range, rows)
-    _save_undo(context, updated_range, "inbody")
+    _save_undo(context, cfg, updated_range, "inbody")
     return "인바디 기록 1건을 시트에 추가했습니다."
 
 
 def _handle_today(cfg: WorkoutConfig) -> str:
     today = _now(cfg).date().isoformat()
-    rows = [row for row in get_rows(cfg, cfg.workout_range) if len(row) > 1 and str(row[1]) == today]
+    rows = [row for row in get_rows(cfg, cfg.workout_range) if row and str(row[0]) == today]
     if not rows:
         return "오늘 운동기록이 없습니다."
     return "오늘 운동기록:\n" + "\n".join(_format_workout_row(row) for row in rows[-20:])
@@ -541,6 +624,10 @@ def _handle_undo(cfg: WorkoutConfig, context: dict[str, str]) -> str:
     item = _consume_undo(context)
     if not item or not item.get("range"):
         return "되돌릴 직전 `/workout log` 또는 `/workout inbody` 기록이 없습니다."
+    if item.get("spreadsheet_id") != cfg.spreadsheet_id:
+        return "되돌릴 기록의 시트가 현재 설정과 달라 실행하지 않았습니다."
+    if (_range_start_row(str(item["range"])) or 0) <= 1:
+        return "헤더 행 보호를 위해 undo를 실행하지 않았습니다."
     clear_range(cfg, str(item["range"]))
     return f"직전 {item.get('kind', 'workout')} 입력 범위를 비웠습니다."
 

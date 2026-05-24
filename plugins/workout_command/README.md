@@ -3,6 +3,7 @@
 Hermes Discord `/workout` command plugin.
 
 Runtime config belongs in `~/.hermes/config.yaml` or environment variables, not in this public repo.
+`workout.google.spreadsheet_id` is required; the plugin intentionally does not fall back to lifelog sheets.
 
 ```yaml
 plugins:
@@ -18,7 +19,7 @@ workout:
   google:
     spreadsheet_id: "${WORKOUT_SPREADSHEET_ID}"
     workout_range: "운동기록!A:H"
-    inbody_range: "인바디!A:G"
+    inbody_range: "인바디!A:U"
 ```
 
 `/workout` is handled as a normal Discord text message through `pre_gateway_dispatch`.
