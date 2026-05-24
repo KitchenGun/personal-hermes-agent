@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Discord `/workout` 명령 플러그인을 추가해 운동기록/인바디 기록을 지정 채널에서 Google Sheets로 라우팅하도록 구현.
 - 현재 Hermes Agent 상태 문서(`docs/12-current-hermes-status.md`)와 매주 토요일 갱신 Job(`weekly_hermes_agent_status_update`)을 추가.
 - 운동 일정 자동화 안전장치(`workout_automation_safeguards`)를 Job Registry에 추가하고, 확인 토큰·Sheets gid·Calendar upsert 안전 기준을 문서화.
 - 날짜별 Job Registry 카탈로그를 `docs/job-registry.md` 단일 기준 문서로 통합.
