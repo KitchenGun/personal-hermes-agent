@@ -1,0 +1,7 @@
+manifest_version: 1
+name: workout_command
+version: 0.1.0
+kind: standalone
+description: Discord /workout command for workout and InBody logging
+provides_hooks:
+  - pre_gateway_dispatch
