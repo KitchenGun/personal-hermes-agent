@@ -1,0 +1,7 @@
+manifest_version: 1
+name: queue_intake_guard
+version: 0.1.0
+kind: standalone
+description: Route dedicated Discord task-channel messages into Hermes Kanban
+provides_hooks:
+  - pre_gateway_dispatch
