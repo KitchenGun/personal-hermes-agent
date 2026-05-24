@@ -73,3 +73,32 @@ def test_help_and_unknown_command_do_not_need_sheets():
 def test_sheet_title_extracts_quoted_title():
     assert workout._sheet_title("운동기록!A:H") == "운동기록"
     assert workout._sheet_title("'인바디'!A:G") == "인바디"
+
+
+def test_register_does_not_add_native_slash_by_default(monkeypatch):
+    monkeypatch.delenv("WORKOUT_REGISTER_NATIVE_SLASH", raising=False)
+
+    calls = []
+    ctx = SimpleNamespace(
+        register_hook=lambda *args: calls.append(("hook", args)),
+        register_command=lambda *args, **kwargs: calls.append(("command", args, kwargs)),
+    )
+
+    workout.register(ctx)
+
+    assert any(kind == "hook" for kind, *_ in calls)
+    assert not any(kind == "command" for kind, *_ in calls)
+
+
+def test_register_can_enable_native_slash_explicitly(monkeypatch):
+    monkeypatch.setenv("WORKOUT_REGISTER_NATIVE_SLASH", "1")
+
+    calls = []
+    ctx = SimpleNamespace(
+        register_hook=lambda *args: calls.append(("hook", args)),
+        register_command=lambda *args, **kwargs: calls.append(("command", args, kwargs)),
+    )
+
+    workout.register(ctx)
+
+    assert any(kind == "command" for kind, *_ in calls)

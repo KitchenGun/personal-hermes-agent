@@ -14,11 +14,15 @@ workout:
   discord:
     channel_allowlist:
       - "${WORKOUT_DISCORD_CHANNEL_ID}"
+    register_native_slash: false
   google:
     spreadsheet_id: "${WORKOUT_SPREADSHEET_ID}"
     workout_range: "운동기록!A:H"
     inbody_range: "인바디!A:G"
 ```
+
+`/workout` is handled as a normal Discord text message through `pre_gateway_dispatch`.
+Native Discord slash registration is disabled by default because Discord command sync can lag or keep stale global commands after gateway restarts.
 
 Commands:
 

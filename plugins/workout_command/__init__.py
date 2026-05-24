@@ -89,12 +89,23 @@ class WorkoutError(RuntimeError):
 
 def register(ctx) -> None:
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
-    ctx.register_command(
-        "workout",
-        handler=lambda raw: handle_workout(raw, context={}),
-        description="운동기록과 인바디 기록을 Google Sheets에 저장합니다.",
-        args_hint="help | log ... | inbody ... | today | recent | undo | confirm <token> | deny <token>",
-    )
+    if _register_native_slash_enabled():
+        ctx.register_command(
+            "workout",
+            handler=lambda raw: handle_workout(raw, context={}),
+            description="운동기록과 인바디 기록을 Google Sheets에 저장합니다.",
+            args_hint="help | log ... | inbody ... | today | recent | undo | confirm <token> | deny <token>",
+        )
+
+
+def _register_native_slash_enabled() -> bool:
+    raw = os.environ.get("WORKOUT_REGISTER_NATIVE_SLASH")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    data = _load_yaml_config()
+    section = data.get("workout", {}) if isinstance(data.get("workout"), dict) else {}
+    discord = section.get("discord", {}) if isinstance(section.get("discord", {}), dict) else {}
+    return bool(discord.get("register_native_slash", False))
 
 
 def _platform_name(source) -> str:
