@@ -395,6 +395,9 @@ def _split_subcommand(raw_args: str) -> tuple[str, str]:
     if not text:
         return "help", ""
     first, _, rest = text.partition(" ")
+    action = re.match(r"^action\s*[:=]\s*(log|inbody|today|recent|undo|help)$", first, re.I)
+    if action:
+        return action.group(1).lower(), rest.strip()
     return first.lower(), rest.strip()
 
 
@@ -434,7 +437,11 @@ def parse_workout_log(body: str, cfg: WorkoutConfig) -> list[list[Any]]:
             continue
         exercises.append(line)
     if not exercises:
-        raise WorkoutError("운동 항목을 찾지 못했습니다.")
+        if part:
+            exercises.append(part)
+            part = ""
+        else:
+            raise WorkoutError("운동 항목을 찾지 못했습니다.")
     created_at = _now(cfg).isoformat(timespec="seconds")
     rows = []
     for exercise in exercises:

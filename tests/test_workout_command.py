@@ -42,6 +42,18 @@ def test_parse_workout_log_single_line():
     assert [row[3] for row in rows] == ["바벨로우", "렛풀다운"]
 
 
+def test_parse_workout_log_freeform_activity():
+    rows = workout.parse_workout_log("토요일 9-13시 에어소프트게임으로 운동 대체", cfg())
+
+    assert len(rows) == 1
+    assert rows[0][3] == "토요일 9-13시 에어소프트게임으로 운동 대체"
+
+
+def test_action_log_alias():
+    assert workout._split_subcommand("action:log 토요일 운동 대체") == ("log", "토요일 운동 대체")
+    assert workout._split_subcommand("action=log 토요일 운동 대체") == ("log", "토요일 운동 대체")
+
+
 def test_parse_inbody():
     rows = workout.parse_inbody(
         "검사일시: 2026-05-19 20:10\n체중: 78.1kg\n골격근량: 30.5kg\n체지방률: 30.7%\n메모: 인바디 사진 입력",
