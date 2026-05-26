@@ -9,6 +9,7 @@ private/
 
 # Hermes runtime state (never publish)
 .hermes-state/
+.hermes-import/
 .gateway-state/
 .memory/
 memory/

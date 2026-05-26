@@ -9,6 +9,7 @@
 ## 현재 운영 모델
 
 - Hermes VM을 단일 운영 source of truth로 둡니다.
+- Hermes Agent의 실제 핵심 실행 repo는 VM의 `/home/ubuntu/.hermes/hermes-agent`입니다.
 - 로컬 WSL은 SSH 터널과 비활성 백업/캐시 역할로 제한합니다.
 - secret, token, session, cookie, raw log, raw DB, gateway state, private workspace path는 커밋하지 않습니다.
 - 런타임 상태는 저장소 밖에 두며, 이 저장소에는 정제된 예시와 운영 소스만 둡니다.
@@ -56,6 +57,8 @@ ops/codex-control-dashboard/
 
 - `ops/README.md`
 - `docs/12-codex-control-dashboard.md`
+- `docs/13-vm-source-commit-prep.md`
+- `docs/14-live-hermes-feature-changes.md`
 
 ## Summary Endpoint Contract
 
