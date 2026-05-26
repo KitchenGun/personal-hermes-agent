@@ -1,68 +1,65 @@
 # Personal Hermes Agent
 
-Public-safe operating profile and operations source for a personal Hermes Agent.
+개인 Hermes 에이전트의 공개 안전 운영 프로필과 VM 운영 소스 저장소입니다.
 
-This repository documents how the agent is run, what is allowed to be published,
-and which repeatable jobs, skills, prompts, scripts, and VM operations artifacts
-belong under version control.
+이 저장소는 에이전트를 어떻게 운용하는지, 어떤 자료를 공개해도 되는지,
+반복 가능한 job, skill, prompt, script, VM 운영 산출물을 어떻게 버전 관리할지
+정리합니다.
 
-## Current Operating Model
+## 현재 운영 모델
 
-- The Hermes VM is the single operating source of truth.
-- Local WSL is limited to SSH tunneling plus inactive backup/cache roles.
-- Secrets, tokens, sessions, cookies, raw logs, raw DB files, gateway state, and
-  private workspace paths are not committed.
-- Runtime state lives outside this repository and is represented here only by
-  sanitized examples.
-- Dashboard/control API security is a required acceptance condition, not an
-  optional hardening task.
+- Hermes VM을 단일 운영 source of truth로 둡니다.
+- 로컬 WSL은 SSH 터널과 비활성 백업/캐시 역할로 제한합니다.
+- secret, token, session, cookie, raw log, raw DB, gateway state, private workspace path는 커밋하지 않습니다.
+- 런타임 상태는 저장소 밖에 두며, 이 저장소에는 정제된 예시와 운영 소스만 둡니다.
+- dashboard/control API 보안은 선택 사항이 아니라 필수 acceptance condition입니다.
 
-## What This Repository Contains
+## 저장소 구성
 
-| Path | Purpose |
+| 경로 | 목적 |
 | --- | --- |
-| `docs/` | Architecture, jobs, memory, tools, gateway, cron, delegation, and operations notes. |
-| `jobs/` | Sanitized Job Registry YAML files for repeatable work. |
-| `skills/` | Reusable Hermes skill examples and conventions. |
-| `prompts/` | Reusable system, workflow, and template prompts. |
-| `scripts/examples/` | Public-safe validation and registry helper scripts. |
-| `config/` | Placeholder-only configuration examples. |
-| `ops/` | Public-safe VM operations source and deployment examples. |
+| `docs/` | architecture, jobs, memory, tools, gateway, cron, delegation, operations 문서 |
+| `jobs/` | 반복 작업을 위한 정제된 Job Registry YAML |
+| `skills/` | 재사용 가능한 Hermes skill 예시와 작성 규칙 |
+| `prompts/` | system, workflow, template prompt |
+| `scripts/examples/` | 공개 안전 검증 및 registry helper script |
+| `config/` | placeholder 전용 설정 예시 |
+| `ops/` | 공개 안전 VM 운영 소스와 배포 예시 |
 
 ## VM Dashboard And Control API
 
-The current VM operation includes a versioned Codex Control Dashboard under:
+현재 VM 운용 상태 기준 Codex Control Dashboard 소스는 다음 경로에 있습니다.
 
 ```text
 ops/codex-control-dashboard/
 ```
 
-It contains:
+포함 항목:
 
 - dashboard/control API runtime
 - static dashboard UI
 - Discord relay runtime
-- summary DTO and auth smoke tests
-- placeholder-only environment example
-- systemd user service examples
+- summary DTO 및 auth smoke test
+- placeholder 전용 env 예시
+- systemd user service 예시
 
-Security model:
+보안 모델:
 
-- dashboard binds to `127.0.0.1`
-- mutating control endpoints require `CONTROL_SHARED_SECRET` or localhost CSRF
-- Discord relay endpoints require `DISCORD_SHARED_SECRET`
-- `DISCORD_PUBLIC_KEY` is required only when Discord Interactions are enabled
-- `/api/summary` returns an allowlist DTO, not redacted raw task objects
-- raw `/api/state` requires auth
+- dashboard는 `127.0.0.1`에만 bind합니다.
+- control mutating endpoint는 `CONTROL_SHARED_SECRET` 또는 localhost CSRF가 필요합니다.
+- Discord relay endpoint는 `DISCORD_SHARED_SECRET`이 필요합니다.
+- `DISCORD_PUBLIC_KEY`는 Discord Interactions를 활성화할 때만 필요합니다.
+- `/api/summary`는 raw object redaction이 아니라 allowlist DTO만 반환합니다.
+- raw `/api/state`는 인증이 필요합니다.
 
-See:
+관련 문서:
 
 - `ops/README.md`
 - `docs/12-codex-control-dashboard.md`
 
 ## Summary Endpoint Contract
 
-`/api/summary` may expose only:
+`/api/summary`가 반환할 수 있는 필드는 아래로 제한합니다.
 
 - `board`
 - `updated_at`
@@ -80,13 +77,19 @@ See:
 - `tasks[].sanitized_error_class`
 - `tasks[].updated_at`
 
-It must not expose raw task body, workspace path, raw command, stdout, stderr,
-environment key names, token-like strings, cookie/session material, or private
-filesystem paths.
+응답에 포함하면 안 되는 항목:
 
-## Validation
+- raw task body
+- workspace path
+- raw command
+- stdout 또는 stderr
+- env key name 또는 value
+- token, secret, key, cookie, session material
+- private filesystem path
 
-Run before publishing:
+## 검증
+
+공개 전 실행:
 
 ```bash
 scripts/examples/scan-for-secrets.sh
@@ -94,7 +97,7 @@ scripts/examples/validate-examples.sh
 scripts/examples/validate-job-registry.sh
 ```
 
-Run on the VM after dashboard deployment:
+dashboard 배포 후 VM에서 실행:
 
 ```bash
 set -a
@@ -103,51 +106,51 @@ set +a
 bash ~/.hermes/codex-control-dashboard/dashboard-smoke.sh
 ```
 
-Expected smoke coverage:
+smoke test 기대 항목:
 
-- health endpoint returns `200`
-- summary endpoint matches the allowlist schema
-- summary strings do not match sensitive deny patterns
-- no-token mutating requests return `401` or `403`
-- bad-token mutating requests return `401` or `403`
-- valid bearer token dry-run returns `200`
-- valid localhost CSRF dry-run returns `200`
-- raw state endpoint rejects unauthenticated access
-- Discord relay mutation endpoints reject unauthenticated access
+- health endpoint가 `200`을 반환합니다.
+- summary endpoint가 allowlist schema와 일치합니다.
+- summary string이 sensitive deny pattern과 매칭되지 않습니다.
+- no-token mutating request는 `401` 또는 `403`을 반환합니다.
+- bad-token mutating request는 `401` 또는 `403`을 반환합니다.
+- valid bearer token dry-run은 `200`을 반환합니다.
+- valid localhost CSRF dry-run은 `200`을 반환합니다.
+- raw state endpoint는 unauthenticated access를 거부합니다.
+- Discord relay mutation endpoint는 unauthenticated access를 거부합니다.
 
-## Publication Rules
+## 공개 규칙
 
-Never commit:
+커밋 금지:
 
-- filled `.env` files
-- real API keys, OAuth tokens, cookies, sessions, or Discord bot tokens
-- real Discord user, channel, or server IDs
-- raw Hermes sessions, checkpoints, DB files, logs, or gateway state
-- private memory, prompts, workspace paths, or personal identifiers
+- filled `.env`
+- 실제 API key, OAuth token, cookie, session, Discord bot token
+- 실제 Discord user, channel, server ID
+- raw Hermes session, checkpoint, DB, log, gateway state
+- private memory, prompt, workspace path, personal identifier
 
-Use placeholders such as:
+placeholder 예시:
 
 - `<YOUR_DISCORD_BOT_TOKEN>`
 - `<YOUR_DISCORD_CHANNEL_ID>`
 - `<GENERATE_WITH_PASSWORD_MANAGER>`
 - `${HERMES_MODEL}`
 
-## Deployment Notes
+## 배포 메모
 
-The files in `ops/` are public-safe source artifacts, not a blind copy of the
-live VM state. A deployment should:
+`ops/`의 파일은 공개 안전 운영 소스입니다. live VM 상태를 그대로 복사한 것이 아닙니다.
 
-1. copy runtime files to the VM dashboard directory
-2. keep the filled environment file VM-local only
-3. set the environment file to mode `600`
-4. keep the dashboard directory at mode `750` or stricter
-5. restart only the relevant user services
-6. run the dashboard smoke test
+배포 시 원칙:
 
-Rollback should restore from a timestamped backup before service restart.
+1. runtime 파일을 VM dashboard directory로 복사합니다.
+2. 채워진 env 파일은 VM-local로만 유지합니다.
+3. env 파일 권한은 `600`으로 둡니다.
+4. dashboard directory 권한은 `750` 이하로 둡니다.
+5. 관련 user service만 재시작합니다.
+6. dashboard smoke test를 실행합니다.
 
-## Status
+rollback은 service restart 전에 만든 timestamp backup에서 복구하는 방식으로 수행합니다.
 
-As of this README, the repository has been aligned with the current VM dashboard
-operation at a source level while keeping live secrets and private runtime state
-out of git.
+## 현재 상태
+
+이 README 기준 저장소는 현재 VM dashboard 운용 상태를 source level로 반영했습니다.
+live secret과 private runtime state는 git에 포함하지 않았습니다.
