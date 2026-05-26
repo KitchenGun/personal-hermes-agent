@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Hermes Kanban Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Codex supervises - Hermes executes</p>
+          <h1>Kanban Control Dashboard</h1>
+        </div>
+        <div class="controls">
+          <select id="boardSelect" aria-label="board"></select>
+          <button id="refreshButton" title="Refresh">Refresh</button>
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="progress">
+        <article>
+          <span>Overall progress</span>
+          <strong id="overallProgress">0%</strong>
+          <div class="bar"><i id="overallBar"></i></div>
+        </article>
+        <article>
+          <span>Current progress</span>
+          <strong id="currentProgress">0%</strong>
+          <div class="bar"><i id="currentBar"></i></div>
+        </article>
+        <article>
+          <span>Task count</span>
+          <strong id="taskCount">0</strong>
+          <small id="taskBreakdown"></small>
+        </article>
+      </section>
+
+      <section class="supervisor">
+        <div class="sectionHead">
+          <h2>Codex supervisor</h2>
+          <span id="supervisorStatus">stopped</span>
+        </div>
+        <div class="supervisorGrid">
+          <div>
+            <span>Board</span>
+            <strong id="supervisorBoard">codex-control</strong>
+          </div>
+          <label>
+            <span>Concurrency target</span>
+            <input id="concurrencyInput" type="number" min="1" max="8" value="2" />
+          </label>
+          <label>
+            <span>Check interval</span>
+            <select id="intervalSelect">
+              <option value="5000">5s</option>
+              <option value="15000" selected>15s</option>
+              <option value="30000">30s</option>
+              <option value="60000">60s</option>
+            </select>
+          </label>
+          <label class="checkControl">
+            <span>blocked recovery</span>
+            <input id="blockedRecoveryInput" type="checkbox" checked />
+          </label>
+          <label>
+            <span>recovery assignee</span>
+            <input id="recoveryAssigneeInput" type="text" value="fixer" />
+          </label>
+          <div class="supervisorControls">
+            <button id="startSupervisor" title="Start supervisor">Start</button>
+            <button id="stopSupervisor" title="Stop supervisor">Stop</button>
+            <button id="tickSupervisor" title="Manual tick">Tick</button>
+          </div>
+        </div>
+        <div class="supervisorLog" id="supervisorLog"></div>
+      </section>
+
+      <section class="current">
+        <div class="sectionHead">
+          <h2>Current task</h2>
+          <span id="updatedAt"></span>
+        </div>
+        <div id="currentTask" class="currentTask"></div>
+      </section>
+
+      <section class="queue">
+        <div class="sectionHead">
+          <h2>Task queue</h2>
+          <span id="queueHint"></span>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Task</th>
+                <th>Status</th>
+                <th>Assignee</th>
+                <th>Retries</th>
+                <th>Age</th>
+              </tr>
+            </thead>
+            <tbody id="taskRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
