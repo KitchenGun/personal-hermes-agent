@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Discord Relay for Hermes VM
+After=network-online.target codex-control-api.service
+Wants=network-online.target codex-control-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/codex-control-dashboard
+EnvironmentFile=%h/.hermes/codex-control.env
+ExecStart=/usr/bin/env node %h/.hermes/codex-control-dashboard/discord-relay.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -17,6 +17,7 @@ This repository is a public-safe operating profile for a personal Hermes Agent.
 - `skills/`: reusable Hermes skills.
 - `prompts/`: reusable workflow and system prompts.
 - `scripts/examples/`: public-safe validation scripts.
+- `ops/`: public-safe VM operations source and deployment examples.
 
 ## Validation
 
@@ -24,4 +25,5 @@ This repository is a public-safe operating profile for a personal Hermes Agent.
 scripts/examples/scan-for-secrets.sh
 scripts/examples/validate-examples.sh
 scripts/examples/validate-job-registry.sh
+ops/codex-control-dashboard/dashboard-smoke.sh
 ```

@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Control API for Hermes VM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/codex-control-dashboard
+EnvironmentFile=%h/.hermes/codex-control.env
+ExecStart=/usr/bin/env node %h/.hermes/codex-control-dashboard/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
