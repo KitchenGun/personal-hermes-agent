@@ -19,6 +19,8 @@
   - parse_x_rss_feed와 x_rss_signal RawTrendItem 생성 추가
   - x-rss-signal, x-author:<handle> tags 보존
   - feed별 failure/timeout은 전체 collector 실패로 전파하지 않고 skip
+  - cleaned summary가 비면 title로 fallback하여 일부 nitter RSS 항목 때문에 feed 전체가 누락되지 않도록 보정
+  - Hermes/NousResearch 관련 X RSS는 author handle도 relevance filter 입력에 포함
   - X bearer token 기반 x_weak_signal 경로는 유지
 - src/ai_trends/config.py, src/ai_trends/collector.py
   - X RSS 설정 값을 collection config에서 collector로 전달
@@ -35,6 +37,7 @@
 
 현재 VM에는 아래 공개 RSS feed를 등록했다.
 
+- https://nitter.net/NousResearch/rss
 - https://nitter.net/OpenAIDevs/rss
 - https://nitter.net/AnthropicAI/rss
 - https://nitter.net/llama_index/rss
@@ -49,6 +52,7 @@
 - RSSHub public instance: Twitter API 미설정 오류로 제외
 - xcancel: RSS reader whitelist 안내 feed만 반환해 제외
 - LangChainAI, vercel_ai: nitter fetch 오류로 제외
+- Teknium1: nitter fetch 오류로 제외
 
 ## 운영 설정
 
@@ -61,11 +65,19 @@
 
 파일 형식은 URL list 또는 {"feeds": ["https://..."]} object를 지원한다. 값에는 secret, cookie, session 정보를 넣지 않는다.
 
+## Hermes/Nous 보강 검증
+
+- https://nitter.net/NousResearch/rss 를 feed file 최상단에 추가
+- env 기반 collect_trend_items(sources=()) 검증 -> x_rss_signal 50개, Hermes/Nous 관련 20개 생성 확인
+- 대표 수집 항목: "Qwen 3.7 Max is now supported in Hermes Agent", "Hermes Agent now can orchestrate the OpenHandsDev agents"
+- tests/ai_trends/test_sources.py -> 16 passed
+- python -m pytest -q -> 84 passed
+
 ## 검증
 
 - python -m compileall -q src tests
 - python -m pytest -q tests/ai_trends/test_sources.py tests/ai_trends/test_config.py -> 21 passed
-- python -m pytest -q -> 82 passed
+- python -m pytest -q -> 84 passed
 - 수동 collect_trend_items(..., x_rss_feeds_json=...) 검증 -> X RSS x_rss_signal 생성 확인
 - env 기반 수동 collect_trend_items(sources=()) 검증 -> x_rss_signal 30개 생성 확인
 - bash -n /home/ubuntu/.hermes/scripts/ai-trends-hourly-collector.sh
