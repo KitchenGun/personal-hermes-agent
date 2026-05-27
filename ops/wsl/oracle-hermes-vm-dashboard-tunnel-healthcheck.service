@@ -1,0 +1,8 @@
+[Unit]
+Description=Oracle Hermes VM dashboard tunnel health check and recovery
+After=oracle-hermes-vm-dashboard-tunnel.service
+Wants=oracle-hermes-vm-dashboard-tunnel.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/oracle-hermes-vm-dashboard-tunnel-healthcheck.sh
