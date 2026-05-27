@@ -35,3 +35,9 @@
 - `/api/supervisor`에서 `healthGate.active=true`, `reason=worker_crash_storm` 확인
 - `codex-control-api.service` active 확인
 - `hermes-gateway.service` active 확인
+
+## 추가 보정: recovery 단일 crash 차단
+
+- health gate 임계치에 도달하지 않은 단일 blocked task라도 run history가 `pid ... not alive` 등 공통 worker 런타임 crash면 `Codex unblock:` fixer를 만들지 않는다.
+- 이 경우 원본 task에 `CODEX_RECOVERY_SKIPPED_SYSTEMIC_WORKER` comment만 남기고 recovery 생성을 건너뛴다.
+- 목적은 recovery worker가 같은 런타임 오류로 다시 blocked 되는 루프를 막는 것이다.

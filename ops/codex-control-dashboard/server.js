@@ -1359,6 +1359,16 @@ function isSystemicWorkerFailure(run) {
   return SYSTEMIC_WORKER_FAILURE_RE.test(failureText);
 }
 
+function taskHasSystemicWorkerFailure(details) {
+  const runs = Array.isArray(details?.runs) ? details.runs : [];
+  return runs.some(isSystemicWorkerFailure);
+}
+
+function recoverySkipMarker(task, details) {
+  const blockedAt = latestEventAt(details, 'blocked') || task.started_at || task.created_at || 'unknown';
+  return `CODEX_RECOVERY_SKIPPED_SYSTEMIC_WORKER task=${task.id} blocked_at=${blockedAt}`;
+}
+
 async function evaluateSupervisorHealthGate(board, state) {
   if (!SUPERVISOR_HEALTH_GATE_ENABLED) {
     return { active: false, reason: 'disabled', count: 0, threshold: SUPERVISOR_CRASH_STORM_THRESHOLD };
@@ -1488,6 +1498,25 @@ async function processBlockedRecoveries(board, state) {
     try {
       if (task.status !== 'blocked' || isRecoveryTask(task)) continue;
       const details = await loadTaskDetails(board, task.id);
+      if (taskHasSystemicWorkerFailure(details)) {
+        const marker = recoverySkipMarker(task, details);
+        if (!taskDetailsText(details).includes(marker)) {
+          await runHermesLong([
+            'kanban',
+            '--board',
+            board,
+            'comment',
+            '--author',
+            'codex-supervisor',
+            task.id,
+            `${marker} status=skipped policy=no_recovery_for_systemic_worker_failure`,
+          ], 60000);
+          pushSupervisorLog('warning', `blocked recovery skipped for systemic worker failure: ${task.id}`, {
+            task: task.id,
+          });
+        }
+        continue;
+      }
       const blockInfo = userInputBlockInfo(task, details);
       if (blockInfo.needsUserInput) {
         const marker = userInputMarker(task, details);
