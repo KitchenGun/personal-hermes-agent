@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- SkillOpt의 rollout/reflection/validation gate 개념을 공개-safe skill 최적화 절차와 수동 Job Registry 항목으로 반영.
 - 운동 일정 자동화 안전장치(`workout_automation_safeguards`)를 Job Registry에 추가하고, 확인 토큰·Sheets gid·Calendar upsert 안전 기준을 문서화.
 - 날짜별 Job Registry 카탈로그를 `docs/job-registry.md` 단일 기준 문서로 통합.
 - README에 현재 Orchestrator / Profile 구조를 추가하고 `config/hermes.example.yaml`, architecture 문서, gateway/job registry 경계를 연결.

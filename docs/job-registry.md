@@ -23,6 +23,7 @@
 | 13 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
 | 14 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
 | 15 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
+| 16 | `skill_optimization_review` | [`jobs/maintenance/skill_optimization_review.yaml`](../jobs/maintenance/skill_optimization_review.yaml) | maintenance | 수동 명령 | enabled | SkillOpt에서 차용한 rollout/reflection/validation gate 절차로 Hermes skill 개선 여부를 평가합니다. |
 
 ## 항목별 설명
 
@@ -146,6 +147,14 @@
 - **주요 단계**: 고엔트로피 확인 토큰 생성, `/workout confirm <token>` 또는 `/workout deny <token>`만 승인 명령으로 인정, Google Sheets `gid` metadata 해석, 확인되지 않은 Calendar write 차단, deterministic event ID와 `hermes_marker`/`spec_hash` 기반 upsert.
 - **출력**: `<YOUR_WORKOUT_REVIEW_CHANNEL>` placeholder 대상으로 승인 대기 또는 결과 markdown 생성.
 - **안전 기준**: free-text 승인은 무시하고, token/gid/pending plan 상태가 없으면 fail-closed 처리하며, Google/Discord secret은 공개 예시에 포함하지 않습니다.
+
+### `skill_optimization_review`
+
+- **목적**: Hermes skill을 반복 평가하고, 검증된 이점이 있을 때만 최소 패치를 받아들입니다.
+- **입력**: `<TARGET_SKILL_NAME_OR_PATH>`, `<YOUR_SANITIZED_SKILL_EVAL_CASES>`, SkillOpt reference URL placeholder.
+- **주요 단계**: 대상 skill 읽기, sanitized train/validation/holdout 구성, 현재 skill 결과 기록, spark subagent 병렬 분석, 최소 패치 제안, validation gate 통과 여부 판단, holdout 확인.
+- **출력**: `<YOUR_MAINTENANCE_CHANNEL>` placeholder 대상으로 before/after와 폐기 여부를 markdown으로 보고합니다.
+- **안전 기준**: raw trajectory, private prompt, credential, live VM state, 로그, 세션, DB, 개인 메모리 원문은 공개 저장소에 기록하지 않습니다.
 
 ## 운영 메모
 

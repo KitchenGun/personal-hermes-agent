@@ -1,0 +1,39 @@
+name: skill_optimization_review
+description: "Evaluate and improve Hermes skills with a SkillOpt-inspired validation gate."
+schedule: manual
+trigger:
+  type: command
+  commands:
+    - "/skills optimize <skill-name>"
+    - "/skills evaluate <skill-name>"
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repository_path: "<YOUR_PUBLIC_PROFILE_REPOSITORY_PATH>"
+  target_skill: "<TARGET_SKILL_NAME_OR_PATH>"
+  sanitized_eval_set_source: "<YOUR_SANITIZED_SKILL_EVAL_CASES>"
+  reference_source: "https://github.com/microsoft/SkillOpt"
+steps:
+  - "Read the target SKILL.md and identify its declared purpose, inputs, procedure, outputs, and safety rules."
+  - "Prepare sanitized train, validation, and holdout cases; stop if cases include secrets, private memory, raw logs, or live runtime state."
+  - "Run or simulate the current skill on train cases and collect only sanitized pass/fail notes."
+  - "Use parallel spark subagents for read-only failure analysis, reuse checks, and regression-risk review."
+  - "Propose the smallest skill patch that addresses repeated failures."
+  - "Accept the patch only if validation improves or a clear safety defect is fixed without weakening other safety rules."
+  - "Run holdout cases after acceptance and report before/after results."
+  - "Discard the change when no measurable benefit or safety improvement is shown."
+output:
+  destination: "<YOUR_MAINTENANCE_CHANNEL>"
+  format: markdown
+tools:
+  - file_read
+  - git
+  - shell
+  - subagent
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  write_access: "explicit-approval-or-local-review-only"
+  secrets: "fail-on-detection"
+  raw_trajectories: "keep-out-of-public-repo"
+  external_code: "do-not-vendor-skillopt-by-default"
+  acceptance_gate: "validation-improvement-or-safety-fix-required"
+status: enabled

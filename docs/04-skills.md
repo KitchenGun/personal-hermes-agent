@@ -26,3 +26,8 @@ Hermes에서 실제 탐색 대상이 되려면 `~/.hermes/config.yaml`의 `skill
 - 새 skill을 만들기 전에 Hermes Skills Hub, agentskills.io, MCP 서버 목록을 확인합니다.
 - 기존 skill이 있으면 그대로 쓰거나 필요한 부분만 공개-safe 형태로 이식합니다.
 - 외부 skill을 참고할 때는 출처, 라이선스, 필요한 도구 범위를 기록합니다.
+
+## 최적화
+
+반복 실패가 있는 skill은 `skills/examples/skill-optimization-review/SKILL.md` 절차로 평가합니다.
+SkillOpt에서 차용한 rollout, reflection, validation gate 구조를 쓰되 raw trajectory와 private runtime state는 공개 저장소에 기록하지 않습니다.

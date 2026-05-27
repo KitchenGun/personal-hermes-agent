@@ -31,6 +31,11 @@ node_modules/
 dist/
 build/
 
+# Skill optimization/runtime artifacts
+outputs/
+skillopt-output/
+.skillopt-runs/
+
 # OS/editor
 .DS_Store
 Thumbs.db
