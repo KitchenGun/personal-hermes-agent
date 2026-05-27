@@ -1,0 +1,10 @@
+[Unit]
+Description=Codex Control API health check and recovery
+After=network-online.target codex-control-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.hermes/codex-control-dashboard
+EnvironmentFile=%h/.hermes/codex-control.env
+ExecStart=%h/.hermes/codex-control-dashboard/dashboard-healthcheck.sh
