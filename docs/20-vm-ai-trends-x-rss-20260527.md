@@ -32,6 +32,7 @@
   - AI_TRENDS_X_RSS_FEED_TIMEOUT_SECONDS=8
   - AI_TRENDS_X_RSS_TOTAL_BUDGET_SECONDS=40
   - AI_TRENDS_X_RSS_FEED_LIMIT=20
+- jobs/hourly, jobs/daily, jobs/weekly YAML env whitelist에 AI_TRENDS_X_RSS_* 이름 추가
 
 ## 등록된 feed URL
 
@@ -56,8 +57,9 @@
 
 ## 운영 설정
 
-/home/ubuntu/.hermes/.env에는 아래 이름만 등록했다. 값 자체는 secret이 아니지만 env 파일 전체는 secret을 포함할 수 있으므로 출력하지 않는다.
+운영 설정과 job env whitelist에는 아래 이름을 사용한다. .env 파일 전체는 secret을 포함할 수 있으므로 출력하지 않는다.
 
+- AI_TRENDS_X_RSS_FEEDS_JSON
 - AI_TRENDS_X_RSS_FEEDS_FILE=/home/ubuntu/.hermes/jobs/config/ai-trends-x-rss-feeds.json
 - AI_TRENDS_X_RSS_FEED_TIMEOUT_SECONDS=8
 - AI_TRENDS_X_RSS_TOTAL_BUDGET_SECONDS=40
@@ -72,11 +74,12 @@
 - 대표 수집 항목: "Qwen 3.7 Max is now supported in Hermes Agent", "Hermes Agent now can orchestrate the OpenHandsDev agents"
 - tests/ai_trends/test_sources.py -> 16 passed
 - python -m pytest -q -> 84 passed
+- job YAML env whitelist 검증 -> hourly/daily/weekly 모두 X RSS env 포함 확인
 
 ## 검증
 
 - python -m compileall -q src tests
-- python -m pytest -q tests/ai_trends/test_sources.py tests/ai_trends/test_config.py -> 21 passed
+- python -m pytest -q tests/ai_trends/test_sources.py tests/ai_trends/test_config.py tests/ai_trends/test_jobs.py -> 27 passed
 - python -m pytest -q -> 84 passed
 - 수동 collect_trend_items(..., x_rss_feeds_json=...) 검증 -> X RSS x_rss_signal 생성 확인
 - env 기반 수동 collect_trend_items(sources=()) 검증 -> x_rss_signal 30개 생성 확인
