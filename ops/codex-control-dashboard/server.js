@@ -1280,6 +1280,10 @@ function summarize(tasks) {
   };
 }
 
+function dispatchableReadyCount(state) {
+  return (state.tasks || []).filter((task) => task.status === 'ready').length;
+}
+
 async function loadBoardState(board) {
   let output;
   if (DASHBOARD_STATE_MODE === 'sqlite') {
@@ -1623,8 +1627,9 @@ function healthGateProbeDecision(state) {
   if (Number(state.summary.running || 0) > 0) {
     return { allowed: false, reason: `running=${state.summary.running}` };
   }
-  if (Number(state.summary.ready || 0) <= 0) {
-    return { allowed: false, reason: 'no ready task' };
+  const dispatchableReady = dispatchableReadyCount(state);
+  if (dispatchableReady <= 0) {
+    return { allowed: false, reason: 'no dispatchable ready task' };
   }
   const lastProbeMs = supervisor.lastHealthGateProbeAt ? Date.parse(supervisor.lastHealthGateProbeAt) : 0;
   const waitMs = SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS * 1000;
@@ -1686,14 +1691,16 @@ async function supervisorTick(reason = 'manual') {
         pushSupervisorLog('warning', `health gate half-open probe dispatch allowed: ${probe.reason}`);
       }
 
-      if (availableSlots > 0 && state.summary.ready > 0) {
+      const dispatchableReady = dispatchableReadyCount(state);
+      const dispatchSlots = Math.min(availableSlots, dispatchableReady);
+      if (dispatchSlots > 0) {
         const output = await runHermes([
           'kanban',
           '--board',
           supervisor.board,
           'dispatch',
           '--max',
-          String(availableSlots),
+          String(dispatchSlots),
           '--failure-limit',
           String(failureLimit),
           '--json',
@@ -1702,9 +1709,9 @@ async function supervisorTick(reason = 'manual') {
         supervisor.lastDispatch = dispatch;
         supervisor.lastError = null;
         const spawned = (dispatch.spawned || []).map((task) => task.task_id).join(', ') || 'none';
-        pushSupervisorLog('info', `dispatch ${reason}: slots=${availableSlots}, spawned=${spawned}`, dispatch);
+        pushSupervisorLog('info', `dispatch ${reason}: slots=${dispatchSlots}, spawned=${spawned}`, dispatch);
       } else {
-        pushSupervisorLog('debug', `tick ${reason}: running=${state.summary.running}, ready=${state.summary.ready}`);
+        pushSupervisorLog('debug', `tick ${reason}: running=${state.summary.running}, ready=${state.summary.ready}, dispatchable_ready=${dispatchableReady}`);
       }
     } else {
       pushSupervisorLog('debug', `tick ${reason}: monitor only`);
