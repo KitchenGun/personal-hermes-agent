@@ -9,6 +9,7 @@
 
 - Runtime repo: /home/ubuntu/.hermes/jobs/repos/ai-trends
 - Cron wrapper: /home/ubuntu/.hermes/scripts/ai-trends-hourly-collector.sh
+- Feed file: /home/ubuntu/.hermes/jobs/config/ai-trends-x-rss-feeds.json
 - Tracking task: codex-control/t_a426b5ac
 
 ## 변경 요약
@@ -30,15 +31,33 @@
   - AI_TRENDS_X_RSS_TOTAL_BUDGET_SECONDS=40
   - AI_TRENDS_X_RSS_FEED_LIMIT=20
 
+## 등록된 feed URL
+
+현재 VM에는 아래 공개 RSS feed를 등록했다.
+
+- https://nitter.net/OpenAIDevs/rss
+- https://nitter.net/AnthropicAI/rss
+- https://nitter.net/llama_index/rss
+- https://nitter.net/simonw/rss
+- https://nitter.net/karpathy/rss
+- https://nitter.net/HamelHusain/rss
+- https://nitter.net/jxnlco/rss
+- https://nitter.net/hwchase17/rss
+
+제외한 후보:
+
+- RSSHub public instance: Twitter API 미설정 오류로 제외
+- xcancel: RSS reader whitelist 안내 feed만 반환해 제외
+- LangChainAI, vercel_ai: nitter fetch 오류로 제외
+
 ## 운영 설정
 
-Example:
+/home/ubuntu/.hermes/.env에는 아래 이름만 등록했다. 값 자체는 secret이 아니지만 env 파일 전체는 secret을 포함할 수 있으므로 출력하지 않는다.
 
-AI_TRENDS_X_RSS_FEEDS_JSON='["https://example.invalid/user/rss"]'
-
-or:
-
-AI_TRENDS_X_RSS_FEEDS_FILE=/path/to/x-rss-feeds.json
+- AI_TRENDS_X_RSS_FEEDS_FILE=/home/ubuntu/.hermes/jobs/config/ai-trends-x-rss-feeds.json
+- AI_TRENDS_X_RSS_FEED_TIMEOUT_SECONDS=8
+- AI_TRENDS_X_RSS_TOTAL_BUDGET_SECONDS=40
+- AI_TRENDS_X_RSS_FEED_LIMIT=20
 
 파일 형식은 URL list 또는 {"feeds": ["https://..."]} object를 지원한다. 값에는 secret, cookie, session 정보를 넣지 않는다.
 
@@ -48,9 +67,11 @@ AI_TRENDS_X_RSS_FEEDS_FILE=/path/to/x-rss-feeds.json
 - python -m pytest -q tests/ai_trends/test_sources.py tests/ai_trends/test_config.py -> 21 passed
 - python -m pytest -q -> 82 passed
 - 수동 collect_trend_items(..., x_rss_feeds_json=...) 검증 -> X RSS x_rss_signal 생성 확인
+- env 기반 수동 collect_trend_items(sources=()) 검증 -> x_rss_signal 30개 생성 확인
 - bash -n /home/ubuntu/.hermes/scripts/ai-trends-hourly-collector.sh
 
 ## 주의
 
 - Runtime repo에는 .git이 없어 변경은 VM runtime에 직접 반영했다.
 - 변경 전 백업: /home/ubuntu/.hermes/backups/ai-trends-x-rss-20260527-
+- nitter public feed는 외부 서비스 상태에 따라 불안정할 수 있다. 실패한 feed는 collector 전체 실패로 전파하지 않고 skip한다.
