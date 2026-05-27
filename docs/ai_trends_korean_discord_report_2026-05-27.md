@@ -29,12 +29,17 @@
 
 실행 위치: `/home/ubuntu/.hermes/jobs/repos/ai-trends`
 
-- `.venv/bin/python -m compileall -q src tests` 통과
-- `.venv/bin/python -m pytest -q` 통과: 91 passed
-- Discord 전송은 수행하지 않았다.
+- `python -m compileall -q src tests` 통과
+- `python -m pytest -q` 통과: 91 passed
+- `PYTHONPATH=src python - <<'PY' ... render_daily_digest_message(...)` dry-run 통과
+  - Discord 전송 없이 X RSS/fallback 샘플 1건을 렌더링했다.
+  - 출력에서 `Hermes agent:` 및 `Fallback(hermes_cli_timeout)`은 노출되지 않았다.
+  - `새 기능/변경점`, `선정 이유`, `근거`, `내 환경에서의 활용` 섹션과 `공개 X RSS 기반 조기 신호` 문구를 확인했다.
+- 실제 Discord 전송은 수행하지 않았다.
 
 ## 운영 메모
 
 - 기존 Google Sheet schema는 변경하지 않았다.
 - Discord 메시지 길이 제한을 고려해 항목별 설명은 짧은 단문 중심으로 유지했다.
-- 테스트 실행을 위해 해당 repo의 `.venv`에 `pytest`와 `PyYAML`을 설치했다.
+- 런타임 repo `/home/ubuntu/.hermes/jobs/repos/ai-trends`는 현재 `.git` 디렉터리가 없는 운영 복사본이라 해당 경로에서 직접 commit/push는 수행할 수 없었다.
+- 운영 환경에 `AI_TRENDS_X_RSS_FEEDS_JSON`/`AI_TRENDS_X_RSS_FEEDS_FILE`이 설정되어 있어, bearer-token 전용 X 테스트는 해당 env를 `monkeypatch.delenv`로 격리하도록 보강했다.
