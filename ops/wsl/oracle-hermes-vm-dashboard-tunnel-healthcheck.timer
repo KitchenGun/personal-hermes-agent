@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Oracle Hermes VM dashboard tunnel health check every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=oracle-hermes-vm-dashboard-tunnel-healthcheck.service
+
+[Install]
+WantedBy=timers.target
