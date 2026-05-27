@@ -1675,7 +1675,9 @@ async function supervisorTick(reason = 'manual') {
       if (gateActive) {
         const probe = healthGateProbeDecision(state);
         if (!probe.allowed) {
-          pushSupervisorLog('debug', `health gate pause: ${probe.reason}`);
+          if (!/^probe backoff /.test(probe.reason)) {
+            pushSupervisorLog('debug', `health gate pause: ${probe.reason}`);
+          }
           return supervisorSnapshot();
         }
         availableSlots = Math.min(1, availableSlots);
