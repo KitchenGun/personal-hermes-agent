@@ -11,7 +11,7 @@
 
 ## 카탈로그
 
-- 단일 카탈로그: 현재 공개 저장소에 반영된 16개 Job 설명: [docs/job-registry.md](../docs/job-registry.md)
+- 단일 카탈로그: 현재 공개 저장소에 반영된 18개 Job 설명: [docs/job-registry.md](../docs/job-registry.md)
 
 ## 분류
 

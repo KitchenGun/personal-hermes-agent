@@ -21,6 +21,7 @@ const stopSupervisor = document.querySelector('#stopSupervisor');
 const tickSupervisor = document.querySelector('#tickSupervisor');
 const supervisorLog = document.querySelector('#supervisorLog');
 
+const DEFAULT_SUPERVISOR_INTERVAL_MS = '300000';
 let board = 'codex-control';
 let timer = null;
 let csrfToken = '';
@@ -161,7 +162,14 @@ function renderSupervisor(data) {
   supervisorStatus.className = data.enabled ? 'live' : '';
   supervisorBoard.textContent = data.board;
   concurrencyInput.value = data.concurrency;
-  intervalSelect.value = String(data.intervalMs);
+  const intervalMs = String(data.intervalMs || DEFAULT_SUPERVISOR_INTERVAL_MS);
+  if (!intervalSelect.querySelector(`option[value="${intervalMs}"]`)) {
+    const option = document.createElement('option');
+    option.value = intervalMs;
+    option.textContent = `${intervalMs}ms`;
+    intervalSelect.appendChild(option);
+  }
+  intervalSelect.value = intervalMs;
   blockedRecoveryInput.checked = Boolean(data.blockedRecovery);
   recoveryAssigneeInput.value = data.recoveryAssignee || 'fixer';
   startSupervisor.disabled = data.enabled || data.runningTick;
@@ -219,7 +227,7 @@ function schedule() {
   timer = setInterval(() => {
     loadState();
     loadSupervisor();
-  }, 5000);
+  }, 30000);
 }
 
 boardSelect.addEventListener('change', () => {

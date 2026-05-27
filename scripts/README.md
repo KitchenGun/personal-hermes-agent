@@ -7,5 +7,6 @@
 - `examples/validate-job-registry.sh`: Job YAML 필수 필드 검증
 - `examples/sync-job-registry.sh`: Cron runner가 registry를 읽는 흐름의 예시
 - `examples/prepare-vm-source-commit.sh`: VM live source 후보를 public-safe import 영역으로 가져오는 절차
+- `weekly_github_sns_publish.js`: 주간 GitHub commit metadata에서 SNS draft, approval, browser handoff, optional API publish 상태를 관리
 
 실제 운영 환경의 credential이나 private path를 스크립트에 하드코딩하지 마세요.

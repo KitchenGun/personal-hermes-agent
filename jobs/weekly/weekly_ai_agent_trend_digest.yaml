@@ -1,0 +1,32 @@
+name: weekly_ai_agent_trend_digest
+description: "Summarize the last 7 days of public AI agent, model routing, and developer tool trends."
+schedule: "0 9 * * 1"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  topics:
+    - "AI agents"
+    - "model routing"
+    - "developer tools"
+  window: "last 7 days"
+  daily_digest_source: "<YOUR_SANITIZED_AI_TREND_DIGEST_SOURCE>"
+steps:
+  - "Reuse sanitized daily trend digests when available."
+  - "Search approved public sources for gaps from the last 7 days."
+  - "Deduplicate overlapping stories and group them by trend."
+  - "Rank trends by novelty, practical impact, and follow-up value."
+  - "Summarize each trend with source links and dates."
+output:
+  destination: "<YOUR_RESEARCH_DIGEST_CHANNEL>"
+  format: markdown
+tools:
+  - file_read
+  - web_search
+model: "${HERMES_RESEARCH_MODEL}"
+safety:
+  sources: "public-only"
+  claims: "cite-sources"
+  private_data: "do-not-include"
+  daily_digest_source: "sanitized-only"
+status: enabled

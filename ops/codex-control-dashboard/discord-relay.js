@@ -5,7 +5,9 @@ const API = 'https://discord.com/api/v10';
 const TOKEN = process.env.DISCORD_BOT_TOKEN || '';
 const ENDPOINT = process.env.DISCORD_RELAY_ENDPOINT || 'http://127.0.0.1:17640/api/discord/task';
 const RESUME_ENDPOINT = process.env.DISCORD_RESUME_ENDPOINT || 'http://127.0.0.1:17640/api/discord/resume';
+const SNS_APPROVAL_ENDPOINT = process.env.DISCORD_SNS_APPROVAL_ENDPOINT || 'http://127.0.0.1:17640/api/sns/approval';
 const STATE_ENDPOINT = process.env.DISCORD_STATE_ENDPOINT || 'http://127.0.0.1:17640/api/summary?board=codex-control';
+const TASK_DETAIL_ENDPOINT = process.env.DISCORD_TASK_DETAIL_ENDPOINT || 'http://127.0.0.1:17640/api/task-detail';
 const STATE_FILE = process.env.DISCORD_RELAY_STATE || path.join(__dirname, 'discord-relay-state.json');
 const SECRET = process.env.DISCORD_SHARED_SECRET || '';
 const CHANNEL_IDS = csvSet(process.env.DISCORD_CHANNEL_IDS || '');
@@ -18,6 +20,7 @@ const QUEUE_ONLY = process.env.DISCORD_QUEUE_ONLY !== '0';
 const QUEUE_NOTICE_COOLDOWN_MS = Number(process.env.DISCORD_QUEUE_NOTICE_COOLDOWN_MS || 60000);
 const QUEUE_PREFIX_RE = /^\s*(?:\[queue\]|\[codex\]|queue:|codex:|task:|codex-task:)\s*/i;
 const RESUME_PREFIX_RE = /^\s*(?:\[resume\]|resume:|unblock:)\s*/i;
+const SNS_APPROVAL_RE = /^\s*\/sns\s+(confirm|deny)\s+([A-Za-z0-9_-]+)(?:\s+(?:run|run_id)[:=]\s*([A-Za-z0-9_-]+))?\s*$/i;
 const SLASH_COMMAND_NAMES = new Set(['queue', 'codex', 'task']);
 
 let socket = null;
@@ -142,6 +145,14 @@ function shouldHandleResume(message) {
   return RESUME_PREFIX_RE.test(String(message.content || ''));
 }
 
+function shouldHandleSnsApproval(message) {
+  if (!message || message.author?.bot) return false;
+  if (isDiscordCommandGeneratedMessage(message)) return false;
+  if (USER_IDS.size && !USER_IDS.has(message.author?.id)) return false;
+  if (CHANNEL_IDS.size && !CHANNEL_IDS.has(message.channel_id)) return false;
+  return SNS_APPROVAL_RE.test(String(message.content || ''));
+}
+
 function mentionsBot(message) {
   return message.mentions?.some((user) => user.id === botUserId)
     || String(message.content || '').includes(`<@${botUserId}>`)
@@ -188,6 +199,16 @@ function parseResume(content) {
     || text.match(/\b(t_[A-Za-z0-9_-]+)\b/)?.[1]
     || '';
   return { taskId, content: text };
+}
+
+function parseSnsApproval(content) {
+  const match = String(content || '').match(SNS_APPROVAL_RE);
+  if (!match) return null;
+  return {
+    decision: match[1].toLowerCase() === 'deny' ? 'deny' : 'confirm',
+    token: match[2],
+    runId: match[3] || '',
+  };
 }
 
 function isTextAttachment(attachment) {
@@ -642,7 +663,9 @@ function buildStatusMessageKo(task, entry) {
       lines.push(`요약: ${koreanBlockSummary(task.blockedReason)}`);
       lines.push(`원문 사유: ${truncate(task.blockedReason, 700)}`);
     }
-    lines.push('참고: Codex 복구 루프가 켜져 있어 복구 작업이 자동 생성될 수 있습니다.');
+    if (task.recoveryEnabled) {
+      lines.push('참고: Codex 복구 루프가 켜져 있어 복구 작업이 자동 생성될 수 있습니다.');
+    }
   }
   if (task.status === 'done' && task.result) {
     lines.push(`결과: ${truncate(task.result, 700)}`);
@@ -699,8 +722,65 @@ function publicNotifyTask(task, blockedReason = '') {
     progress,
     progressStage: task.sanitized_error_class || '',
     blockedReason,
-    needsUserInput: false,
+    needsUserInput: Boolean(task.needs_user_input || task.needsUserInput),
+    requiredInputs: task.required_inputs || task.requiredInputs || [],
+    recoveryEnabled: Boolean(task.recoveryEnabled),
   };
+}
+
+async function loadTaskDetail(task, entry) {
+  if (task.status !== 'blocked') return null;
+  try {
+    const url = new URL(TASK_DETAIL_ENDPOINT);
+    url.searchParams.set('board', entry.board || 'codex-control');
+    url.searchParams.set('id', task.id);
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${SECRET}` },
+    });
+    if (!response.ok) throw new Error(`task detail API failed: ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    log('task detail failed', `${task.id} ${error.message || String(error)}`);
+    return null;
+  }
+}
+
+async function approveSnsDraft(message) {
+  const parsed = parseSnsApproval(message.content);
+  if (!parsed) return;
+  const response = await fetch(SNS_APPROVAL_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(SECRET ? { authorization: `Bearer ${SECRET}` } : {}),
+    },
+    body: JSON.stringify({
+      decision: parsed.decision,
+      token: parsed.token,
+      runId: parsed.runId,
+      userId: message.author?.id || '',
+      approver: message.author?.username || '',
+    }),
+  });
+  const body = await response.text();
+  let result = {};
+  try {
+    result = JSON.parse(body);
+  } catch {}
+  if (!response.ok || !result.ok) {
+    const status = result.status || response.status;
+    await sendDiscordMessage(
+      message.channel_id,
+      `[sns approval blocked] status=${status} error=${result.sanitized_error_class || 'error'}`,
+      message.id,
+    );
+    return;
+  }
+  await sendDiscordMessage(
+    message.channel_id,
+    `[sns approval ${result.status}] run=${result.run_id || '-'} targets=${(result.targets || []).join(',') || '-'}`,
+    message.id,
+  );
 }
 
 async function pollTaskStatus() {
@@ -726,7 +806,14 @@ async function pollTaskStatus() {
       if (!statusChanged && !progressChanged && !blockedReasonChanged) continue;
 
       if ((statusChanged && NOTIFY_STATUSES.has(task.status)) || blockedReasonChanged) {
-        await sendDiscordMessage(entry.channelId, buildStatusMessage(publicNotifyTask(task, blockedReason), entry), entry.messageId);
+        const detail = await loadTaskDetail(task, entry);
+        const reason = detail?.blocked_reason_summary || blockedReason;
+        const notifyTask = publicNotifyTask({
+          ...task,
+          ...(detail || {}),
+          recoveryEnabled: Boolean(state.blockedRecovery),
+        }, reason);
+        await sendDiscordMessage(entry.channelId, buildStatusMessage(notifyTask, entry), entry.messageId);
         log('notified task', `${taskId} status=${task.status}`);
       }
       entry.lastStatus = task.status;
@@ -795,6 +882,14 @@ async function handleMessage(event) {
     || String(event.d.content || '').includes(`<@!${botUserId}>`);
   if (mentioned || CHANNEL_IDS.has(event.d.channel_id)) {
     log('message seen', `channel=${event.d.channel_id} author=${event.d.author?.id || '-'} attachments=${event.d.attachments?.length || 0}`);
+  }
+  if (shouldHandleSnsApproval(event.d)) {
+    try {
+      await approveSnsDraft(event.d);
+    } catch (error) {
+      log('sns approval handling failed', error.message || String(error));
+    }
+    return;
   }
   if (shouldSendQueueOnlyNotice(event.d)) {
     try {

@@ -1,0 +1,41 @@
+name: weekly_github_sns_publish
+description: "Draft and approval-gate weekly SNS updates from sanitized GitHub commit activity, then hand off to logged-in browser compose screens."
+schedule: "30 18 * * 5"
+trigger:
+  type: cron
+  timezone: "${HERMES_TIMEZONE}"
+input:
+  repositories:
+    - "<YOUR_REPOSITORY_SLUG>"
+  scheduled_window:
+    mode: persisted-cursor
+    first_run: "scheduled_at_minus_7d"
+  targets:
+    - linkedin
+    - x
+    - facebook
+    - instagram
+  manual_handoff: true
+steps:
+  - "Collect GitHub commit metadata for the fixed scheduled window using GitHub API first and metadata-only git fallback."
+  - "Sanitize commit subjects, repository metadata, private paths, PII, and secret-like text before draft generation."
+  - "Generate platform-specific SNS drafts and risk report; use browser handoff instead of OAuth token based API writes."
+  - "Create a Codex Control review task with an approval token bound to draft_hash, targets, and scheduled_window."
+  - "After approval, open X intent tweet and LinkedIn/Facebook/Instagram compose handoff; the user clicks the final Post button."
+  - "After user confirmation, mark targets as user_confirmed_posted in VM-local state."
+output:
+  destination: "<YOUR_SNS_REVIEW_CHANNEL>"
+  format: markdown
+tools:
+  - github_api
+  - git_metadata
+  - codex_control_queue
+  - browser_compose_handoff
+model: "${HERMES_REASONING_MODEL}"
+safety:
+  secrets: "vm-local-secret-aliases-only"
+  private_repos: "blocked-by-default"
+  approval: "required-before-publish"
+  api_publish_default: false
+  final_post_click: "user-controlled"
+status: enabled

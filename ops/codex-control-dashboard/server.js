@@ -4,10 +4,18 @@ const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 
-const PORT = Number(process.env.PORT || 17640);
+const PORT = parsePort(process.env.PORT, 17640);
 const HOST = process.env.HOST || '127.0.0.1';
 const ROOT = __dirname;
+const REPO_ROOT = path.resolve(ROOT, '..', '..');
+const JOBS_ROOT = path.join(REPO_ROOT, 'jobs');
 const PUBLIC = path.join(ROOT, 'public');
+let snsAutomation = null;
+try {
+  snsAutomation = require('../../scripts/weekly_github_sns_publish.js');
+} catch {
+  snsAutomation = null;
+}
 const HERMES_BIN = process.env.HERMES_BIN || 'hermes';
 const HERMES_EXEC_MODE = process.env.HERMES_EXEC_MODE || 'native';
 const QUEUE_EXECUTION_PROFILE = cleanProfile(process.env.QUEUE_EXECUTION_PROFILE || 'default', 'default');
@@ -17,8 +25,16 @@ const QUEUE_SPAWNABLE_PROFILES = new Set(
     .map((profile) => cleanProfile(profile, ''))
     .filter(Boolean),
 );
-const SUPERVISOR_AUTO_START = /^(1|true|yes|on)$/i.test(String(process.env.SUPERVISOR_AUTO_START || '1'));
+const SUPERVISOR_AUTO_START = /^(1|true|yes|on)$/i.test(String(process.env.SUPERVISOR_AUTO_START || '0'));
 const SUPERVISOR_DEFAULT_BOARD = process.env.SUPERVISOR_BOARD || 'codex-control';
+const SUPERVISOR_MIN_INTERVAL_MS = 5000;
+const SUPERVISOR_MAX_INTERVAL_MS = 300000;
+const SUPERVISOR_DEFAULT_INTERVAL_MS = clampInt(
+  process.env.SUPERVISOR_INTERVAL_MS,
+  300000,
+  SUPERVISOR_MIN_INTERVAL_MS,
+  SUPERVISOR_MAX_INTERVAL_MS,
+);
 const DASHBOARD_BOARDS = String(process.env.DASHBOARD_BOARDS || 'codex-control,default,kk-job,hermes-hybrid')
   .split(',')
   .map((slug) => cleanBoard(slug))
@@ -46,6 +62,13 @@ const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
 
+function parsePort(raw, fallback) {
+  const value = raw === undefined || raw === null || raw === '' ? fallback : Number(raw);
+  if (Number.isInteger(value) && value >= 1 && value <= 65535) return value;
+  console.error(`invalid PORT: ${raw}`);
+  process.exit(1);
+}
+
 if (!CONTROL_SHARED_SECRET) {
   console.error('CONTROL_SHARED_SECRET is required for dashboard control endpoints.');
   process.exit(1);
@@ -60,7 +83,7 @@ const supervisor = {
   enabled: false,
   board: 'codex-control',
   concurrency: Math.max(1, Math.min(8, Number(process.env.SUPERVISOR_CONCURRENCY || 4) || 4)),
-  intervalMs: 15000,
+  intervalMs: SUPERVISOR_DEFAULT_INTERVAL_MS,
   failureLimit: 2,
   startedAt: null,
   lastTickAt: null,
@@ -92,6 +115,18 @@ function errJson(res, status, message) {
     'cache-control': 'no-store',
   });
   res.end(body);
+}
+
+function redirect(res, location) {
+  res.writeHead(302, {
+    location,
+    'cache-control': 'no-store',
+  });
+  res.end();
+}
+
+function wantsHtml(req) {
+  return /\btext\/html\b/i.test(String(req.headers.accept || ''));
 }
 
 class HttpError extends Error {
@@ -203,6 +238,31 @@ function publicTaskDto(task) {
   };
 }
 
+async function publicTaskDetailDto(board, taskId) {
+  const task = safeTaskId(taskId);
+  if (!task) throw new HttpError(400, 'invalid task id');
+  const details = await loadTaskDetails(board, task);
+  const rawTask = details.task || details;
+  const logText = DASHBOARD_FAST_STATE ? '' : '';
+  const blockInfo = userInputBlockInfo(rawTask, details, logText);
+  const errorSource = rawTask.error || rawTask.lastError || rawTask.blocked_reason || details.latest_summary || '';
+  const reason = sanitizeNotificationReason(blockInfo.blockedReason || errorSource || rawTask.status || '');
+  return {
+    id: sanitizePublicText(task, 64),
+    title: sanitizePublicText(rawTask.title || details.title || 'Untitled task', 180),
+    status: sanitizePublicText(rawTask.status || details.status || 'blocked', 32),
+    assignee: sanitizePublicText(rawTask.assignee || details.assignee || '-', 64),
+    sanitized_error_class: sanitizeErrorClass(errorSource || reason),
+    blocked_reason_summary: reason,
+    needs_user_input: Boolean(blockInfo.needsUserInput),
+    required_inputs: blockInfo.requiredInputs.map((item) => ({
+      name: sanitizePublicText(item.name, 80),
+      secret: Boolean(item.secret),
+    })),
+    updated_at: taskUpdatedAt(rawTask),
+  };
+}
+
 function publicSummaryDto(state) {
   return {
     board: sanitizePublicText(state.board, 64),
@@ -264,6 +324,10 @@ function cleanText(raw, maxLength) {
   return String(raw || '').replace(/\r\n/g, '\n').trim().slice(0, maxLength);
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function safeTaskId(raw) {
   const value = String(raw || '').trim();
   return /^t_[A-Za-z0-9_-]+$/.test(value) ? value : '';
@@ -311,8 +375,12 @@ function runHermesLong(args, timeout = 120000) {
 }
 
 function readBoardSqlite(board) {
+  const script = path.join(ROOT, 'board-state.py');
+  if (!fs.existsSync(script)) {
+    return readBoardKanban(board);
+  }
   return new Promise((resolve, reject) => {
-    execFile('python3', [path.join(ROOT, 'board-state.py'), board], { timeout: 10000 }, (error, stdout, stderr) => {
+    execFile('python3', [script, board], { timeout: 10000 }, (error, stdout, stderr) => {
       if (error) {
         const message = (stderr || stdout || error.message || '').trim();
         reject(new Error(message || 'sqlite board state failed'));
@@ -321,6 +389,26 @@ function readBoardSqlite(board) {
       resolve(stdout);
     });
   });
+}
+
+async function readBoardKanban(board) {
+  const listArgs = [
+    'kanban',
+    '--board',
+    board,
+    'list',
+    '--json',
+  ];
+  if (DASHBOARD_INCLUDE_ARCHIVED) listArgs.push('--archived');
+  if (kanbanListSupportsSort) {
+    try {
+      return await runHermes([...listArgs, '--sort', 'priority-desc']);
+    } catch (error) {
+      if (!/unrecognized arguments: --sort/.test(String(error.message || error))) throw error;
+      kanbanListSupportsSort = false;
+    }
+  }
+  return runHermes(listArgs);
 }
 
 function boolValue(value, fallback) {
@@ -520,6 +608,12 @@ function extractRequiredInputs(text) {
   return found.slice(0, 12);
 }
 
+function sanitizeNotificationReason(raw, maxLength = 900) {
+  const text = sanitizePublicText(raw || '', maxLength)
+    .replace(/\b[A-Za-z0-9_.-]*(?:TOKEN|SECRET|KEY|WEBHOOK|PASSWORD|COOKIE|AUTH|BEARER)[A-Za-z0-9_.-]*\b/gi, '[redacted]');
+  return cleanText(text || 'No detailed blocked reason was available.', maxLength);
+}
+
 function userInputBlockInfo(task, details, logText = '') {
   const text = blockedContextText(details, logText);
   const reason = cleanText(details?.latest_summary || text.replace(/\s+/g, ' '), 900);
@@ -528,6 +622,87 @@ function userInputBlockInfo(task, details, logText = '') {
     requiredInputs: extractRequiredInputs(text),
     blockedReason: reason,
   };
+}
+
+function listRegistryYamlFiles(dir) {
+  const files = [];
+  if (!fs.existsSync(dir)) return files;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listRegistryYamlFiles(full));
+    } else if (/\.ya?ml$/i.test(entry.name)) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+function readRegistryJobs() {
+  return listRegistryYamlFiles(JOBS_ROOT).map((file) => {
+    const content = fs.readFileSync(file, 'utf8');
+    const name = content.match(/^name:\s*["']?([^"'\r\n#]+)["']?\s*$/m)?.[1]?.trim();
+    if (!name) return null;
+    return {
+      name,
+      file,
+      relativePath: path.relative(REPO_ROOT, file).replace(/\\/g, '/'),
+      content: cleanText(content, 10000),
+    };
+  }).filter(Boolean);
+}
+
+function findManualRegistryJob(input) {
+  const text = `${input.title || ''}\n${input.detail || input.body || input.description || ''}`;
+  const normalized = text.replace(/[-\s]+/g, '_');
+  const jobs = readRegistryJobs();
+  const exact = jobs.find((job) => {
+    const name = escapeRegExp(job.name);
+    return new RegExp(`(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$)`, 'i').test(text)
+      || new RegExp(`(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$)`, 'i').test(normalized);
+  });
+  if (exact) return exact;
+  if (!/\b(job|registry|manual|수동|실행|호출)\b|작업|잡/i.test(text)) return null;
+  return null;
+}
+
+function registryJobAssignee(job, fallback) {
+  const content = job?.content || '';
+  if (/web_search|research|trend|digest|검색|조사/i.test(content)) return 'researcher';
+  if (/shell|git|file_read|validation|검증/i.test(content)) return 'coder';
+  return fallback || 'default';
+}
+
+function buildManualRegistryJobBody(input, detail, job) {
+  return [
+    `Source: ${cleanText(input.source || 'api', 80)}`,
+    '',
+    `Manual Job Registry invocation: ${job.name}`,
+    `Job file: ${job.relativePath}`,
+    '',
+    'Original request:',
+    detail || input.title || job.name,
+    '',
+    'Execution instructions:',
+    '- Run this registry job now as a manual invocation. Ignore the cron schedule for this run.',
+    '- Follow the job definition steps, tools, model intent, output format, and safety rules.',
+    '- Reuse prior daily results only when they are available in approved sanitized sources.',
+    '- If a non-secret tool is unavailable but a public-safe equivalent exists, use the equivalent and note it in verification instead of blocking.',
+    '- Block only when required user-controlled private input, credentials, or permission is truly missing.',
+    '- Cite public sources for factual claims and keep the report in Korean unless the job says otherwise.',
+    '- During long work, comment `[PROGRESS] <percent> - <stage>` after meaningful milestones.',
+    '',
+    'Job definition:',
+    '```yaml',
+    job.content,
+    '```',
+    '',
+    'Completion report:',
+    '- Summary',
+    '- Sources',
+    '- Verification',
+    '- Blockers or follow-up tasks',
+  ].join('\n');
 }
 
 function inferTaskActivity(task, details, logText) {
@@ -596,10 +771,15 @@ async function enrichTaskProgress(board, task) {
 
 function fallbackTaskSpec(input) {
   const detail = cleanText(input.detail || input.body || input.description, 8000);
-  const title = cleanText(input.title || detail.split('\n')[0] || 'Untitled task', 160);
+  const registryJob = findManualRegistryJob({ ...input, detail });
+  const title = cleanText(
+    registryJob ? `Manual job: ${registryJob.name}` : input.title || detail.split('\n')[0] || 'Untitled task',
+    160,
+  );
   const combined = `${title}\n${detail}`.toLowerCase();
   const assignee = cleanProfile(
     input.assignee
+      || (registryJob ? registryJobAssignee(registryJob, null) : '')
       || (/(test|qa|검증|테스트)/.test(combined) ? 'tester'
       : /(review|리뷰|검토)/.test(combined) ? 'reviewer'
       : /(research|조사|리서치|검색)/.test(combined) ? 'researcher'
@@ -614,7 +794,7 @@ function fallbackTaskSpec(input) {
     0,
     100,
   );
-  const body = [
+  const body = registryJob ? buildManualRegistryJobBody(input, detail, registryJob) : [
     `Source: ${cleanText(input.source || 'api', 80)}`,
     '',
     'Original request:',
@@ -640,7 +820,7 @@ function fallbackTaskSpec(input) {
     assignee,
     priority,
     workspace: cleanText(input.workspace || 'scratch', 120) || 'scratch',
-    maxRuntime: cleanText(input.maxRuntime || '30m', 32),
+    maxRuntime: cleanText(input.maxRuntime || (registryJob ? '45m' : '30m'), 32),
     maxRetries: clampInt(input.maxRetries, 2, 1, 10),
     skills: Array.isArray(input.skills) ? input.skills.map((skill) => cleanText(skill, 64)).filter(Boolean).slice(0, 4) : [],
     orchestrated: false,
@@ -1000,7 +1180,7 @@ async function createKanbanSwarm(input, board, plan) {
     synthesizer: swarmCreated.synthesizer_id,
     source: input.source || 'api',
   });
-  supervisorTick('task-create').catch(() => {});
+  supervisorTick('task-create', { runWork: true }).catch(() => {});
   return { created: true, board, mode: 'swarm', spec: plan.spec, swarm: plan.swarm, task, swarmCreated };
 }
 
@@ -1053,7 +1233,7 @@ async function createKanbanTask(input) {
     priority: spec.priority,
     source: input.source || 'api',
   });
-  supervisorTick('task-create').catch(() => {});
+  supervisorTick('task-create', { runWork: true }).catch(() => {});
   return { created: true, board, mode: 'task', spec, task };
 }
 
@@ -1102,7 +1282,7 @@ async function resumeBlockedTask(input) {
     await runHermesLong(['kanban', '--board', board, 'unblock', taskId], 60000);
   }
   pushSupervisorLog('info', `user input received: ${taskId}`, { board, unblocked: shouldUnblock });
-  if (shouldUnblock) supervisorTick('user-input-resume').catch(() => {});
+  if (shouldUnblock) supervisorTick('user-input-resume', { runWork: true }).catch(() => {});
   return { ok: true, board, taskId, unblocked: shouldUnblock };
 }
 
@@ -1254,23 +1434,7 @@ async function loadBoardState(board) {
   if (DASHBOARD_STATE_MODE === 'sqlite') {
     output = await readBoardSqlite(board);
   } else {
-    const listArgs = [
-      'kanban',
-      '--board',
-      board,
-      'list',
-      '--json',
-    ];
-    if (DASHBOARD_INCLUDE_ARCHIVED) listArgs.push('--archived');
-    if (kanbanListSupportsSort) {
-      try {
-        output = await runHermes([...listArgs, '--sort', 'priority-desc']);
-      } catch (error) {
-        if (!/unrecognized arguments: --sort/.test(String(error.message || error))) throw error;
-        kanbanListSupportsSort = false;
-      }
-    }
-    if (!output) output = await runHermes(listArgs);
+    output = await readBoardKanban(board);
   }
   const rawTasks = JSON.parse(output);
   rawTasks.sort((left, right) => Number(right.priority || 0) - Number(left.priority || 0));
@@ -1479,11 +1643,12 @@ function scheduleSupervisor() {
   if (!supervisor.enabled) return;
   supervisor.nextTickAt = new Date(Date.now() + supervisor.intervalMs).toISOString();
   supervisor.timer = setTimeout(() => {
-    supervisorTick('timer').catch(() => {});
+    supervisorTick('timer', { runWork: true }).catch(() => {});
   }, supervisor.intervalMs);
 }
 
-async function supervisorTick(reason = 'manual') {
+async function supervisorTick(reason = 'manual', options = {}) {
+  const runWork = Boolean(options.runWork ?? supervisor.enabled);
   if (supervisor.runningTick) {
     return supervisorSnapshot();
   }
@@ -1496,7 +1661,7 @@ async function supervisorTick(reason = 'manual') {
     supervisor.lastError = null;
     detectTransitions(state.tasks);
 
-    if (supervisor.enabled) {
+    if (runWork) {
       const recoveryCreated = await processBlockedRecoveries(supervisor.board, state);
       if (recoveryCreated) {
         state = await loadBoardState(supervisor.board);
@@ -1542,14 +1707,14 @@ function startSupervisor(config) {
   if (!board) throw new Error('invalid board slug');
   supervisor.board = board;
   supervisor.concurrency = clampInt(config.concurrency, supervisor.concurrency, 1, 8);
-  supervisor.intervalMs = clampInt(config.intervalMs, supervisor.intervalMs, 5000, 60000);
+  supervisor.intervalMs = clampInt(config.intervalMs, supervisor.intervalMs, SUPERVISOR_MIN_INTERVAL_MS, SUPERVISOR_MAX_INTERVAL_MS);
   supervisor.failureLimit = clampInt(config.failureLimit, supervisor.failureLimit, 1, 10);
   supervisor.blockedRecovery = boolValue(config.blockedRecovery, supervisor.blockedRecovery);
   supervisor.recoveryAssignee = cleanProfile(config.recoveryAssignee, supervisor.recoveryAssignee);
   supervisor.enabled = true;
   supervisor.startedAt = new Date().toISOString();
   pushSupervisorLog('info', `supervisor started on ${supervisor.board}`);
-  supervisorTick('start').catch(() => {});
+  supervisorTick('start', { runWork: true }).catch(() => {});
   return supervisorSnapshot();
 }
 
@@ -1603,6 +1768,22 @@ async function apiSummary(req, res) {
   okJson(res, publicSummaryDto(await loadBoardState(board)));
 }
 
+async function apiTaskDetail(req, res) {
+  assertSharedSecret(req);
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const board = cleanBoard(url.searchParams.get('board') || supervisor.board || 'codex-control');
+  const taskId = safeTaskId(url.searchParams.get('id') || url.searchParams.get('taskId'));
+  if (!board) {
+    errJson(res, 400, 'invalid board slug');
+    return;
+  }
+  if (!taskId) {
+    errJson(res, 400, 'invalid task id');
+    return;
+  }
+  okJson(res, await publicTaskDetailDto(board, taskId));
+}
+
 function apiHealth(req, res) {
   okJson(res, {
     ok: true,
@@ -1615,7 +1796,15 @@ function apiHealth(req, res) {
 async function apiSupervisor(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'GET') {
-    okJson(res, supervisorSnapshot());
+    if (url.pathname === '/api/supervisor') {
+      okJson(res, supervisorSnapshot());
+      return;
+    }
+    if (url.pathname === '/api/supervisor/tick' && wantsHtml(req)) {
+      redirect(res, '/');
+      return;
+    }
+    errJson(res, url.pathname === '/api/supervisor/tick' ? 405 : 404, 'not found');
     return;
   }
   if (req.method !== 'POST') {
@@ -1637,7 +1826,7 @@ async function apiSupervisor(req, res) {
     return;
   }
   if (url.pathname === '/api/supervisor/tick') {
-    okJson(res, await supervisorTick('manual'));
+    okJson(res, await supervisorTick('manual', { runWork: true }));
     return;
   }
   errJson(res, 404, 'not found');
@@ -1740,9 +1929,50 @@ async function apiDiscord(req, res) {
   errJson(res, 404, 'not found');
 }
 
+async function apiSns(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method !== 'POST') {
+    errJson(res, 405, 'method not allowed');
+    return;
+  }
+  if (url.pathname !== '/api/sns/approval') {
+    errJson(res, 404, 'not found');
+    return;
+  }
+  try {
+    assertControlAuth(req);
+  } catch (controlError) {
+    assertSharedSecret(req);
+  }
+  if (!snsAutomation) {
+    errJson(res, 503, 'sns automation runner is not available');
+    return;
+  }
+  const body = await readJson(req);
+  const result = await snsAutomation.approveRun({
+    stateDir: process.env.SNS_AUTOMATION_STATE_DIR,
+    runId: body.runId || body.run_id,
+    token: body.token,
+    decision: body.decision || body.action,
+    targets: body.targets,
+    draftHash: body.draftHash || body.draft_hash,
+    windowUntil: body.windowUntil || body.window_until,
+    userId: body.userId || body.user_id || body.approver,
+    approver: body.approver,
+  });
+  okJson(res, {
+    ok: Boolean(result.ok),
+    run_id: sanitizePublicText(result.run_id || body.runId || body.run_id || '', 80),
+    status: sanitizePublicText(result.status || 'blocked', 40),
+    targets: Array.isArray(result.targets) ? result.targets.map((target) => sanitizePublicText(target, 32)) : [],
+    draft_hash: sanitizePublicText(result.draft_hash || '', 80),
+    sanitized_error_class: result.ok ? null : sanitizeErrorClass(result.error || result.status),
+  });
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+  const rel = ['/', '/dashboard', '/ui'].includes(url.pathname) ? 'index.html' : url.pathname.slice(1);
   const file = path.normalize(path.join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC)) {
     res.writeHead(403);
@@ -1779,6 +2009,10 @@ const server = http.createServer(async (req, res) => {
       await apiState(req, res);
       return;
     }
+    if (req.url.startsWith('/api/task-detail')) {
+      await apiTaskDetail(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/boards')) {
       okJson(res, { boards: staticBoards() });
       return;
@@ -1791,6 +2025,10 @@ const server = http.createServer(async (req, res) => {
       await apiTasks(req, res);
       return;
     }
+    if (req.url.startsWith('/api/sns')) {
+      await apiSns(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/discord')) {
       await apiDiscord(req, res);
       return;
@@ -1801,6 +2039,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ error: error.message || String(error) }));
   }
+});
+
+server.on('error', (error) => {
+  console.error(`dashboard listen failed host=${HOST} port=${PORT}: ${error.message || String(error)}`);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

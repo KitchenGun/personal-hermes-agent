@@ -51,6 +51,7 @@ ops/codex-control-dashboard/
 - Discord relay endpoint는 `DISCORD_SHARED_SECRET`이 필요합니다.
 - `DISCORD_PUBLIC_KEY`는 Discord Interactions를 활성화할 때만 필요합니다.
 - `/api/summary`는 raw object redaction이 아니라 allowlist DTO만 반환합니다.
+- `/api/task-detail`은 Discord relay 인증이 있을 때만 차단 작업의 정제된 원인 요약을 반환합니다.
 - raw `/api/state`는 인증이 필요합니다.
 
 관련 문서:
@@ -59,6 +60,7 @@ ops/codex-control-dashboard/
 - `docs/12-codex-control-dashboard.md`
 - `docs/13-vm-source-commit-prep.md`
 - `docs/14-live-hermes-feature-changes.md`
+- `docs/16-weekly-github-sns-publish.md`
 
 ## Summary Endpoint Contract
 
@@ -119,7 +121,9 @@ smoke test 기대 항목:
 - valid bearer token dry-run은 `200`을 반환합니다.
 - valid localhost CSRF dry-run은 `200`을 반환합니다.
 - raw state endpoint는 unauthenticated access를 거부합니다.
+- task detail endpoint는 unauthenticated access를 거부합니다.
 - Discord relay mutation endpoint는 unauthenticated access를 거부합니다.
+- SNS approval endpoint는 unauthenticated access를 거부합니다.
 
 ## 공개 규칙
 

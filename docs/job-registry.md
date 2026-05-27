@@ -20,10 +20,12 @@
 | 10 | `weekly_game_jobs_digest` | [`jobs/research/weekly_game_jobs_digest.yaml`](../jobs/research/weekly_game_jobs_digest.yaml) | research | 매주 월요일 09:00 | enabled | 정제된 공개 게임 업계 채용 목록에서 주간 매칭 digest를 생성합니다. |
 | 11 | `self_review_generator` | [`jobs/weekly/self_review_generator.yaml`](../jobs/weekly/self_review_generator.yaml) | weekly | 매주 일요일 20:00 | enabled | 주간 작업 요약에서 성과, 막힘, 다음 행동을 정리합니다. |
 | 12 | `weekly_github_summary` | [`jobs/weekly/weekly_github_summary.yaml`](../jobs/weekly/weekly_github_summary.yaml) | weekly | 매주 금요일 18:00 | enabled | 허가된 저장소의 커밋, PR, 이슈, 릴리스를 주간 요약합니다. |
-| 13 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
-| 14 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
-| 15 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
-| 16 | `skill_optimization_review` | [`jobs/maintenance/skill_optimization_review.yaml`](../jobs/maintenance/skill_optimization_review.yaml) | maintenance | 수동 명령 | enabled | SkillOpt에서 차용한 rollout/reflection/validation gate 절차로 Hermes skill 개선 여부를 평가합니다. |
+| 13 | `weekly_github_sns_publish` | [`jobs/weekly/weekly_github_sns_publish.yaml`](../jobs/weekly/weekly_github_sns_publish.yaml) | weekly | 매주 금요일 18:30 | enabled | 주간 GitHub 커밋 요약을 SNS 초안으로 만들고 승인 뒤 브라우저 작성창으로 handoff합니다. |
+| 14 | `daily-brief-example` | [`jobs/examples/daily-brief.job.yaml`](../jobs/examples/daily-brief.job.yaml) | examples | 매일 09:00 | draft | 캘린더·작업·날씨 입력을 합성/익명화해 일일 브리핑 예시를 만듭니다. |
+| 15 | `repo-maintenance-example` | [`jobs/examples/repo-maintenance.job.yaml`](../jobs/examples/repo-maintenance.job.yaml) | examples | 수동 실행 | draft | 문서 링크, 예시 설정, secret hygiene를 점검하는 저장소 유지보수 예시입니다. |
+| 16 | `workout_automation_safeguards` | [`jobs/maintenance/workout_automation_safeguards.yaml`](../jobs/maintenance/workout_automation_safeguards.yaml) | maintenance | 수동 승인 명령 | enabled | 운동 일정 자동화의 Calendar write를 확인 토큰, gid 검증, idempotent upsert 뒤에만 허용합니다. |
+| 17 | `weekly_ai_agent_trend_digest` | [`jobs/weekly/weekly_ai_agent_trend_digest.yaml`](../jobs/weekly/weekly_ai_agent_trend_digest.yaml) | weekly | 매주 월요일 09:00 | enabled | 최근 7일 공개 AI agent/model routing/developer tools 트렌드를 주간 digest로 요약합니다. |
+| 18 | `skill_optimization_review` | [`jobs/maintenance/skill_optimization_review.yaml`](../jobs/maintenance/skill_optimization_review.yaml) | maintenance | 수동 명령 | enabled | SkillOpt에서 차용한 rollout/reflection/validation gate 절차로 Hermes skill 개선 여부를 평가합니다. |
 
 ## 항목별 설명
 
@@ -123,6 +125,22 @@
 - **주요 단계**: 한 주간 커밋·PR·이슈·릴리스 수집, 저장소와 주제별 그룹화, 토큰을 노출하지 않는 후속 작업 정리.
 - **출력**: `<YOUR_WEEKLY_SUMMARY_CHANNEL>` placeholder 대상으로 markdown 요약 제공.
 - **안전 기준**: secret은 redact하고, private repository는 승인된 범위에서만 다룹니다.
+
+### `weekly_github_sns_publish`
+
+- **목적**: 고정된 주간 GitHub commit window를 SNS 게시 초안으로 변환하고, 승인된 경우에만 브라우저 작성창으로 handoff합니다.
+- **입력**: `<YOUR_REPOSITORY_SLUG>`, `<YOUR_SNS_REVIEW_CHANNEL>`, target platform placeholder.
+- **주요 단계**: GitHub API 우선 수집, metadata-only git fallback, sanitization gate, 플랫폼별 draft, approval token 생성, browser handoff, VM-local ledger/audit 기록.
+- **출력**: `<YOUR_SNS_REVIEW_CHANNEL>` placeholder 대상으로 draft와 risk report를 제공하고, 승인 후 X intent 및 LinkedIn/Facebook/Instagram compose를 준비합니다.
+- **안전 기준**: 플랫폼 OAuth token 없이 로그인된 브라우저 세션을 사용하고, private repository는 기본 차단하며, free-text 승인은 무시합니다.
+
+### `weekly_ai_agent_trend_digest`
+
+- **목적**: 최근 7일의 공개 AI agents, model routing, developer tools 트렌드를 주간 digest로 정리합니다.
+- **입력**: 공개 조사 주제 목록, `last 7 days` window, `<YOUR_SANITIZED_AI_TREND_DIGEST_SOURCE>` placeholder.
+- **주요 단계**: 정제된 일간 digest 재사용, 누락분 공개 검색, 중복 제거, 새로움·실무 영향·후속 가치 기준 랭킹, 출처와 날짜 포함 요약.
+- **출력**: `<YOUR_RESEARCH_DIGEST_CHANNEL>` placeholder 대상으로 markdown digest 생성.
+- **안전 기준**: 공개 자료만 사용하고, daily digest source는 sanitized 자료만 허용합니다.
 
 ### `daily-brief-example`
 

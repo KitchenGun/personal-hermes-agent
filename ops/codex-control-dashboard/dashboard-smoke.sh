@@ -38,11 +38,35 @@ expect_forbidden() {
 }
 
 health_json="$tmpdir/health.json"
+dashboard_html="$tmpdir/dashboard.html"
+asset_out="$tmpdir/asset.out"
 summary_json="$tmpdir/summary.json"
 post_json="$tmpdir/post.json"
+supervisor_snapshot_json="$tmpdir/supervisor-snapshot.json"
 
 health_code="$(code GET "$BASE/api/health" "$health_json")"
 expect_code 200 "$health_code" "health"
+
+dashboard_code="$(code GET "$BASE/" "$dashboard_html")"
+expect_code 200 "$dashboard_code" "dashboard root"
+
+node - "$dashboard_html" <<'JS'
+const fs = require('node:fs');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+if (!html.includes('Kanban Control Dashboard')) {
+  throw new Error('dashboard root did not include expected title');
+}
+JS
+echo "PASS dashboard root content"
+
+app_code="$(code GET "$BASE/app.js" "$asset_out")"
+expect_code 200 "$app_code" "dashboard app.js"
+
+styles_code="$(code GET "$BASE/styles.css" "$asset_out")"
+expect_code 200 "$styles_code" "dashboard styles.css"
+
+tick_get_code="$(code GET "$BASE/api/supervisor/tick" "$post_json" -H 'accept: text/html')"
+expect_code 302 "$tick_get_code" "browser GET supervisor tick redirects"
 
 summary_code="$(code GET "$BASE/api/summary?board=$BOARD" "$summary_json")"
 expect_code 200 "$summary_code" "summary"
@@ -109,6 +133,46 @@ JS
 )"
 expect_code 200 "$csrf_code" "supervisor valid csrf dry-run"
 
+supervisor_snapshot_code="$(code GET "$BASE/api/supervisor" "$supervisor_snapshot_json")"
+expect_code 200 "$supervisor_snapshot_code" "supervisor snapshot"
+
+node - "$supervisor_snapshot_json" <<'JS'
+const fs = require('node:fs');
+const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (data.intervalMs !== 300000) {
+  throw new Error(`supervisor default intervalMs expected 300000 got ${data.intervalMs}`);
+}
+JS
+echo "PASS supervisor default intervalMs"
+read -r initial_supervisor_enabled initial_supervisor_interval < <(node - "$supervisor_snapshot_json" <<'JS'
+const fs = require('node:fs');
+const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+process.stdout.write(`${Boolean(data.enabled)} ${Number(data.intervalMs)}`);
+JS
+)
+
+start_code="$(code POST "$BASE/api/supervisor/start" "$post_json" -H 'content-type: application/json' -H "authorization: Bearer $CONTROL_SHARED_SECRET" --data '{"intervalMs":300000}')"
+expect_code 200 "$start_code" "supervisor start intervalMs 300000"
+
+node - "$post_json" <<'JS'
+const fs = require('node:fs');
+const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (data.intervalMs !== 300000) {
+  throw new Error(`supervisor start intervalMs expected 300000 got ${data.intervalMs}`);
+}
+JS
+echo "PASS supervisor start intervalMs preserved"
+
+if [[ "$initial_supervisor_enabled" == "false" ]]; then
+  supervisor_stop_code="$(code POST "$BASE/api/supervisor/stop" "$post_json" -H 'content-type: application/json' -H "authorization: Bearer $CONTROL_SHARED_SECRET" --data '{}')"
+  expect_code 200 "$supervisor_stop_code" "supervisor stop cleanup"
+else
+  if [[ "$initial_supervisor_interval" != "300000" ]]; then
+    supervisor_restore_code="$(code POST "$BASE/api/supervisor/start" "$post_json" -H 'content-type: application/json' -H "authorization: Bearer $CONTROL_SHARED_SECRET" --data "{\"intervalMs\":$initial_supervisor_interval}")"
+    expect_code 200 "$supervisor_restore_code" "supervisor restore interval"
+  fi
+fi
+
 task_no_token_code="$(code POST "$BASE/api/tasks/create" "$post_json" -H 'content-type: application/json' --data '{}')"
 expect_forbidden "$task_no_token_code" "task create no token"
 
@@ -120,6 +184,18 @@ expect_forbidden "$state_no_token_code" "raw state no token"
 
 state_bad_token_code="$(code GET "$BASE/api/state?board=$BOARD" "$post_json" -H 'authorization: Bearer invalid')"
 expect_forbidden "$state_bad_token_code" "raw state bad token"
+
+task_detail_no_token_code="$(code GET "$BASE/api/task-detail?board=$BOARD&id=t_example" "$post_json")"
+expect_forbidden "$task_detail_no_token_code" "task detail no token"
+
+task_detail_bad_token_code="$(code GET "$BASE/api/task-detail?board=$BOARD&id=t_example" "$post_json" -H 'authorization: Bearer invalid')"
+expect_forbidden "$task_detail_bad_token_code" "task detail bad token"
+
+sns_approval_no_token_code="$(code POST "$BASE/api/sns/approval" "$post_json" -H 'content-type: application/json' --data '{}')"
+expect_forbidden "$sns_approval_no_token_code" "sns approval no token"
+
+sns_approval_bad_token_code="$(code POST "$BASE/api/sns/approval" "$post_json" -H 'content-type: application/json' -H 'authorization: Bearer invalid' --data '{}')"
+expect_forbidden "$sns_approval_bad_token_code" "sns approval bad token"
 
 discord_task_no_token_code="$(code POST "$BASE/api/discord/task" "$post_json" -H 'content-type: application/json' --data '{}')"
 expect_forbidden "$discord_task_no_token_code" "discord task no token"
