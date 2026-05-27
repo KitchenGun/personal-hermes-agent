@@ -1,17 +1,17 @@
 # Codex Control worker crash gate (2026-05-27)
 
-## 목적
+## 배경
 
-- swarm dispatch 자체는 병렬로 동작했지만, `openai-codex` 호출 레이어 장애가 나면 모든 worker와 recovery worker가 같은 오류로 연쇄 차단된다.
-- 같은 런타임 장애가 반복될 때는 새 작업과 복구 작업을 계속 투입하지 않고, supervisor가 즉시 멈춰 원인을 드러내야 한다.
+- swarm dispatch 자체는 병렬로 동작하지만, `openai-codex` 호출 레이어 장애가 나면 모든 worker와 recovery worker가 같은 오류로 연쇄 차단된다.
+- 대표 오류는 `Non-streaming API call timed out`, `'NoneType' object is not iterable`, `pid ... not alive` 이다.
+- 이 오류는 개별 작업 구현 실패가 아니라 공통 provider/worker 런타임 장애로 분류한다.
 
-## 적용 내용
+## 기존 gate 정책
 
 - `worker_crash_storm` health gate를 `codex-control-dashboard` supervisor에 추가했다.
-- 최근 1시간 안에 `pid ... not alive`, `NoneType object is not iterable`, non-streaming timeout, non-retryable client error 계열 worker 실패가 3개 이상 감지되면 gate가 active 된다.
-- gate가 active인 동안 supervisor는 신규 `dispatch`와 blocked recovery 생성을 건너뛴다.
-- dashboard supervisor 패널에 `health gate on` 상태와 원인 메시지를 표시한다.
-- 기존 worker, Hermes gateway, 전역 Hermes 모델 설정은 변경하지 않았다.
+- 최근 blocked task의 run history에서 시스템성 worker crash가 임계치 이상이면 gate를 active로 둔다.
+- 기존 정책은 gate active 동안 신규 dispatch와 blocked recovery 생성을 모두 멈췄다.
+- 이는 recovery worker가 같은 오류로 다시 blocked 되는 증폭은 막지만, provider가 회복되어도 window가 지나기 전까지 ready 작업이 진행되지 않는 교착을 만들 수 있다.
 
 ## 운영 기본값
 
@@ -19,25 +19,34 @@
 - `SUPERVISOR_CRASH_STORM_THRESHOLD=3`
 - `SUPERVISOR_CRASH_STORM_WINDOW_SECONDS=3600`
 - `SUPERVISOR_CRASH_STORM_SCAN_LIMIT=12`
+- `SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS=300`
 
-## 현재 사건 분석
+## 2026-05-27 사건 분석
 
-- `t_c1b290a1`은 swarm 하위 작업을 생성한 뒤 완료 처리됐다.
-- 하위 작업 `t_6d5bdb38`, `t_89ae9a79`, `t_da5fa371`, `t_d9cfa7f3`는 모두 2회 crash 후 blocked 처리됐다.
-- 공통 로그는 `openai-codex` + `gpt-5.5` 호출 중 `TypeError: 'NoneType' object is not iterable`이다.
-- 이는 AI Trends X RSS 코드 구현 실패가 아니라 공통 LLM 호출 레이어 장애다.
-- 기존 blocked recovery는 fixer 작업을 자동 생성했지만, fixer도 같은 호출 장애로 blocked되어 장애를 증폭했다.
+- `AI Trends 일간/주간 보고 한국어 해설 강화` swarm 하위 작업들이 동시에 시작됐다.
+- `researcher`, `devops`, `coder`, `tester`, `fixer` 작업들이 `openai-codex` timeout 또는 `NoneType` 오류 뒤 `pid ... not alive` crash로 blocked 처리됐다.
+- 이 상태에서 기존 blocked recovery가 fixer 작업을 추가로 만들었고, fixer도 같은 호출 장애로 blocked 되어 오류가 증폭됐다.
+- `hermes kanban show --json` 조회도 일부 tick에서 오래 걸려 supervisor가 task detail 조회에 매달릴 수 있었다.
 
-## 검증
+## 합의된 수정
 
-- `node --check`로 server/app 구문 확인
-- dashboard smoke 통과
-- `/api/supervisor`에서 `healthGate.active=true`, `reason=worker_crash_storm` 확인
-- `codex-control-api.service` active 확인
-- `hermes-gateway.service` active 확인
+- health gate의 task detail 조회는 `hermes kanban show --json` 대신 SQLite read-only helper로 수행한다.
+- 시스템성 worker failure 원본에는 fixer recovery를 만들지 않고 `CODEX_RECOVERY_SKIPPED_SYSTEMIC_WORKER` 주석만 남긴다.
+- gate active 중에는 recovery 생성은 계속 막는다.
+- 단, 완전 정지 대신 `SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS` backoff 뒤 ready 작업 1개만 `failure-limit=1`로 dispatch한다.
+- 이 half-open probe는 provider/worker 레이어가 회복됐는지 확인하기 위한 제한적 재개다.
+- probe 중 running 작업이 있으면 추가 dispatch는 하지 않는다.
 
-## 추가 보정: recovery 단일 crash 차단
+## 기대 효과
 
-- health gate 임계치에 도달하지 않은 단일 blocked task라도 run history가 `pid ... not alive` 등 공통 worker 런타임 crash면 `Codex unblock:` fixer를 만들지 않는다.
-- 이 경우 원본 task에 `CODEX_RECOVERY_SKIPPED_SYSTEMIC_WORKER` comment만 남기고 recovery 생성을 건너뛴다.
-- 목적은 recovery worker가 같은 런타임 오류로 다시 blocked 되는 루프를 막는 것이다.
+- provider 장애 중에는 worker 폭주와 recovery 증폭을 막는다.
+- provider가 회복되면 1시간 window를 기다리지 않고 제한적으로 작업이 다시 흐른다.
+- supervisor tick은 SQLite 직접 조회를 사용하므로 Kanban CLI 상세 조회 지연에 덜 묶인다.
+
+## 검증 기준
+
+- `node --check ops/codex-control-dashboard/server.js`
+- `python3 -m py_compile ops/codex-control-dashboard/board-state.py ops/codex-control-dashboard/board-task-details.py`
+- `python3 ops/codex-control-dashboard/board-task-details.py codex-control <task_id>` 가 run/comment/event를 즉시 반환
+- runtime 반영 후 `codex-control-api.service` 재시작
+- `/api/supervisor`에서 health gate active 상태에서도 `lastHealthGateProbeAt`와 half-open probe 로그 확인

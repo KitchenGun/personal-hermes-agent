@@ -33,6 +33,7 @@ const SUPERVISOR_HEALTH_GATE_ENABLED = !/^(0|false|no|off)$/i.test(String(proces
 const SUPERVISOR_CRASH_STORM_THRESHOLD = Math.max(2, Math.min(8, Number(process.env.SUPERVISOR_CRASH_STORM_THRESHOLD || 3) || 3));
 const SUPERVISOR_CRASH_STORM_WINDOW_SECONDS = Math.max(300, Math.min(86400, Number(process.env.SUPERVISOR_CRASH_STORM_WINDOW_SECONDS || 3600) || 3600));
 const SUPERVISOR_CRASH_STORM_SCAN_LIMIT = Math.max(3, Math.min(20, Number(process.env.SUPERVISOR_CRASH_STORM_SCAN_LIMIT || 12) || 12));
+const SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS = Math.max(60, Math.min(3600, Number(process.env.SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS || 300) || 300));
 const SYSTEMIC_WORKER_FAILURE_RE = /pid\s+\d+\s+not alive|'NoneType' object is not iterable|Non-streaming API call timed out|Non-retryable client error/i;
 const CONTROL_SHARED_SECRET = process.env.CONTROL_SHARED_SECRET || '';
 const CONTROL_CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
@@ -81,6 +82,7 @@ const supervisor = {
   recoveryAssignee: 'fixer',
   healthGate: null,
   lastHealthGateKey: '',
+  lastHealthGateProbeAt: null,
 };
 
 function okJson(res, value) {
@@ -260,6 +262,7 @@ function publicSupervisorSnapshot() {
     lastSummary: summary,
     blockedRecovery: supervisor.blockedRecovery,
     recoveryAssignee: sanitizePublicText(supervisor.recoveryAssignee, 64),
+    lastHealthGateProbeAt: supervisor.lastHealthGateProbeAt,
     logs: supervisor.logs.slice(0, MAX_SUPERVISOR_LOGS).map((entry) => ({
       level: sanitizePublicText(entry.level || 'info', 16),
       message: sanitizePublicText(entry.message || '', 180),
@@ -330,17 +333,25 @@ function runHermesLong(args, timeout = 120000) {
   });
 }
 
-function readBoardSqlite(board) {
+function readDashboardSqlite(scriptName, args, timeout = 10000) {
   return new Promise((resolve, reject) => {
-    execFile('python3', [path.join(ROOT, 'board-state.py'), board], { timeout: 10000 }, (error, stdout, stderr) => {
+    execFile('python3', [path.join(ROOT, scriptName), ...args], { timeout }, (error, stdout, stderr) => {
       if (error) {
         const message = (stderr || stdout || error.message || '').trim();
-        reject(new Error(message || 'sqlite board state failed'));
+        reject(new Error(message || `${scriptName} failed`));
         return;
       }
       resolve(stdout);
     });
   });
+}
+
+function readBoardSqlite(board) {
+  return readDashboardSqlite('board-state.py', [board], 10000);
+}
+
+function readTaskDetailsSqlite(board, taskId) {
+  return readDashboardSqlite('board-task-details.py', [board, taskId], 10000);
 }
 
 function boolValue(value, fallback) {
@@ -1341,7 +1352,9 @@ function recoveryAlreadyQueued(tasks, marker) {
 }
 
 async function loadTaskDetails(board, taskId) {
-  const output = await runHermes(['kanban', '--board', board, 'show', '--json', taskId]);
+  const output = DASHBOARD_STATE_MODE === 'sqlite'
+    ? await readTaskDetailsSqlite(board, taskId)
+    : await runHermes(['kanban', '--board', board, 'show', '--json', taskId]);
   return JSON.parse(output);
 }
 
@@ -1414,7 +1427,7 @@ async function evaluateSupervisorHealthGate(board, state) {
   return {
     active: true,
     reason: 'worker_crash_storm',
-    message: `${failures.length} recent systemic worker crashes; dispatch and recovery paused`,
+    message: `${failures.length} recent systemic worker crashes; recovery paused; dispatch limited to half-open probes`,
     count: failures.length,
     threshold: SUPERVISOR_CRASH_STORM_THRESHOLD,
     windowSeconds: SUPERVISOR_CRASH_STORM_WINDOW_SECONDS,
@@ -1491,8 +1504,9 @@ async function createBlockedRecoveryTask(board, task, details, marker) {
   return JSON.parse(output);
 }
 
-async function processBlockedRecoveries(board, state) {
+async function processBlockedRecoveries(board, state, options = {}) {
   if (!supervisor.blockedRecovery) return 0;
+  const annotateOnly = Boolean(options.annotateOnly);
   let created = 0;
   for (const task of state.tasks) {
     try {
@@ -1541,6 +1555,7 @@ async function processBlockedRecoveries(board, state) {
         }
         continue;
       }
+      if (annotateOnly) continue;
       const marker = recoveryMarker(task, details);
       if (taskDetailsText(details).includes(marker) || recoveryAlreadyQueued(state.tasks, marker)) {
         continue;
@@ -1603,6 +1618,24 @@ function clampInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, parsed));
 }
 
+function healthGateProbeDecision(state) {
+  if (!supervisor.healthGate?.active) return { allowed: true, reason: 'gate inactive' };
+  if (Number(state.summary.running || 0) > 0) {
+    return { allowed: false, reason: `running=${state.summary.running}` };
+  }
+  if (Number(state.summary.ready || 0) <= 0) {
+    return { allowed: false, reason: 'no ready task' };
+  }
+  const lastProbeMs = supervisor.lastHealthGateProbeAt ? Date.parse(supervisor.lastHealthGateProbeAt) : 0;
+  const waitMs = SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS * 1000;
+  const elapsedMs = lastProbeMs ? Date.now() - lastProbeMs : Infinity;
+  if (elapsedMs < waitMs) {
+    const remaining = Math.ceil((waitMs - elapsedMs) / 1000);
+    return { allowed: false, reason: `probe backoff ${remaining}s` };
+  }
+  return { allowed: true, reason: `half-open probe after ${SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS}s backoff` };
+}
+
 function scheduleSupervisor() {
   clearTimeout(supervisor.timer);
   supervisor.timer = null;
@@ -1629,16 +1662,28 @@ async function supervisorTick(reason = 'manual') {
 
     if (supervisor.enabled) {
       updateSupervisorHealthGate(await evaluateSupervisorHealthGate(supervisor.board, state));
-      if (supervisor.healthGate?.active) {
-        return supervisorSnapshot();
-      }
-      const recoveryCreated = await processBlockedRecoveries(supervisor.board, state);
+      const gateActive = Boolean(supervisor.healthGate?.active);
+      const recoveryCreated = await processBlockedRecoveries(supervisor.board, state, { annotateOnly: gateActive });
       if (recoveryCreated) {
         state = await loadBoardState(supervisor.board);
         supervisor.lastSummary = state.summary;
         detectTransitions(state.tasks);
       }
-      const availableSlots = Math.max(0, supervisor.concurrency - state.summary.running);
+
+      let availableSlots = Math.max(0, supervisor.concurrency - state.summary.running);
+      let failureLimit = supervisor.failureLimit;
+      if (gateActive) {
+        const probe = healthGateProbeDecision(state);
+        if (!probe.allowed) {
+          pushSupervisorLog('debug', `health gate pause: ${probe.reason}`);
+          return supervisorSnapshot();
+        }
+        availableSlots = Math.min(1, availableSlots);
+        failureLimit = 1;
+        supervisor.lastHealthGateProbeAt = new Date().toISOString();
+        pushSupervisorLog('warning', `health gate half-open probe dispatch allowed: ${probe.reason}`);
+      }
+
       if (availableSlots > 0 && state.summary.ready > 0) {
         const output = await runHermes([
           'kanban',
@@ -1648,7 +1693,7 @@ async function supervisorTick(reason = 'manual') {
           '--max',
           String(availableSlots),
           '--failure-limit',
-          String(supervisor.failureLimit),
+          String(failureLimit),
           '--json',
         ]);
         const dispatch = JSON.parse(output);
