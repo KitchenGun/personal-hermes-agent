@@ -222,6 +222,10 @@ small {
   color: var(--bad);
 }
 
+.supervisorLog .warning span {
+  color: var(--warn);
+}
+
 .live {
   color: var(--good) !important;
   font-weight: 700;

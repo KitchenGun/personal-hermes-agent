@@ -168,14 +168,19 @@ function renderSupervisor(data) {
   stopSupervisor.disabled = !data.enabled;
   tickSupervisor.disabled = data.runningTick;
   const summary = data.lastSummary
-    ? `total ${data.lastSummary.total} - running ${data.lastSummary.running} - ready ${data.lastSummary.ready} - blocked ${data.lastSummary.blocked} - recovery ${data.blockedRecovery ? 'on' : 'off'}`
+    ? `total ${data.lastSummary.total} - running ${data.lastSummary.running} - ready ${data.lastSummary.ready} - blocked ${data.lastSummary.blocked} - recovery ${data.blockedRecovery ? 'on' : 'off'}${data.healthGate?.active ? ' - health gate on' : ''}`
     : 'no tick yet';
   const rows = [
     `<div><b>state</b><span>${escapeHtml(summary)}</span></div>`,
-    ...data.logs.slice(0, 8).map((entry) => (
+  ];
+  if (data.healthGate?.active) {
+    rows.push(`<div class="warning"><b>health</b><span>${escapeHtml(data.healthGate.message || data.healthGate.reason)}</span></div>`);
+  }
+  rows.push(
+    ...data.logs.slice(0, data.healthGate?.active ? 7 : 8).map((entry) => (
       `<div class="${escapeHtml(entry.level)}"><b>${time(entry.at)}</b><span>${escapeHtml(entry.message)}</span></div>`
     )),
-  ];
+  );
   supervisorLog.innerHTML = rows.join('');
 }
 

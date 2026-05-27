@@ -29,6 +29,11 @@ const DASHBOARD_INCLUDE_ARCHIVED = /^(1|true|yes|on)$/i.test(String(process.env.
 const MAX_SUPERVISOR_LOGS = 80;
 const AUTO_SWARM_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.QUEUE_AUTO_SWARM || 'true'));
 const AUTO_SWARM_MAX_WORKERS = Math.max(3, Math.min(5, Number(process.env.QUEUE_AUTO_SWARM_MAX_WORKERS || 4) || 4));
+const SUPERVISOR_HEALTH_GATE_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.SUPERVISOR_HEALTH_GATE || '1'));
+const SUPERVISOR_CRASH_STORM_THRESHOLD = Math.max(2, Math.min(8, Number(process.env.SUPERVISOR_CRASH_STORM_THRESHOLD || 3) || 3));
+const SUPERVISOR_CRASH_STORM_WINDOW_SECONDS = Math.max(300, Math.min(86400, Number(process.env.SUPERVISOR_CRASH_STORM_WINDOW_SECONDS || 3600) || 3600));
+const SUPERVISOR_CRASH_STORM_SCAN_LIMIT = Math.max(3, Math.min(20, Number(process.env.SUPERVISOR_CRASH_STORM_SCAN_LIMIT || 12) || 12));
+const SYSTEMIC_WORKER_FAILURE_RE = /pid\s+\d+\s+not alive|'NoneType' object is not iterable|Non-streaming API call timed out|Non-retryable client error/i;
 const CONTROL_SHARED_SECRET = process.env.CONTROL_SHARED_SECRET || '';
 const CONTROL_CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY || '';
@@ -74,6 +79,8 @@ const supervisor = {
   seenStatuses: new Map(),
   blockedRecovery: true,
   recoveryAssignee: 'fixer',
+  healthGate: null,
+  lastHealthGateKey: '',
 };
 
 function okJson(res, value) {
@@ -237,6 +244,19 @@ function publicSupervisorSnapshot() {
     nextTickAt: supervisor.nextTickAt,
     runningTick: supervisor.runningTick,
     lastError: sanitizeErrorClass(supervisor.lastError),
+    healthGate: supervisor.healthGate ? {
+      active: Boolean(supervisor.healthGate.active),
+      reason: sanitizePublicText(supervisor.healthGate.reason || '', 64),
+      message: sanitizePublicText(supervisor.healthGate.message || '', 180),
+      count: Number(supervisor.healthGate.count || 0),
+      threshold: Number(supervisor.healthGate.threshold || SUPERVISOR_CRASH_STORM_THRESHOLD),
+      windowSeconds: Number(supervisor.healthGate.windowSeconds || SUPERVISOR_CRASH_STORM_WINDOW_SECONDS),
+      tasks: (supervisor.healthGate.tasks || []).slice(0, 6).map((task) => ({
+        id: safeTaskId(task.id),
+        assignee: sanitizePublicText(task.assignee || '', 64),
+        profile: sanitizePublicText(task.profile || '', 64),
+      })),
+    } : { active: false },
     lastSummary: summary,
     blockedRecovery: supervisor.blockedRecovery,
     recoveryAssignee: sanitizePublicText(supervisor.recoveryAssignee, 64),
@@ -1325,6 +1345,88 @@ async function loadTaskDetails(board, taskId) {
   return JSON.parse(output);
 }
 
+function runFinishedAt(run) {
+  return Number(run?.ended_at || run?.endedAt || run?.finished_at || run?.started_at || 0) || 0;
+}
+
+function isSystemicWorkerFailure(run) {
+  const status = String(run?.status || '').toLowerCase();
+  const outcome = String(run?.outcome || '').toLowerCase();
+  if (!['blocked', 'crashed', 'error', 'failed'].includes(status) && !['crashed', 'error', 'failed'].includes(outcome)) {
+    return false;
+  }
+  const failureText = [run?.error, run?.summary].filter(Boolean).join('\n');
+  return SYSTEMIC_WORKER_FAILURE_RE.test(failureText);
+}
+
+async function evaluateSupervisorHealthGate(board, state) {
+  if (!SUPERVISOR_HEALTH_GATE_ENABLED) {
+    return { active: false, reason: 'disabled', count: 0, threshold: SUPERVISOR_CRASH_STORM_THRESHOLD };
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const blocked = (state.tasks || [])
+    .filter((task) => task.status === 'blocked')
+    .sort((a, b) => Number(b.started_at || b.created_at || 0) - Number(a.started_at || a.created_at || 0))
+    .slice(0, SUPERVISOR_CRASH_STORM_SCAN_LIMIT);
+  const failures = [];
+  for (const task of blocked) {
+    let details;
+    try {
+      details = await loadTaskDetails(board, task.id);
+    } catch (error) {
+      pushSupervisorLog('error', `health gate inspect failed: ${task.id} ${error.message || String(error)}`);
+      continue;
+    }
+    const runs = Array.isArray(details?.runs) ? details.runs : [];
+    const failedRun = runs.find((run) => {
+      const finishedAt = runFinishedAt(run);
+      if (!finishedAt || nowSeconds - finishedAt > SUPERVISOR_CRASH_STORM_WINDOW_SECONDS) return false;
+      return isSystemicWorkerFailure(run);
+    });
+    if (failedRun) {
+      failures.push({
+        id: task.id,
+        assignee: task.assignee || '',
+        profile: failedRun.profile || task.assignee || '',
+      });
+    }
+  }
+  if (failures.length < SUPERVISOR_CRASH_STORM_THRESHOLD) {
+    return {
+      active: false,
+      reason: 'healthy',
+      count: failures.length,
+      threshold: SUPERVISOR_CRASH_STORM_THRESHOLD,
+      windowSeconds: SUPERVISOR_CRASH_STORM_WINDOW_SECONDS,
+      tasks: failures,
+    };
+  }
+  return {
+    active: true,
+    reason: 'worker_crash_storm',
+    message: `${failures.length} recent systemic worker crashes; dispatch and recovery paused`,
+    count: failures.length,
+    threshold: SUPERVISOR_CRASH_STORM_THRESHOLD,
+    windowSeconds: SUPERVISOR_CRASH_STORM_WINDOW_SECONDS,
+    tasks: failures,
+  };
+}
+
+function updateSupervisorHealthGate(gate) {
+  const prior = supervisor.healthGate || { active: false };
+  supervisor.healthGate = gate || { active: false, reason: 'unknown', count: 0 };
+  if (supervisor.healthGate.active) {
+    const key = `${supervisor.healthGate.reason}:${supervisor.healthGate.count}:${(supervisor.healthGate.tasks || []).map((task) => task.id).join(',')}`;
+    if (key !== supervisor.lastHealthGateKey) {
+      pushSupervisorLog('warning', `health gate active: ${supervisor.healthGate.message}`);
+      supervisor.lastHealthGateKey = key;
+    }
+  } else if (prior.active) {
+    pushSupervisorLog('info', 'health gate cleared');
+    supervisor.lastHealthGateKey = '';
+  }
+}
+
 async function createBlockedRecoveryTask(board, task, details, marker) {
   const reason = cleanText(details?.latest_summary || 'No blocked summary was provided.', 1200);
   const latest = cleanText(taskDetailsText(details).replace(/\s+/g, ' '), 2400);
@@ -1497,6 +1599,10 @@ async function supervisorTick(reason = 'manual') {
     detectTransitions(state.tasks);
 
     if (supervisor.enabled) {
+      updateSupervisorHealthGate(await evaluateSupervisorHealthGate(supervisor.board, state));
+      if (supervisor.healthGate?.active) {
+        return supervisorSnapshot();
+      }
       const recoveryCreated = await processBlockedRecoveries(supervisor.board, state);
       if (recoveryCreated) {
         state = await loadBoardState(supervisor.board);
