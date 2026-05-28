@@ -13,12 +13,15 @@ const USER_IDS = csvSet(process.env.DISCORD_ALLOWED_USER_IDS || '');
 const GATEWAY_QUEUE_CHANNEL_IDS = csvSet(process.env.DISCORD_GATEWAY_QUEUE_CHANNEL_IDS || '');
 const MAX_ATTACHMENT_BYTES = Number(process.env.DISCORD_MAX_ATTACHMENT_BYTES || 262144);
 const NOTIFY_INTERVAL_MS = Number(process.env.DISCORD_NOTIFY_INTERVAL_MS || 10000);
+const RELAY_STATE_PRUNE_AFTER_MS = Number(process.env.DISCORD_RELAY_PRUNE_AFTER_MS || 3 * 24 * 60 * 60 * 1000);
 const NOTIFY_STATUSES = new Set(['running', 'blocked', 'review', 'done']);
+const PRUNE_STATUSES = new Set(['done', 'archived']);
 const QUEUE_ONLY = process.env.DISCORD_QUEUE_ONLY !== '0';
 const QUEUE_NOTICE_COOLDOWN_MS = Number(process.env.DISCORD_QUEUE_NOTICE_COOLDOWN_MS || 60000);
 const QUEUE_PREFIX_RE = /^\s*(?:\[queue\]|\[codex\]|queue:|codex:|task:|codex-task:)\s*/i;
 const RESUME_PREFIX_RE = /^\s*(?:\[resume\]|resume:|unblock:)\s*/i;
 const SLASH_COMMAND_NAMES = new Set(['queue', 'codex', 'task']);
+const TEST_MODE = process.env.DISCORD_RELAY_TEST_MODE === '1';
 
 let socket = null;
 let heartbeat = null;
@@ -29,12 +32,12 @@ let botUserId = '';
 let relayState = loadRelayState();
 const queueNoticeAt = new Map();
 
-if (!TOKEN) {
+if (!TEST_MODE && !TOKEN) {
   console.error('DISCORD_BOT_TOKEN is required.');
   process.exit(1);
 }
 
-if (!SECRET) {
+if (!TEST_MODE && !SECRET) {
   console.error('DISCORD_SHARED_SECRET is required.');
   process.exit(1);
 }
@@ -55,10 +58,73 @@ function loadRelayState() {
   }
 }
 
+function timestampMs(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function terminalTaskTimestamp(entry) {
+  return Math.max(
+    timestampMs(entry.lastNotifiedAt),
+    timestampMs(entry.completedAt),
+    timestampMs(entry.archivedAt),
+    timestampMs(entry.updatedAt),
+    timestampMs(entry.createdAt),
+  );
+}
+
+function pruneRelayState(state, options = {}) {
+  const tasks = state.tasks || {};
+  const now = Number(options.now || Date.now());
+  const maxAgeMs = Number(options.maxAgeMs ?? RELAY_STATE_PRUNE_AFTER_MS);
+  const before = Object.keys(tasks).length;
+  const prunedTaskIds = [];
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+    return {
+      before,
+      after: before,
+      pruned: 0,
+      prunedTaskIds,
+      maxAgeMs,
+      reason: 'pruning disabled',
+    };
+  }
+  for (const [taskId, entry] of Object.entries(tasks)) {
+    const status = String(entry.lastStatus || entry.status || '').toLowerCase();
+    if (!PRUNE_STATUSES.has(status)) continue;
+    const terminalAt = terminalTaskTimestamp(entry);
+    if (!terminalAt || now - terminalAt <= maxAgeMs) continue;
+    delete tasks[taskId];
+    prunedTaskIds.push(taskId);
+  }
+  return {
+    before,
+    after: Object.keys(tasks).length,
+    pruned: prunedTaskIds.length,
+    prunedTaskIds,
+    maxAgeMs,
+    reason: `done/archived older than ${maxAgeMs}ms`,
+  };
+}
+
+function saveRelayStateToFile(state, filePath, options = {}) {
+  const pruneResult = pruneRelayState(state, options);
+  if (pruneResult.pruned) {
+    const logger = options.log || log;
+    logger(
+      'pruned relay state tasks',
+      `pruned=${pruneResult.pruned} before=${pruneResult.before} after=${pruneResult.after} maxAgeMs=${pruneResult.maxAgeMs} statuses=done,archived`,
+    );
+  }
+  if (!pruneResult.pruned && options.writeWhenUnchanged === false) return pruneResult;
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, filePath);
+  return pruneResult;
+}
+
 function saveRelayState() {
-  const tmp = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(relayState, null, 2));
-  fs.renameSync(tmp, STATE_FILE);
+  return saveRelayStateToFile(relayState, STATE_FILE);
 }
 
 function truncate(value, maxLength) {
@@ -756,7 +822,11 @@ async function pollTaskStatus() {
       entry.lastNotifiedAt = new Date().toISOString();
       changed = true;
     }
-    if (changed) saveRelayState();
+    if (changed) {
+      saveRelayState();
+    } else {
+      saveRelayStateToFile(relayState, STATE_FILE, { writeWhenUnchanged: false });
+    }
   } catch (error) {
     log('status poll failed', error.message || String(error));
   } finally {
@@ -866,9 +936,21 @@ async function connect() {
   });
 }
 
-connect().catch((error) => {
-  console.error(error.message || error);
-  process.exit(1);
-});
+if (!TEST_MODE) {
+  saveRelayStateToFile(relayState, STATE_FILE, { writeWhenUnchanged: false });
 
-startStatusPolling();
+  connect().catch((error) => {
+    console.error(error.message || error);
+    process.exit(1);
+  });
+
+  startStatusPolling();
+}
+
+module.exports = {
+  __test: {
+    pruneRelayState,
+    saveRelayStateToFile,
+    terminalTaskTimestamp,
+  },
+};

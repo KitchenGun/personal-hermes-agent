@@ -35,6 +35,9 @@ const SUPERVISOR_CRASH_STORM_THRESHOLD = Math.max(2, Math.min(8, Number(process.
 const SUPERVISOR_CRASH_STORM_WINDOW_SECONDS = Math.max(300, Math.min(86400, Number(process.env.SUPERVISOR_CRASH_STORM_WINDOW_SECONDS || 3600) || 3600));
 const SUPERVISOR_CRASH_STORM_SCAN_LIMIT = Math.max(3, Math.min(20, Number(process.env.SUPERVISOR_CRASH_STORM_SCAN_LIMIT || 12) || 12));
 const SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS = Math.max(60, Math.min(3600, Number(process.env.SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS || 300) || 300));
+const SUMMARY_CACHE_TTL_MS = Math.max(500, Math.min(10_000, Number(process.env.SUMMARY_CACHE_TTL_MS || 2000) || 2000));
+const SUMMARY_CACHE_SWR_MS = Math.max(SUMMARY_CACHE_TTL_MS, Math.min(60_000, Number(process.env.SUMMARY_CACHE_SWR_MS || 10_000) || 10_000));
+const SUPERVISOR_IDLE_BACKOFF_MAX_MS = Math.max(15_000, Math.min(300_000, Number(process.env.SUPERVISOR_IDLE_BACKOFF_MAX_MS || 60_000) || 60_000));
 const SYSTEMIC_WORKER_FAILURE_RE = /pid\s+\d+\s+not alive|'NoneType' object is not iterable|Non-streaming API call timed out|Non-retryable client error/i;
 const CONTROL_SHARED_SECRET = process.env.CONTROL_SHARED_SECRET || '';
 const CONTROL_CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
@@ -68,6 +71,8 @@ const supervisor = {
   board: 'codex-control',
   concurrency: Math.max(1, Math.min(8, Number(process.env.SUPERVISOR_CONCURRENCY || 4) || 4)),
   intervalMs: 15000,
+  currentIntervalMs: 15000,
+  idleBackoffStreak: 0,
   failureLimit: 2,
   startedAt: null,
   lastTickAt: null,
@@ -85,6 +90,9 @@ const supervisor = {
   lastHealthGateKey: '',
   lastHealthGateProbeAt: null,
 };
+
+const summaryCache = new Map();
+let loadBoardStateForTest = null;
 
 function okJson(res, value) {
   const body = JSON.stringify(value);
@@ -234,6 +242,54 @@ function publicSummaryDto(state) {
   };
 }
 
+function setSummaryCache(board, state) {
+  const value = publicSummaryDto(state);
+  summaryCache.set(board, {
+    value,
+    loadedAt: Date.now(),
+    promise: null,
+  });
+  return value;
+}
+
+function invalidateSummaryCache(board) {
+  if (board) {
+    summaryCache.delete(board);
+    return;
+  }
+  summaryCache.clear();
+}
+
+async function refreshSummaryCache(board) {
+  const existing = summaryCache.get(board);
+  if (existing?.promise) return existing.promise;
+  const loadState = loadBoardStateForTest || loadBoardState;
+  const promise = loadState(board)
+    .then((state) => setSummaryCache(board, state))
+    .catch((error) => {
+      const current = summaryCache.get(board);
+      if (current) summaryCache.set(board, { ...current, promise: null });
+      throw error;
+    });
+  summaryCache.set(board, {
+    value: existing?.value || null,
+    loadedAt: existing?.loadedAt || 0,
+    promise,
+  });
+  return promise;
+}
+
+async function loadCachedSummary(board) {
+  const entry = summaryCache.get(board);
+  const ageMs = entry ? Date.now() - entry.loadedAt : Infinity;
+  if (entry?.value && ageMs < SUMMARY_CACHE_TTL_MS) return entry.value;
+  if (entry?.value && ageMs < SUMMARY_CACHE_SWR_MS) {
+    refreshSummaryCache(board).catch((error) => pushSupervisorLog('error', `summary cache refresh failed for ${board}: ${error.message || String(error)}`));
+    return entry.value;
+  }
+  return refreshSummaryCache(board);
+}
+
 function publicSupervisorSnapshot() {
   const summary = supervisor.lastSummary ? {
     total: Number(supervisor.lastSummary.total || 0),
@@ -247,6 +303,8 @@ function publicSupervisorSnapshot() {
     board: sanitizePublicText(supervisor.board, 64),
     concurrency: supervisor.concurrency,
     intervalMs: supervisor.intervalMs,
+    currentIntervalMs: supervisor.currentIntervalMs,
+    idleBackoffStreak: supervisor.idleBackoffStreak,
     failureLimit: supervisor.failureLimit,
     startedAt: supervisor.startedAt,
     lastTickAt: supervisor.lastTickAt,
@@ -942,20 +1000,166 @@ async function orchestrateTask(input) {
   }
 }
 
-function idempotencyKey(input, spec) {
+function normalizeFingerprintText(raw, maxLength = 4000) {
+  return String(raw || '')
+    .normalize('NFKC')
+    .replace(/[\p{P}\p{S}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .slice(0, maxLength);
+}
+
+function stableJson(value) {
+  if (value === null || value === undefined || value === '') return '';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function compactFingerprintComponent(value, maxLength = 512) {
+  const text = typeof value === 'string' ? normalizeFingerprintText(value, maxLength) : stableJson(value);
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.floor(maxLength / 2))}:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 16)}`;
+}
+
+function boundedSourceKey(prefix, raw, maxRawLength = 80) {
+  const value = cleanText(raw, Math.max(maxRawLength + 1, 512));
+  if (value.length <= maxRawLength) return `${prefix}:${value}`;
+  const digest = crypto.createHash('sha256').update(value).digest('hex').slice(0, 24);
+  return `${prefix}:${value.slice(0, 32)}:${digest}`.slice(0, 120);
+}
+
+function stableWorkerPlan(workers) {
+  if (!Array.isArray(workers)) return workers || null;
+  return workers.map((worker) => ({
+    profile: cleanProfile(worker?.profile, ''),
+    title: normalizeFingerprintText(worker?.title || worker?.role || '', 160),
+  })).filter((worker) => worker.profile || worker.title);
+}
+
+function stableCapabilityPlan(plan) {
+  if (!plan || typeof plan !== 'object') return null;
+  return {
+    tags: Array.isArray(plan.tags) ? plan.tags.map((tag) => normalizeFingerprintText(tag, 80)).filter(Boolean).sort() : [],
+    requested_assignee: cleanProfile(plan.requestedAssignee, ''),
+    current_assignee: cleanProfile(plan.currentAssignee, ''),
+    recommended_assignee: cleanProfile(plan.recommendedAssignee, ''),
+    swarm_recommended: Boolean(plan.swarmRecommended),
+    workers: stableWorkerPlan(plan.workers || plan.profiles || plan.recommendedProfiles),
+    guardrails: Array.isArray(plan.guardrails) ? plan.guardrails.map((item) => normalizeFingerprintText(item, 240)).filter(Boolean).sort() : [],
+    hints: Array.isArray(plan.hints) ? plan.hints.map((hint) => ({
+      kind: normalizeFingerprintText(hint?.kind, 80),
+      name: normalizeFingerprintText(hint?.name, 120),
+      reason: normalizeFingerprintText(hint?.reason, 240),
+    })).sort((a, b) => stableJson(a).localeCompare(stableJson(b))) : [],
+  };
+}
+
+function stableSwarmPlan(swarm) {
+  if (!swarm || typeof swarm !== 'object') return null;
+  return {
+    workers: stableWorkerPlan(swarm.workers),
+    verifier: cleanProfile(swarm.verifier, ''),
+    synthesizer: cleanProfile(swarm.synthesizer, ''),
+    priority: clampInt(swarm.priority, 0, 0, 100),
+  };
+}
+
+function fingerprintComponents(input, spec = {}, board = '') {
+  const capabilityPlan = stableCapabilityPlan(spec.capabilityPlan);
+  const workers = stableSwarmPlan(spec.workers) || stableWorkerPlan(spec.workers || capabilityPlan?.workers);
+  return {
+    source: normalizeFingerprintText(input.source || 'api', 80) || 'api',
+    board: cleanBoard(board || input.board || supervisor.board || 'codex-control') || 'codex-control',
+    assignee: cleanProfile(spec.assignee || input.assignee || QUEUE_EXECUTION_PROFILE, QUEUE_EXECUTION_PROFILE),
+    priority: clampInt(spec.priority ?? input.priority, 0, 0, 100),
+    title: normalizeFingerprintText(spec.title || input.title || '', 300),
+    detail: normalizeFingerprintText(input.detail || input.body || input.description || spec.body || '', 1200),
+    capability_plan: compactFingerprintComponent(capabilityPlan, 1200),
+    workers: compactFingerprintComponent(workers, 800),
+  };
+}
+
+function idempotencyKey(input, spec, board = '') {
   if (input.idempotencyKey) return cleanText(input.idempotencyKey, 120);
-  if (input.discordInteractionId) return `discord:${cleanText(input.discordInteractionId, 80)}`;
-  if (input.sourceId) return `${cleanText(input.source || 'source', 30)}:${cleanText(input.sourceId, 80)}`;
+  if (input.discordInteractionId) return boundedSourceKey('discord', input.discordInteractionId, 80);
+  if (input.sourceId) return boundedSourceKey(cleanText(input.source || 'source', 30), input.sourceId, 80);
+  const components = fingerprintComponents(input, spec, board);
   return crypto
     .createHash('sha256')
-    .update(`${input.source || 'api'}\n${spec.title}\n${input.detail || input.body || ''}`)
+    .update(stableJson(components))
     .digest('hex')
     .slice(0, 32);
 }
 
+function taskIdFromCreateResult(task) {
+  return task?.id || task?.task_id || task?.task?.id || task?.task?.task_id || null;
+}
+
+function taskDuplicateReused(task) {
+  return Boolean(task?.duplicate_reused || task?.duplicateReused || task?.reused || task?.existing || task?.task?.duplicate_reused);
+}
+
+// API response extension memo:
+// createKanbanTask responses keep existing top-level fields and add
+// duplicate_report: { possible_duplicate, duplicate_reused, idempotency_key,
+// fingerprint, reason, source, key_components, reused_task_id? }.
+// dryRun returns reason=idempotency-key-preview so callers can audit the
+// duplicate-prevention fingerprint before running hermes kanban create.
+function duplicateReport(input, spec, board, context = {}) {
+  const key = idempotencyKey(input, spec, board);
+  const reused = taskDuplicateReused(context.task);
+  const report = {
+    possible_duplicate: true,
+    duplicate_reused: reused,
+    idempotency_key: key,
+    fingerprint: key,
+    mode: context.mode || 'task',
+    dry_run: Boolean(context.dryRun),
+    reason: reused ? 'idempotency-key-reused' : (context.dryRun ? 'idempotency-key-preview' : 'idempotency-key-created'),
+    source: cleanText(input.source || 'api', 80) || 'api',
+    key_components: fingerprintComponents(input, spec, board),
+  };
+  const reusedTaskId = reused ? taskIdFromCreateResult(context.task) : null;
+  if (reusedTaskId) report.reused_task_id = reusedTaskId;
+  return report;
+}
+
+function safeDuplicateReport(report) {
+  return {
+    ...report,
+    key_components: {
+      ...report.key_components,
+      title: sanitizePublicText(report.key_components.title, 120),
+      detail: report.key_components.detail
+        ? crypto.createHash('sha256').update(report.key_components.detail).digest('hex').slice(0, 16)
+        : '',
+      capability_plan: report.key_components.capability_plan
+        ? crypto.createHash('sha256').update(report.key_components.capability_plan).digest('hex').slice(0, 16)
+        : '',
+      workers: report.key_components.workers
+        ? crypto.createHash('sha256').update(report.key_components.workers).digest('hex').slice(0, 16)
+        : '',
+    },
+  };
+}
+
+function planFingerprintSpec(plan) {
+  if (plan.mode !== 'swarm') return plan.spec;
+  return {
+    ...plan.spec,
+    workers: plan.swarm || plan.spec.workers,
+  };
+}
+
 async function createKanbanSwarm(input, board, plan) {
   const createdBy = cleanText(input.createdBy || 'Codex Discord Orchestrator', 80);
-  const baseKey = idempotencyKey(input, plan.spec);
+  const fingerprintSpec = planFingerprintSpec(plan);
+  const baseKey = idempotencyKey(input, fingerprintSpec, board);
   const priority = String(clampInt(plan.swarm.priority, plan.spec.priority, 0, 100));
 
   async function createTask(title, body, assignee, suffix, parents = []) {
@@ -1089,6 +1293,7 @@ async function createKanbanSwarm(input, board, plan) {
     title: plan.spec.title,
     assignee: 'planner',
   };
+  const report = duplicateReport(input, fingerprintSpec, board, { mode: 'swarm', task: root, dryRun: false });
   pushSupervisorLog('info', `swarm created: ${rootId || plan.spec.title}`, {
     board,
     title: plan.spec.title,
@@ -1096,9 +1301,12 @@ async function createKanbanSwarm(input, board, plan) {
     verifier: swarmCreated.verifier_id,
     synthesizer: swarmCreated.synthesizer_id,
     source: input.source || 'api',
+    duplicate_report: safeDuplicateReport(report),
   });
+  invalidateSummaryCache(board);
+  resetSupervisorBackoff();
   supervisorTick('task-create').catch(() => {});
-  return { created: true, board, mode: 'swarm', spec: plan.spec, swarm: plan.swarm, task, swarmCreated };
+  return { created: true, board, mode: 'swarm', spec: plan.spec, swarm: plan.swarm, task, swarmCreated, duplicate_report: report };
 }
 
 async function createKanbanTask(input) {
@@ -1109,8 +1317,16 @@ async function createKanbanTask(input) {
   const plan = shouldSwarm
     ? buildSwarmPlan(input, spec, board)
     : { mode: 'task', spec };
+  const fingerprintSpec = planFingerprintSpec(plan);
   if (input.dryRun) {
-    return { created: false, board, mode: plan.mode, spec: plan.spec, swarm: plan.swarm };
+    const report = duplicateReport(input, fingerprintSpec, board, { dryRun: true, mode: plan.mode });
+    pushSupervisorLog('info', `task dry-run duplicate preview: ${report.idempotency_key}`, {
+      board,
+      title: plan.spec.title,
+      source: input.source || 'api',
+      duplicate_report: safeDuplicateReport(report),
+    });
+    return { created: false, board, mode: plan.mode, spec: plan.spec, swarm: plan.swarm, duplicate_report: report };
   }
   if (plan.mode === 'swarm') {
     return createKanbanSwarm(input, board, plan);
@@ -1136,7 +1352,7 @@ async function createKanbanTask(input) {
     '--created-by',
     cleanText(input.createdBy || 'Codex Discord Orchestrator', 80),
     '--idempotency-key',
-    idempotencyKey(input, spec),
+    idempotencyKey(input, fingerprintSpec, board),
     '--json',
   ];
   for (const skill of spec.skills) {
@@ -1144,15 +1360,19 @@ async function createKanbanTask(input) {
   }
   const output = await runHermesLong(createArgs, 60000);
   const task = JSON.parse(output);
+  const report = duplicateReport(input, fingerprintSpec, board, { dryRun: false, mode: 'task', task });
   pushSupervisorLog('info', `task created: ${task.id || spec.title}`, {
     board,
     title: spec.title,
     assignee: spec.assignee,
     priority: spec.priority,
     source: input.source || 'api',
+    duplicate_report: safeDuplicateReport(report),
   });
+  invalidateSummaryCache(board);
+  resetSupervisorBackoff();
   supervisorTick('task-create').catch(() => {});
-  return { created: true, board, mode: 'task', spec, task };
+  return { created: true, board, mode: 'task', spec, task, duplicate_report: report };
 }
 
 function sanitizeResumeText(raw) {
@@ -1200,7 +1420,11 @@ async function resumeBlockedTask(input) {
     await runHermesLong(['kanban', '--board', board, 'unblock', taskId], 60000);
   }
   pushSupervisorLog('info', `user input received: ${taskId}`, { board, unblocked: shouldUnblock });
-  if (shouldUnblock) supervisorTick('user-input-resume').catch(() => {});
+  invalidateSummaryCache(board);
+  if (shouldUnblock) {
+    resetSupervisorBackoff();
+    supervisorTick('user-input-resume').catch(() => {});
+  }
   return { ok: true, board, taskId, unblocked: shouldUnblock };
 }
 
@@ -1667,9 +1891,11 @@ function pushSupervisorLog(level, message, details = null) {
 }
 
 function detectTransitions(tasks) {
+  let changed = false;
   for (const task of tasks) {
     const prior = supervisor.seenStatuses.get(task.id);
     if (prior && prior !== task.status) {
+      changed = true;
       pushSupervisorLog('info', `${task.id} ${prior} -> ${task.status}`, {
         title: task.title,
         assignee: task.assignee,
@@ -1677,6 +1903,29 @@ function detectTransitions(tasks) {
     }
     supervisor.seenStatuses.set(task.id, task.status);
   }
+  if (changed) invalidateSummaryCache(supervisor.board);
+  return changed;
+}
+
+function resetSupervisorBackoff() {
+  supervisor.currentIntervalMs = supervisor.intervalMs;
+  supervisor.idleBackoffStreak = 0;
+}
+
+function updateSupervisorBackoff(state) {
+  const summary = state?.summary || {};
+  const idle = Number(summary.ready || 0) === 0
+    && Number(summary.running || 0) === 0
+    && Number(summary.blocked || 0) === 0;
+  if (!idle) {
+    resetSupervisorBackoff();
+    return;
+  }
+  supervisor.idleBackoffStreak += 1;
+  supervisor.currentIntervalMs = Math.min(
+    SUPERVISOR_IDLE_BACKOFF_MAX_MS,
+    Math.max(supervisor.intervalMs, supervisor.currentIntervalMs || supervisor.intervalMs) * 2,
+  );
 }
 
 function supervisorSnapshot() {
@@ -1713,21 +1962,26 @@ function scheduleSupervisor() {
   supervisor.timer = null;
   supervisor.nextTickAt = null;
   if (!supervisor.enabled) return;
-  supervisor.nextTickAt = new Date(Date.now() + supervisor.intervalMs).toISOString();
+  const delayMs = supervisor.currentIntervalMs || supervisor.intervalMs;
+  supervisor.nextTickAt = new Date(Date.now() + delayMs).toISOString();
   supervisor.timer = setTimeout(() => {
     supervisorTick('timer').catch(() => {});
-  }, supervisor.intervalMs);
+  }, delayMs);
 }
 
 async function supervisorTick(reason = 'manual') {
+  if (reason === 'manual') invalidateSummaryCache(supervisor.board);
   if (supervisor.runningTick) {
     return supervisorSnapshot();
   }
+  let latestState = null;
   supervisor.runningTick = true;
   supervisor.lastTickAt = new Date().toISOString();
   supervisor.nextTickAt = null;
   try {
     let state = await loadBoardState(supervisor.board);
+    latestState = state;
+    setSummaryCache(supervisor.board, state);
     supervisor.lastSummary = state.summary;
     supervisor.lastError = null;
     detectTransitions(state.tasks);
@@ -1738,6 +1992,8 @@ async function supervisorTick(reason = 'manual') {
       const recoveryCreated = await processBlockedRecoveries(supervisor.board, state, { annotateOnly: gateActive });
       if (recoveryCreated) {
         state = await loadBoardState(supervisor.board);
+        latestState = state;
+        setSummaryCache(supervisor.board, state);
         supervisor.lastSummary = state.summary;
         detectTransitions(state.tasks);
       }
@@ -1777,6 +2033,8 @@ async function supervisorTick(reason = 'manual') {
         supervisor.lastError = null;
         const spawned = (dispatch.spawned || []).map((task) => task.task_id).join(', ') || 'none';
         pushSupervisorLog('info', `dispatch ${reason}: slots=${dispatchSlots}, spawned=${spawned}`, dispatch);
+        invalidateSummaryCache(supervisor.board);
+        resetSupervisorBackoff();
       } else {
         pushSupervisorLog('debug', `tick ${reason}: running=${state.summary.running}, ready=${state.summary.ready}, dispatchable_ready=${dispatchableReady}`);
       }
@@ -1787,6 +2045,7 @@ async function supervisorTick(reason = 'manual') {
     supervisor.lastError = error.message || String(error);
     pushSupervisorLog('error', supervisor.lastError);
   } finally {
+    if (supervisor.enabled && latestState) updateSupervisorBackoff(latestState);
     supervisor.runningTick = false;
     scheduleSupervisor();
   }
@@ -1799,6 +2058,7 @@ function startSupervisor(config) {
   supervisor.board = board;
   supervisor.concurrency = clampInt(config.concurrency, supervisor.concurrency, 1, 8);
   supervisor.intervalMs = clampInt(config.intervalMs, supervisor.intervalMs, 5000, 60000);
+  resetSupervisorBackoff();
   supervisor.failureLimit = clampInt(config.failureLimit, supervisor.failureLimit, 1, 10);
   supervisor.blockedRecovery = boolValue(config.blockedRecovery, supervisor.blockedRecovery);
   supervisor.recoveryAssignee = cleanProfile(config.recoveryAssignee, supervisor.recoveryAssignee);
@@ -1856,7 +2116,7 @@ async function apiSummary(req, res) {
     errJson(res, 400, 'invalid board slug');
     return;
   }
-  okJson(res, publicSummaryDto(await loadBoardState(board)));
+  okJson(res, await loadCachedSummary(board));
 }
 
 function apiHealth(req, res) {
@@ -2059,20 +2319,40 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Codex Hermes Kanban dashboard: http://${HOST}:${PORT}`);
-  if (SUPERVISOR_AUTO_START) {
-    try {
-      startSupervisor({
-        board: SUPERVISOR_DEFAULT_BOARD,
-        concurrency: supervisor.concurrency,
-        intervalMs: supervisor.intervalMs,
-        failureLimit: supervisor.failureLimit,
-        blockedRecovery: supervisor.blockedRecovery,
-        recoveryAssignee: supervisor.recoveryAssignee,
-      });
-    } catch (error) {
-      console.error(`supervisor auto-start failed: ${error.message || String(error)}`);
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Codex Hermes Kanban dashboard: http://${HOST}:${PORT}`);
+    if (SUPERVISOR_AUTO_START) {
+      try {
+        startSupervisor({
+          board: SUPERVISOR_DEFAULT_BOARD,
+          concurrency: supervisor.concurrency,
+          intervalMs: supervisor.intervalMs,
+          failureLimit: supervisor.failureLimit,
+          blockedRecovery: supervisor.blockedRecovery,
+          recoveryAssignee: supervisor.recoveryAssignee,
+        });
+      } catch (error) {
+        console.error(`supervisor auto-start failed: ${error.message || String(error)}`);
+      }
     }
-  }
-});
+  });
+}
+
+module.exports = {
+  server,
+  __test: {
+    supervisor,
+    loadCachedSummary,
+    invalidateSummaryCache,
+    clearSummaryCache: () => summaryCache.clear(),
+    setLoadBoardStateForTest: (fn) => { loadBoardStateForTest = fn; },
+    restoreLoadBoardState: () => { loadBoardStateForTest = null; },
+    resetSupervisorBackoff,
+    updateSupervisorBackoff,
+    idempotencyKey,
+    duplicateReport,
+    fingerprintComponents,
+    planFingerprintSpec,
+  },
+};

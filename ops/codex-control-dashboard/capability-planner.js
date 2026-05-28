@@ -1,12 +1,15 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 
 const HERMES_HOME = process.env.HERMES_HOME || '/home/ubuntu/.hermes';
 const STATE_DIR = path.join(HERMES_HOME, 'state', 'capability-planner');
 const INVENTORY_FILE = path.join(STATE_DIR, 'inventory.json');
 const AUDIT_FILE = path.join(STATE_DIR, 'audit.jsonl');
+const ROUTING_STATS_FILE = path.join(STATE_DIR, 'profile-routing-stats.json');
 const INVENTORY_TTL_MS = Math.max(15000, Math.min(600000, Number(process.env.CAPABILITY_PLANNER_TTL_MS || 60000) || 60000));
+const MIN_ROUTING_SAMPLE = Math.max(3, Number(process.env.CAPABILITY_PLANNER_MIN_ROUTING_SAMPLE || 3) || 3);
 
 let cachedInventory = null;
 let cachedInventoryAt = 0;
@@ -151,6 +154,156 @@ function chooseProfile(tags, spawnableProfiles, fallback) {
   return fallback;
 }
 
+function preferredProfileOrder(tags, spawnableProfiles, fallback) {
+  const available = new Set(spawnableProfiles || []);
+  const ordered = [];
+  const add = (...profiles) => {
+    for (const profile of profiles) {
+      if (!profile || !available.has(profile) || ordered.includes(profile)) continue;
+      ordered.push(profile);
+    }
+  };
+  if (tags.includes('cron') || tags.includes('discord') || tags.includes('dashboard') || tags.includes('google-workspace')) {
+    add('devops_fast', 'devops', 'fixer', fallback);
+  }
+  if (tags.includes('verification')) add('tester', 'reviewer', fallback);
+  if (tags.includes('code-change')) add('coder', 'fixer', fallback);
+  if (tags.includes('research') || tags.includes('ai-trends')) add('researcher', 'planner', fallback);
+  if (tags.includes('docs')) add('editor', 'planner', fallback);
+  if (tags.includes('mcp') || tags.includes('skills') || tags.includes('plugins')) add('planner', 'researcher', fallback);
+  add(fallback);
+  return ordered;
+}
+
+function boardDbPath(board) {
+  const safeBoard = String(board || '').replace(/[^A-Za-z0-9_.-]/g, '');
+  const boardDb = safeBoard ? path.join(HERMES_HOME, 'kanban', 'boards', safeBoard, 'kanban.db') : '';
+  if (boardDb && fs.existsSync(boardDb)) return boardDb;
+  const legacyDb = path.join(HERMES_HOME, 'kanban.db');
+  if (fs.existsSync(legacyDb)) return legacyDb;
+  return boardDb || legacyDb;
+}
+
+function emptyRoutingStats(profile) {
+  return {
+    profile,
+    sample: 0,
+    completed: 0,
+    blocked: 0,
+    failed: 0,
+    avgDurationSec: null,
+    successRate: null,
+    blockedRate: null,
+    failureRate: null,
+    recentFailureRate: null,
+    score: null,
+  };
+}
+
+function collectRoutingStats(board, spawnableProfiles = []) {
+  const profiles = [...new Set(spawnableProfiles || [])].filter(Boolean).sort();
+  const stats = Object.fromEntries(profiles.map((profile) => [profile, emptyRoutingStats(profile)]));
+  const db = boardDbPath(board);
+  if (!fs.existsSync(db)) return { generatedAt: new Date().toISOString(), board, db: null, profiles: stats };
+
+  let rows = [];
+  try {
+    const script = [
+      'import json, sqlite3, sys',
+      'db = sys.argv[1]',
+      'con = sqlite3.connect(db)',
+      'con.row_factory = sqlite3.Row',
+      "rows = con.execute('select profile, status, outcome, started_at, ended_at from task_runs where profile is not null').fetchall()",
+      'print(json.dumps([dict(row) for row in rows]))',
+    ].join('\n');
+    rows = JSON.parse(execFileSync('python3', ['-c', script, db], { encoding: 'utf8', timeout: 5000 }));
+  } catch {
+    return { generatedAt: new Date().toISOString(), board, db, profiles: stats };
+  }
+
+  const byProfile = new Map();
+  for (const row of rows) {
+    const profile = String(row.profile || '').trim();
+    if (!profile || (profiles.length && !profiles.includes(profile))) continue;
+    const outcome = String(row.outcome || row.status || '').toLowerCase();
+    if (!outcome || outcome === 'running') continue;
+    const started = Number(row.started_at || 0);
+    const ended = Number(row.ended_at || 0);
+    if (!byProfile.has(profile)) byProfile.set(profile, []);
+    byProfile.get(profile).push({ outcome, started, ended });
+  }
+
+  for (const [profile, items] of byProfile.entries()) {
+    const sample = items.length;
+    const completed = items.filter((item) => ['completed', 'done', 'success', 'succeeded'].includes(item.outcome)).length;
+    const blocked = items.filter((item) => item.outcome === 'blocked').length;
+    const failed = items.filter((item) => ['failed', 'failure', 'crashed', 'timed_out', 'timeout', 'error'].includes(item.outcome)).length;
+    const durations = items
+      .map((item) => item.ended && item.started ? Math.max(0, item.ended - item.started) : null)
+      .filter((duration) => Number.isFinite(duration));
+    const recent = [...items].sort((a, b) => (b.started || 0) - (a.started || 0)).slice(0, 10);
+    const recentFailures = recent.filter((item) => ['failed', 'failure', 'crashed', 'timed_out', 'timeout', 'error'].includes(item.outcome)).length;
+    const avgDurationSec = durations.length ? durations.reduce((sum, duration) => sum + duration, 0) / durations.length : null;
+    const successRate = sample ? completed / sample : null;
+    const blockedRate = sample ? blocked / sample : null;
+    const failureRate = sample ? failed / sample : null;
+    const recentFailureRate = recent.length ? recentFailures / recent.length : null;
+    const durationPenalty = avgDurationSec == null ? 0 : Math.min(0.5, avgDurationSec / 3600);
+    stats[profile] = {
+      profile,
+      sample,
+      completed,
+      blocked,
+      failed,
+      avgDurationSec: avgDurationSec == null ? null : Math.round(avgDurationSec),
+      successRate,
+      blockedRate,
+      failureRate,
+      recentFailureRate,
+      score: sample >= MIN_ROUTING_SAMPLE
+        ? Number(((successRate * 2) - (blockedRate * 0.9) - (failureRate * 1.4) - (recentFailureRate * 1.2) - durationPenalty).toFixed(3))
+        : null,
+    };
+  }
+  const result = { generatedAt: new Date().toISOString(), board, db, minSample: MIN_ROUTING_SAMPLE, profiles: stats };
+  try {
+    ensureStateDir();
+    fs.writeFileSync(ROUTING_STATS_FILE, JSON.stringify(result, null, 2));
+  } catch {
+    // Routing stats are advisory; queue creation must keep working without state writes.
+  }
+  return result;
+}
+
+function weightedProfileRecommendation({ tags, spawnableProfiles, fallback, board }) {
+  const baseProfile = chooseProfile(tags, spawnableProfiles, fallback);
+  const candidates = preferredProfileOrder(tags, spawnableProfiles, fallback);
+  const statsState = collectRoutingStats(board, spawnableProfiles);
+  const profiles = statsState.profiles || {};
+  const candidateStats = candidates.map((profile) => profiles[profile] || emptyRoutingStats(profile));
+  const baseStats = profiles[baseProfile] || emptyRoutingStats(baseProfile);
+  const viable = candidateStats.filter((stat) => stat.sample >= MIN_ROUTING_SAMPLE && stat.score != null);
+  if (baseStats.sample < MIN_ROUTING_SAMPLE || viable.length < 2) {
+    return {
+      selectedProfile: baseProfile,
+      baseProfile,
+      reason: 'insufficient-data',
+      minSample: MIN_ROUTING_SAMPLE,
+      profiles: Object.fromEntries(candidateStats.map((stat) => [stat.profile, stat])),
+    };
+  }
+  viable.sort((a, b) => b.score - a.score || b.sample - a.sample || candidates.indexOf(a.profile) - candidates.indexOf(b.profile));
+  const best = viable[0];
+  const selectedProfile = best.score > (baseStats.score ?? -Infinity) + 0.25 ? best.profile : baseProfile;
+  return {
+    selectedProfile,
+    baseProfile,
+    reason: selectedProfile === baseProfile ? 'heuristic-retained' : `${best.profile} selected: score ${best.score} beats ${baseProfile} score ${baseStats.score}`,
+    minSample: MIN_ROUTING_SAMPLE,
+    profiles: Object.fromEntries(candidateStats.map((stat) => [stat.profile, stat])),
+  };
+}
+
 function recommendedWorkers(tags, spawnableProfiles) {
   const available = new Set(spawnableProfiles || []);
   const ordered = [];
@@ -237,7 +390,13 @@ function planCapabilities({ input = {}, spec = {}, board = 'codex-control', spaw
   const inventory = getInventory(spawnableProfiles);
   const requestedAssignee = String(input.assignee || '').trim();
   const currentAssignee = String(spec.assignee || executionProfile || 'default').trim();
-  const recommendedAssignee = chooseProfile(tags, spawnableProfiles, executionProfile || currentAssignee || 'default');
+  const routingWeights = weightedProfileRecommendation({
+    tags,
+    spawnableProfiles,
+    fallback: executionProfile || currentAssignee || 'default',
+    board,
+  });
+  const recommendedAssignee = routingWeights.selectedProfile;
   const workers = recommendedWorkers(tags, spawnableProfiles);
   const hints = capabilityHints(tags, inventory);
   const swarmRecommended = tags.length >= 3 || (tags.includes('cron') && (tags.includes('code-change') || tags.includes('verification')));
@@ -253,6 +412,7 @@ function planCapabilities({ input = {}, spec = {}, board = 'codex-control', spaw
     swarmRecommended,
     workers,
     hints,
+    routingWeights,
     guardrails: [
       '기존 Hermes cron jobs.json, gateway service, codex-control.env는 직접 수정하지 말 것',
       'cron 문제는 직접 변경 대신 별도 Kanban 작업으로 분리할 것',
@@ -272,6 +432,22 @@ function planCapabilities({ input = {}, spec = {}, board = 'codex-control', spaw
   return plan;
 }
 
+function formatPercent(value) {
+  return value == null ? 'n/a' : `${Math.round(value * 100)}%`;
+}
+
+function routingWeightLines(routingWeights) {
+  if (!routingWeights) return [];
+  const lines = [`- 라우팅 가중치: ${routingWeights.reason}`];
+  const entries = Object.values(routingWeights.profiles || {})
+    .filter((stat) => stat && stat.profile)
+    .sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity) || String(a.profile).localeCompare(String(b.profile)));
+  for (const stat of entries) {
+    lines.push(`  - ${stat.profile}: sample=${stat.sample}, done=${stat.completed}, blocked=${stat.blocked}, failed=${stat.failed}, avg=${stat.avgDurationSec ?? 'n/a'}s, recent_fail=${formatPercent(stat.recentFailureRate)}, score=${stat.score ?? 'n/a'}`);
+  }
+  return lines;
+}
+
 function renderCapabilitySection(plan) {
   if (!plan) return '';
   const lines = [
@@ -280,6 +456,7 @@ function renderCapabilitySection(plan) {
     `- 감지 태그: ${plan.tags.length ? plan.tags.join(', ') : 'none'}`,
     `- 병렬 권장: ${plan.swarmRecommended ? 'yes' : 'no'}`,
     `- 현재 inventory: profiles=${plan.inventorySummary.profiles}, plugins=${plan.inventorySummary.enabledPlugins}, mcp=${plan.inventorySummary.mcpServers}, skills=${plan.inventorySummary.skills}, cron=${plan.inventorySummary.cronRecentOk}/${plan.inventorySummary.cronTotal} ok`,
+    ...routingWeightLines(plan.routingWeights),
     '- 추천 capability:',
     ...plan.hints.map((hint) => `  - ${hint.kind}:${hint.name} - ${hint.reason}`),
   ];
@@ -302,6 +479,12 @@ function auditPlan(plan) {
       tags: plan.tags,
       recommendedAssignee: plan.recommendedAssignee,
       swarmRecommended: plan.swarmRecommended,
+      routingWeights: plan.routingWeights ? {
+        selectedProfile: plan.routingWeights.selectedProfile,
+        baseProfile: plan.routingWeights.baseProfile,
+        reason: plan.routingWeights.reason,
+        minSample: plan.routingWeights.minSample,
+      } : null,
       inventorySummary: plan.inventorySummary,
     })}\n`);
   } catch {
@@ -313,4 +496,5 @@ module.exports = {
   planCapabilities,
   renderCapabilitySection,
   getInventory,
+  collectRoutingStats,
 };
