@@ -3,6 +3,7 @@ const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
+const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
 const PORT = Number(process.env.PORT || 17640);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -761,16 +762,27 @@ function swarmTitle(text, fallback) {
 }
 
 function buildSwarmWorkers(input, spec) {
-  const text = `${input.title || ''}\n${input.detail || input.body || input.description || ''}\n${spec.title || ''}\n${spec.body || ''}`.toLowerCase();
-  const workers = [
+  const text = `${input.title || ''}
+${input.detail || input.body || input.description || ''}
+${spec.title || ''}
+${spec.body || ''}`.toLowerCase();
+  const plannerWorkers = Array.isArray(spec.capabilityPlan?.workers)
+    ? spec.capabilityPlan.workers
+      .map((worker) => ({
+        profile: cleanProfile(worker.profile, ''),
+        title: swarmTitle(worker.title, 'Capability worker'),
+      }))
+      .filter((worker) => worker.profile && QUEUE_SPAWNABLE_PROFILES.has(worker.profile))
+    : [];
+  const workers = plannerWorkers.length ? plannerWorkers : [
     { profile: 'researcher', title: '현재 상태 조사 및 원인 분석' },
     { profile: 'coder', title: '핵심 코드 수정 및 설정 반영' },
     { profile: 'tester', title: '회귀 테스트와 실행 검증' },
   ];
-  if (/(cron|scheduler|discord|webhook|api|env|config|deploy|운영|설정|자동화|대시보드)/i.test(text)) {
+  if (!plannerWorkers.length && /(cron|scheduler|discord|webhook|api|env|config|deploy|운영|설정|자동화|대시보드)/i.test(text)) {
     workers.splice(1, 0, { profile: 'devops', title: '운영 경로와 실행 환경 점검' });
   }
-  if (workers.length < AUTO_SWARM_MAX_WORKERS || /(docs|readme|문서|보고|runbook|운영)/i.test(text)) {
+  if (!plannerWorkers.length && (workers.length < AUTO_SWARM_MAX_WORKERS || /(docs|readme|문서|보고|runbook|운영)/i.test(text))) {
     workers.push({ profile: 'documenter', title: '문서와 완료 보고 정리' });
   }
   return workers
@@ -782,15 +794,48 @@ function buildSwarmWorkers(input, spec) {
     }));
 }
 
+
+function applyCapabilityPlan(spec, input, board) {
+  let plan = null;
+  try {
+    plan = planCapabilities({
+      input,
+      spec,
+      board,
+      spawnableProfiles: [...QUEUE_SPAWNABLE_PROFILES],
+      executionProfile: QUEUE_EXECUTION_PROFILE,
+    });
+  } catch (error) {
+    pushSupervisorLog('error', `capability planner failed: ${error.message || String(error)}`);
+    return spec;
+  }
+
+  const section = renderCapabilitySection(plan);
+  const body = section && !String(spec.body || '').includes('Capability Planner:')
+    ? cleanText(`${spec.body || ''}\n\n${section}`, 12000)
+    : spec.body;
+  const assignee = plan.shouldOverrideAssignee
+    ? cleanProfile(plan.recommendedAssignee, spec.assignee || QUEUE_EXECUTION_PROFILE)
+    : spec.assignee;
+  return {
+    ...spec,
+    assignee,
+    body,
+    capabilityPlan: plan,
+  };
+}
+
 function buildSwarmPlan(input, spec, board) {
   const detail = cleanText(input.detail || input.body || input.description || spec.body || '', 8000);
   const title = swarmTitle(spec.title || input.title, '병렬 작업');
+  const capabilitySection = spec.capabilityPlan ? renderCapabilitySection(spec.capabilityPlan) : '';
   const goal = cleanText([
     `Source: ${cleanText(input.source || 'api', 80)}`,
     `Board: ${board}`,
     '',
     'Original request:',
     detail || title,
+    ...(capabilitySection ? ['', capabilitySection] : []),
     '',
     'Parallel execution policy:',
     '- Work as a Kanban swarm: parallel workers produce focused handoffs, verifier gates, synthesizer integrates.',
@@ -812,6 +857,7 @@ function buildSwarmPlan(input, spec, board) {
       maxRetries: spec.maxRetries || 2,
       skills: [],
       orchestrated: Boolean(spec.orchestrated),
+      capabilityPlan: spec.capabilityPlan || null,
     },
     swarm: {
       goal,
@@ -1058,8 +1104,9 @@ async function createKanbanSwarm(input, board, plan) {
 async function createKanbanTask(input) {
   const board = cleanBoard(input.board || supervisor.board || 'codex-control');
   if (!board) throw new Error('invalid board slug');
-  const spec = await orchestrateTask({ ...input, board });
-  const plan = shouldCreateSwarm(input, spec)
+  const spec = applyCapabilityPlan(await orchestrateTask({ ...input, board }), input, board);
+  const shouldSwarm = shouldCreateSwarm(input, spec) || Boolean(spec.capabilityPlan?.swarmRecommended && requestedQueueMode(input) !== 'single');
+  const plan = shouldSwarm
     ? buildSwarmPlan(input, spec, board)
     : { mode: 'task', spec };
   if (input.dryRun) {
