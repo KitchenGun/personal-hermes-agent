@@ -685,19 +685,38 @@ function buildStatusMessage(task, entry) {
   return lines.join('\n');
 }
 
+function clampProgress(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(100, Math.round(parsed)));
+}
+
+function statusProgress(status) {
+  if (status === 'done' || status === 'archived') return 100;
+  if (status === 'review') return 80;
+  if (status === 'running') return 15;
+  return 0;
+}
+
+function taskProgress(task) {
+  return task?.progress === undefined || task?.progress === null
+    ? statusProgress(task?.status)
+    : clampProgress(task.progress);
+}
+
+function progressBucket(value) {
+  return Math.floor(clampProgress(value) / 10);
+}
+
 function publicNotifyTask(task, blockedReason = '') {
-  const progress = task.status === 'done'
-    ? 100
-    : task.status === 'running'
-      ? 45
-      : 0;
+  const progress = taskProgress(task);
   return {
     id: task.id,
     title: task.title,
     status: task.status,
     assignee: task.assignee,
     progress,
-    progressStage: task.sanitized_error_class || '',
+    progressStage: task.progressStage || task.sanitized_error_class || '',
     blockedReason,
     needsUserInput: false,
   };
@@ -720,17 +739,19 @@ async function pollTaskStatus() {
       const task = tasksById.get(taskId);
       if (!task?.status || !entry.channelId) continue;
       const statusChanged = task.status !== entry.lastStatus;
-      const progressChanged = false;
+      const currentProgress = taskProgress(task);
+      const lastProgress = clampProgress(entry.lastProgress || 0);
+      const progressChanged = progressBucket(currentProgress) !== progressBucket(lastProgress);
       const blockedReason = task.status === 'blocked' ? String(task.sanitized_error_class || '') : '';
       const blockedReasonChanged = Boolean(blockedReason && blockedReason !== String(entry.lastBlockedReason || ''));
       if (!statusChanged && !progressChanged && !blockedReasonChanged) continue;
 
-      if ((statusChanged && NOTIFY_STATUSES.has(task.status)) || blockedReasonChanged) {
-        await sendDiscordMessage(entry.channelId, buildStatusMessage(publicNotifyTask(task, blockedReason), entry), entry.messageId);
-        log('notified task', `${taskId} status=${task.status}`);
+      if ((statusChanged && NOTIFY_STATUSES.has(task.status)) || blockedReasonChanged || (task.status === 'running' && progressChanged)) {
+        await sendDiscordMessage(entry.channelId, buildStatusMessage(publicNotifyTask({ ...task, progress: currentProgress }, blockedReason), entry), entry.messageId);
+        log('notified task', `${taskId} status=${task.status} progress=${currentProgress}`);
       }
       entry.lastStatus = task.status;
-      entry.lastProgress = Number(task.progress || 0);
+      entry.lastProgress = currentProgress;
       entry.lastBlockedReason = blockedReason;
       entry.lastNotifiedAt = new Date().toISOString();
       changed = true;

@@ -40,11 +40,23 @@ function unix(value) {
   return new Date(Number(value) * 1000).toLocaleString('ko-KR');
 }
 
+function clampProgress(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
 function statusProgress(status) {
   if (status === 'done' || status === 'archived') return 100;
-  if (status === 'running') return 45;
-  if (status === 'ready' || status === 'todo' || status === 'triage' || status === 'scheduled') return 15;
+  if (status === 'running') return 15;
+  if (status === 'review') return 80;
+  if (status === 'ready' || status === 'todo' || status === 'triage' || status === 'scheduled') return 0;
   return 0;
+}
+
+function taskProgress(task) {
+  if (task && task.progress !== undefined && task.progress !== null) return clampProgress(task.progress);
+  return statusProgress(task?.status);
 }
 
 function ageText(seconds) {
@@ -109,9 +121,10 @@ async function loadBoards() {
 
 function render(data) {
   const summary = data.summary;
-  const overall = summary.total ? Math.round((summary.done / summary.total) * 100) : 0;
-  const activeTask = data.tasks.find((task) => task.status !== 'done' && task.status !== 'archived') || data.tasks[0] || null;
-  const activeProgress = activeTask ? statusProgress(activeTask.status) : 0;
+  const fallbackOverall = summary.total ? Math.round((summary.done / summary.total) * 100) : 0;
+  const overall = summary.overallProgress === undefined ? fallbackOverall : clampProgress(summary.overallProgress);
+  const activeTask = summary.currentTask || data.tasks.find((task) => task.status !== 'done' && task.status !== 'archived') || data.tasks[0] || null;
+  const activeProgress = activeTask ? taskProgress(activeTask) : 0;
   overallProgress.textContent = pct(overall);
   currentProgress.textContent = pct(activeProgress);
   overallBar.style.width = pct(overall);
@@ -129,7 +142,7 @@ function render(data) {
         <div class="taskTitle">${escapeHtml(task.title)}</div>
         <div class="taskMeta">${taskMeta(task, true)}</div>
       </div>
-      <div>${statusBadge(task.status)}${progressCell(statusProgress(task.status), task.sanitized_error_class)}</div>
+      <div>${statusBadge(task.status)}${progressCell(taskProgress(task), task.progressStage || task.sanitized_error_class)}</div>
     `;
   } else {
     currentTask.innerHTML = '<div class="taskMeta">No current task.</div>';

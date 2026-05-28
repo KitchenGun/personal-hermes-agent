@@ -36,6 +36,8 @@ Allowed fields:
 - `summary.running`
 - `summary.ready`
 - `summary.blocked`
+- `summary.overallProgress`
+- `summary.currentTask`
 - `tasks[].id`
 - `tasks[].title`
 - `tasks[].status`
@@ -44,6 +46,8 @@ Allowed fields:
 - `tasks[].retry_count`
 - `tasks[].sanitized_error_class`
 - `tasks[].updated_at`
+- `tasks[].progress`
+- `tasks[].progressStage`
 
 Forbidden in responses:
 

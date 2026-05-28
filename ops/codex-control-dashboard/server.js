@@ -209,19 +209,25 @@ function publicTaskDto(task) {
     retry_count: Number(task.retry_count ?? task.retries ?? task.attempts ?? 0) || 0,
     sanitized_error_class: sanitizeErrorClass(errorSource),
     updated_at: taskUpdatedAt(task),
+    progress: publicTaskProgress(task),
+    progressStage: publicTaskProgressStage(task),
   };
 }
 
 function publicSummaryDto(state) {
+  const summary = state.summary || {};
+  const currentTask = summary.currentTask ? publicTaskDto(summary.currentTask) : null;
   return {
     board: sanitizePublicText(state.board, 64),
     updated_at: state.updatedAt || new Date().toISOString(),
     summary: {
-      total: Number(state.summary?.total || 0),
-      done: Number(state.summary?.done || 0),
-      running: Number(state.summary?.running || 0),
-      ready: Number(state.summary?.ready || 0),
-      blocked: Number(state.summary?.blocked || 0),
+      total: Number(summary.total || 0),
+      done: Number(summary.done || 0),
+      running: Number(summary.running || 0),
+      ready: Number(summary.ready || 0),
+      blocked: Number(summary.blocked || 0),
+      overallProgress: clampProgress(summary.overallProgress ?? percent(Number(summary.done || 0), Number(summary.total || 0))),
+      currentTask,
     },
     tasks: (state.tasks || []).map(publicTaskDto),
   };
@@ -388,7 +394,16 @@ function statusProgress(task) {
 }
 
 function taskProgress(task) {
-  return clampProgress(task.progress ?? statusProgress(task));
+  const explicit = task.progress;
+  return explicit === undefined || explicit === null ? statusProgress(task) : clampProgress(explicit);
+}
+
+function publicTaskProgress(task) {
+  return taskProgress(task);
+}
+
+function publicTaskProgressStage(task) {
+  return sanitizePublicText(task.progressStage || taskStage(task), 120);
 }
 
 function taskStage(task) {
@@ -783,6 +798,7 @@ function buildSwarmPlan(input, spec, board) {
     '- User-facing status, block reasons, and completion summaries must be written in Korean.',
     '- Do not reveal secret values. Request missing secrets by env/secret name only.',
     '- Completion must report files changed, commands run, verification result, and remaining blockers.',
+    '- Each worker must emit Korean progress updates with exact markers: `[PROGRESS] 15%`, `[PROGRESS] 40%`, `[PROGRESS] 70%`, `[PROGRESS] 90%`.',
   ].join('\n'), 12000);
   return {
     mode: 'swarm',
@@ -850,6 +866,7 @@ async function orchestrateTask(input) {
     '}',
     '',
     'Body must include acceptance criteria, execution notes, verification expectations, progress reporting, and completion report format.',
+    'Workers must report meaningful progress in Korean at major milestones using exact markers like `[PROGRESS] 15%`, `[PROGRESS] 40%`, `[PROGRESS] 70%`, and `[PROGRESS] 90%` in logs or comments.',
     'All user-facing status messages, block reasons, and final summaries must be in Korean.',
     'When required user information is missing, tell the worker to block with `NEEDS_USER_INPUT` and `REQUIRED_INPUTS:`. Secrets must be requested by name only, not by value.',
     'If the request is too broad, make the first task a planning/decomposition task only when needed, and require it to create concrete implementation child tasks before completion. Never let planning be the final deliverable when the user asked to proceed or implement.',
@@ -956,6 +973,7 @@ async function createKanbanSwarm(input, board, plan) {
       '',
       'Output requirements:',
       '- Comment progress and findings in Korean.',
+      '- Include exact progress markers at major milestones: `[PROGRESS] 15%`, `[PROGRESS] 40%`, `[PROGRESS] 70%`, `[PROGRESS] 90%`.',
       '- Avoid editing files outside this worker scope unless necessary.',
       '- Leave concrete handoff notes for verifier/synthesizer.',
     ].join('\n');
@@ -978,6 +996,7 @@ async function createKanbanSwarm(input, board, plan) {
       ...workerIds.map((id) => `- ${id}`),
       '',
       'Report in Korean: pass/fail, gaps, and required fixes.',
+      'Include exact progress markers while verifying: `[PROGRESS] 40%`, `[PROGRESS] 70%`, `[PROGRESS] 90%`.',
     ].join('\n'),
     cleanProfile(plan.swarm.verifier, 'reviewer'),
     'verifier',
@@ -993,6 +1012,7 @@ async function createKanbanSwarm(input, board, plan) {
       `Verifier task: ${verifierId || '-'}`,
       '',
       'Final report must be in Korean and include changed files, commands run, verification result, and remaining risks.',
+      'Include exact progress markers during synthesis: `[PROGRESS] 40%`, `[PROGRESS] 70%`, `[PROGRESS] 90%`.',
     ].join('\n'),
     cleanProfile(plan.swarm.synthesizer, 'editor'),
     'synthesizer',

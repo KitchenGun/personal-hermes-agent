@@ -50,9 +50,9 @@ expect_code 200 "$summary_code" "summary"
 node - "$summary_json" <<'JS'
 const allowed = new Set([
   'board','updated_at','summary','tasks',
-  'total','done','running','ready','blocked',
+  'total','done','running','ready','blocked','overallProgress','currentTask',
   'id','title','status','assignee','age_seconds',
-  'retry_count','sanitized_error_class'
+  'retry_count','sanitized_error_class','progress','progressStage'
 ]);
 
 function walk(value, path = '$') {
