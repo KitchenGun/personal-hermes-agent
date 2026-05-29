@@ -6,6 +6,8 @@ trigger:
   commands:
     - "/workout confirm <token>"
     - "/workout deny <token>"
+    - "캘린더도 수정해라"
+    - "금요일 일정 확정하고 구글캘린더에 업데이트해줘라"
   timezone: "${HERMES_TIMEZONE}"
 input:
   spreadsheet_url: "<YOUR_WORKOUT_SPREADSHEET_URL>"
@@ -19,6 +21,9 @@ steps:
   - "Resolve Google Sheets gid through sheet metadata to a quoted A1 range."
   - "Fail closed when gid, sheet metadata, token, or pending plan state is missing."
   - "Refuse Google Calendar writes unless the pending plan is explicitly confirmed."
+  - "If an already-calendarized draft is revised, set calendar_update_required and keep it actionable."
+  - "Treat explicit calendar update phrases as confirmation plus forced Calendar re-upsert for the latest active draft."
+  - "Delete stale prior Hermes-marked workout events that are no longer present in the revised plan."
   - "Use deterministic Hermes event IDs plus hermes_marker and spec_hash for idempotent calendar upsert."
 output:
   destination: "<YOUR_WORKOUT_REVIEW_CHANNEL>"
@@ -33,6 +38,7 @@ safety:
   token_entropy: "128-bit-minimum"
   calendar_write: "confirmed-plan-only"
   idempotency: "deterministic-event-id-and-spec-hash"
+  calendar_update_required: "set-on-revised-calendarized-draft-clear-after-apply"
   sheets_gid: "metadata-resolved-fail-closed"
   secrets: "do-not-include-google-or-discord-secrets"
 status: enabled
