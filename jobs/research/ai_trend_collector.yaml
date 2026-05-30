@@ -12,12 +12,29 @@ input:
 steps:
   - "Search approved public sources."
   - "Deduplicate overlapping stories."
-  - "Summarize trends with source links."
+  - "Summarize trends with Korean source links, score, rationale, evidence, and project impact."
 output:
   destination: "<YOUR_RESEARCH_DIGEST_CHANNEL>"
   format: markdown
 tools:
   - web_search
+limits:
+  max_items: 10
+  recency_hours: 24
+output_requirements:
+  language: ko
+  template: "# AI 일간 트렌드 보고 - YYYY-MM-DD"
+  include_per_item:
+    - 제목
+    - 링크
+    - 점수
+    - 새 기능/변경점
+    - 선정 이유
+    - 근거
+    - 내 환경에서의 활용
+  fallback_policy:
+    - "Do not expose raw fallback or error text."
+    - "Explain fallback scoring in user-friendly Korean when needed."
 model: "${HERMES_RESEARCH_MODEL}"
 safety:
   sources: "public-only"
