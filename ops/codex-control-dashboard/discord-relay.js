@@ -8,13 +8,17 @@ const RESUME_ENDPOINT = process.env.DISCORD_RESUME_ENDPOINT || 'http://127.0.0.1
 const STATE_ENDPOINT = process.env.DISCORD_STATE_ENDPOINT || 'http://127.0.0.1:17640/api/summary?board=codex-control';
 const STATE_FILE = process.env.DISCORD_RELAY_STATE || path.join(__dirname, 'discord-relay-state.json');
 const SECRET = process.env.DISCORD_SHARED_SECRET || '';
+const STATE_SECRET = process.env.CONTROL_SHARED_SECRET || SECRET;
 const CHANNEL_IDS = csvSet(process.env.DISCORD_CHANNEL_IDS || '');
 const USER_IDS = csvSet(process.env.DISCORD_ALLOWED_USER_IDS || '');
 const GATEWAY_QUEUE_CHANNEL_IDS = csvSet(process.env.DISCORD_GATEWAY_QUEUE_CHANNEL_IDS || '');
 const MAX_ATTACHMENT_BYTES = Number(process.env.DISCORD_MAX_ATTACHMENT_BYTES || 262144);
-const NOTIFY_INTERVAL_MS = Number(process.env.DISCORD_NOTIFY_INTERVAL_MS || 10000);
+const NOTIFY_ACTIVE_INTERVAL_MS = Math.max(1000, Number(process.env.DISCORD_NOTIFY_INTERVAL_MS || 10000) || 10000);
+const NOTIFY_IDLE_INTERVAL_MS = Math.max(NOTIFY_ACTIVE_INTERVAL_MS, Number(process.env.DISCORD_NOTIFY_IDLE_INTERVAL_MS || 60000) || 60000);
+const NOTIFY_ERROR_INTERVAL_MS = Math.max(5000, Number(process.env.DISCORD_NOTIFY_ERROR_INTERVAL_MS || 30000) || 30000);
 const RELAY_STATE_PRUNE_AFTER_MS = Number(process.env.DISCORD_RELAY_PRUNE_AFTER_MS || 3 * 24 * 60 * 60 * 1000);
 const NOTIFY_STATUSES = new Set(['running', 'blocked', 'review', 'done']);
+const ACTIVE_POLL_STATUSES = new Set(['queued', 'todo', 'triage', 'scheduled', 'ready', 'running', 'review', 'blocked']);
 const PRUNE_STATUSES = new Set(['done', 'archived']);
 const QUEUE_ONLY = process.env.DISCORD_QUEUE_ONLY !== '0';
 const QUEUE_NOTICE_COOLDOWN_MS = Number(process.env.DISCORD_QUEUE_NOTICE_COOLDOWN_MS || 60000);
@@ -39,6 +43,11 @@ if (!TEST_MODE && !TOKEN) {
 
 if (!TEST_MODE && !SECRET) {
   console.error('DISCORD_SHARED_SECRET is required.');
+  process.exit(1);
+}
+
+if (!TEST_MODE && !STATE_SECRET) {
+  console.error('CONTROL_SHARED_SECRET or DISCORD_SHARED_SECRET is required for status polling.');
   process.exit(1);
 }
 
@@ -788,12 +797,26 @@ function publicNotifyTask(task, blockedReason = '') {
   };
 }
 
+function isActiveState(state, persistedState = relayState) {
+  const summary = state?.summary || {};
+  if (Number(summary.running || 0) > 0) return true;
+  if (Number(summary.ready || 0) > 0) return true;
+  if (Number(summary.blocked || 0) > 0) return true;
+  return Object.values(persistedState?.tasks || {}).some((entry) => ACTIVE_POLL_STATUSES.has(String(entry.lastStatus || '')));
+}
+
+function statusPollDelayMs(result) {
+  if (result?.status === 'error') return NOTIFY_ERROR_INTERVAL_MS;
+  if (result?.status === 'active' || result?.status === 'busy') return NOTIFY_ACTIVE_INTERVAL_MS;
+  return NOTIFY_IDLE_INTERVAL_MS;
+}
+
 async function pollTaskStatus() {
-  if (notifyBusy) return;
+  if (notifyBusy) return { status: 'busy', changed: false };
   notifyBusy = true;
   try {
     const response = await fetch(STATE_ENDPOINT, {
-      headers: { authorization: `Bearer ${SECRET}` },
+      headers: { authorization: `Bearer ${STATE_SECRET}` },
     });
     if (!response.ok) throw new Error(`state API failed: ${response.status}`);
     const state = await response.json();
@@ -827,17 +850,32 @@ async function pollTaskStatus() {
     } else {
       saveRelayStateToFile(relayState, STATE_FILE, { writeWhenUnchanged: false });
     }
+    return { status: isActiveState(state) ? 'active' : 'idle', changed };
   } catch (error) {
     log('status poll failed', error.message || String(error));
+    return { status: 'error', changed: false, error };
   } finally {
     notifyBusy = false;
   }
 }
 
+function scheduleStatusPoll(delayMs) {
+  clearTimeout(notifyTimer);
+  notifyTimer = setTimeout(async () => {
+    notifyTimer = null;
+    const result = await pollTaskStatus();
+    scheduleStatusPoll(statusPollDelayMs(result));
+  }, delayMs);
+}
+
 function startStatusPolling() {
   if (notifyTimer) return;
-  notifyTimer = setInterval(() => pollTaskStatus().catch((error) => log('status poll failed', error.message)), NOTIFY_INTERVAL_MS);
-  pollTaskStatus().catch((error) => log('status poll failed', error.message));
+  pollTaskStatus()
+    .then((result) => scheduleStatusPoll(statusPollDelayMs(result)))
+    .catch((error) => {
+      log('status poll failed', error.message || String(error));
+      scheduleStatusPoll(NOTIFY_ERROR_INTERVAL_MS);
+    });
 }
 
 function shouldSendQueueOnlyNotice(message) {
@@ -952,5 +990,12 @@ module.exports = {
     pruneRelayState,
     saveRelayStateToFile,
     terminalTaskTimestamp,
+    isActiveState,
+    statusPollDelayMs,
+    intervals: {
+      active: NOTIFY_ACTIVE_INTERVAL_MS,
+      idle: NOTIFY_IDLE_INTERVAL_MS,
+      error: NOTIFY_ERROR_INTERVAL_MS,
+    },
   },
 };

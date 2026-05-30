@@ -5,6 +5,7 @@ process.env.SUPERVISOR_AUTO_START = '0';
 process.env.SUMMARY_CACHE_TTL_MS = '1000';
 process.env.SUMMARY_CACHE_SWR_MS = '5000';
 process.env.SUPERVISOR_IDLE_BACKOFF_MAX_MS = '60000';
+process.env.SUPERVISOR_IDLE_BACKOFF_INITIAL_MS = '30000';
 
 delete require.cache[require.resolve('./server')];
 const dashboard = require('./server');
@@ -59,11 +60,11 @@ function testSupervisorIdleBackoffAndReset() {
   dashboard.__test.resetSupervisorBackoff();
 
   dashboard.__test.updateSupervisorBackoff(state('codex-control', 0));
-  assert.equal(supervisor.currentIntervalMs, 10000);
+  assert.equal(supervisor.currentIntervalMs, 30000);
   assert.equal(supervisor.idleBackoffStreak, 1);
 
   dashboard.__test.updateSupervisorBackoff(state('codex-control', 0));
-  assert.equal(supervisor.currentIntervalMs, 20000);
+  assert.equal(supervisor.currentIntervalMs, 60000);
   assert.equal(supervisor.idleBackoffStreak, 2);
 
   dashboard.__test.updateSupervisorBackoff(state('codex-control', 1, { ready: 1 }));

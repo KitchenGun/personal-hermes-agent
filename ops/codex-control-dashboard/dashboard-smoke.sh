@@ -6,6 +6,10 @@ BASE="${BASE:-http://127.0.0.1:17640}"
 BOARD="${BOARD:-codex-control}"
 CHECK_ENV="${CODEX_CONTROL_CHECK_ENV:-0}"
 ENV_FILE="${CODEX_CONTROL_ENV_FILE:-/home/ubuntu/.hermes/codex-control.env}"
+NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
+if [[ -z "$NODE_BIN" && -x /home/ubuntu/.local/bin/node ]]; then
+  NODE_BIN=/home/ubuntu/.local/bin/node
+fi
 
 usage() {
   cat <<'USAGE'
@@ -73,6 +77,7 @@ fi
 
 : "${CONTROL_SHARED_SECRET:?CONTROL_SHARED_SECRET must be set}"
 : "${DISCORD_SHARED_SECRET:?DISCORD_SHARED_SECRET must be set}"
+: "${NODE_BIN:?node executable not found}"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -116,7 +121,7 @@ expect_code 200 "$health_code" "health"
 summary_code="$(code GET "$BASE/api/summary?board=$BOARD" "$summary_json")"
 expect_code 200 "$summary_code" "summary"
 
-node - "$summary_json" <<'NODE'
+"$NODE_BIN" - "$summary_json" <<'NODE'
 const allowed = new Set([
   'board', 'updated_at', 'summary', 'tasks',
   'total', 'done', 'running', 'ready', 'blocked', 'overallProgress', 'currentTask',
@@ -165,7 +170,7 @@ expect_forbidden "$bad_token_code" "supervisor bad token"
 good_token_code="$(code POST "$BASE/api/supervisor/tick?dryRun=1" "$post_json" -H 'content-type: application/json' -H "authorization: Bearer ${CONTROL_SHARED_SECRET}" --data '{}')"
 expect_code 200 "$good_token_code" "supervisor valid token dry-run"
 
-csrf_code="$(node - "$BASE" <<'NODE'
+csrf_code="$("$NODE_BIN" - "$BASE" <<'NODE'
 const base = process.argv[2];
 const health = await fetch(`${base}/api/health`).then((r) => r.json());
 const response = await fetch(`${base}/api/supervisor/tick?dryRun=1`, {

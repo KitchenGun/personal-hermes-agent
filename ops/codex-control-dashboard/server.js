@@ -37,7 +37,8 @@ const SUPERVISOR_CRASH_STORM_SCAN_LIMIT = Math.max(3, Math.min(20, Number(proces
 const SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS = Math.max(60, Math.min(3600, Number(process.env.SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS || 300) || 300));
 const SUMMARY_CACHE_TTL_MS = Math.max(500, Math.min(10_000, Number(process.env.SUMMARY_CACHE_TTL_MS || 2000) || 2000));
 const SUMMARY_CACHE_SWR_MS = Math.max(SUMMARY_CACHE_TTL_MS, Math.min(60_000, Number(process.env.SUMMARY_CACHE_SWR_MS || 10_000) || 10_000));
-const SUPERVISOR_IDLE_BACKOFF_MAX_MS = Math.max(15_000, Math.min(300_000, Number(process.env.SUPERVISOR_IDLE_BACKOFF_MAX_MS || 60_000) || 60_000));
+const SUPERVISOR_IDLE_BACKOFF_MAX_MS = Math.max(15_000, Math.min(300_000, Number(process.env.SUPERVISOR_IDLE_BACKOFF_MAX_MS || 300_000) || 300_000));
+const SUPERVISOR_IDLE_BACKOFF_INITIAL_MS = Math.max(15_000, Math.min(SUPERVISOR_IDLE_BACKOFF_MAX_MS, Number(process.env.SUPERVISOR_IDLE_BACKOFF_INITIAL_MS || 60_000) || 60_000));
 const SYSTEMIC_WORKER_FAILURE_RE = /pid\s+\d+\s+not alive|'NoneType' object is not iterable|Non-streaming API call timed out|Non-retryable client error/i;
 const CONTROL_SHARED_SECRET = process.env.CONTROL_SHARED_SECRET || '';
 const CONTROL_CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
@@ -305,6 +306,8 @@ function publicSupervisorSnapshot() {
     intervalMs: supervisor.intervalMs,
     currentIntervalMs: supervisor.currentIntervalMs,
     idleBackoffStreak: supervisor.idleBackoffStreak,
+    idleBackoffInitialMs: SUPERVISOR_IDLE_BACKOFF_INITIAL_MS,
+    idleBackoffMaxMs: SUPERVISOR_IDLE_BACKOFF_MAX_MS,
     failureLimit: supervisor.failureLimit,
     startedAt: supervisor.startedAt,
     lastTickAt: supervisor.lastTickAt,
@@ -1921,11 +1924,12 @@ function updateSupervisorBackoff(state) {
     resetSupervisorBackoff();
     return;
   }
+  const priorIntervalMs = Math.max(supervisor.intervalMs, supervisor.currentIntervalMs || supervisor.intervalMs);
+  const nextIntervalMs = supervisor.idleBackoffStreak === 0
+    ? Math.max(supervisor.intervalMs, SUPERVISOR_IDLE_BACKOFF_INITIAL_MS)
+    : priorIntervalMs * 2;
   supervisor.idleBackoffStreak += 1;
-  supervisor.currentIntervalMs = Math.min(
-    SUPERVISOR_IDLE_BACKOFF_MAX_MS,
-    Math.max(supervisor.intervalMs, supervisor.currentIntervalMs || supervisor.intervalMs) * 2,
-  );
+  supervisor.currentIntervalMs = Math.min(SUPERVISOR_IDLE_BACKOFF_MAX_MS, nextIntervalMs);
 }
 
 function supervisorSnapshot() {

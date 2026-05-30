@@ -5,6 +5,9 @@ const path = require('node:path');
 
 process.env.DISCORD_RELAY_TEST_MODE = '1';
 process.env.DISCORD_RELAY_PRUNE_AFTER_MS = String(24 * 60 * 60 * 1000);
+process.env.DISCORD_NOTIFY_INTERVAL_MS = '10000';
+process.env.DISCORD_NOTIFY_IDLE_INTERVAL_MS = '60000';
+process.env.DISCORD_NOTIFY_ERROR_INTERVAL_MS = '30000';
 
 delete require.cache[require.resolve('./discord-relay')];
 const relay = require('./discord-relay');
@@ -64,6 +67,21 @@ function testSavePrunesBeforeAtomicWrite() {
   assert.ok(logs.some((line) => line.includes('maxAgeMs=10')));
 }
 
+function testAdaptivePollingState() {
+  assert.equal(typeof relay.__test.isActiveState, 'function');
+  assert.equal(relay.__test.isActiveState({ summary: { running: 1 }, tasks: [] }, { tasks: {} }), true);
+  assert.equal(relay.__test.isActiveState({ summary: { ready: 1 }, tasks: [] }, { tasks: {} }), true);
+  assert.equal(relay.__test.isActiveState({ summary: { blocked: 1 }, tasks: [] }, { tasks: {} }), true);
+  assert.equal(relay.__test.isActiveState({ summary: { running: 0, ready: 0, blocked: 0 }, tasks: [] }, { tasks: {} }), false);
+  assert.equal(relay.__test.isActiveState({ summary: {} }, { tasks: { t1: { lastStatus: 'running' } } }), true);
+  assert.equal(relay.__test.isActiveState({ summary: {} }, { tasks: { t1: { lastStatus: 'done' } } }), false);
+
+  assert.equal(relay.__test.statusPollDelayMs({ status: 'active' }), relay.__test.intervals.active);
+  assert.equal(relay.__test.statusPollDelayMs({ status: 'idle' }), relay.__test.intervals.idle);
+  assert.equal(relay.__test.statusPollDelayMs({ status: 'error' }), relay.__test.intervals.error);
+}
+
 testPrunesOnlyOldTerminalTasks();
 testSavePrunesBeforeAtomicWrite();
+testAdaptivePollingState();
 console.log('discord relay prune tests passed');

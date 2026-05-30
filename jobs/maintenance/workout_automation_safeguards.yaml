@@ -10,6 +10,7 @@ trigger:
     - "금요일 일정 확정하고 구글캘린더에 업데이트해줘라"
     - "workout inbody + image attachment"
     - "workout log block format"
+    - "workout append history"
   timezone: "${HERMES_TIMEZONE}"
 input:
   spreadsheet_url: "<YOUR_WORKOUT_SPREADSHEET_URL>"
@@ -28,6 +29,7 @@ steps:
   - "Delete stale prior Hermes-marked workout events that are no longer present in the revised plan."
   - "For workout inbody image attachments, OCR the image through the Hermes vision path before appending to Sheets."
   - "For workout log, accept both one-line entries and block entries where an exercise name line is followed by metric-only set lines."
+  - "Keep last_append for compatibility and maintain append_history for the latest manual workout sheet writes."
   - "Keep the workout Discord channel in free_response_channels and no_thread_channels so direct workout commands are handled without mentions."
   - "Use deterministic Hermes event IDs plus hermes_marker and spec_hash for idempotent calendar upsert."
 output:
@@ -46,6 +48,7 @@ safety:
   calendar_update_required: "set-on-revised-calendarized-draft-clear-after-apply"
   inbody_image: "vision-ocr-before-sheets-append"
   workout_log_block_format: "exercise-heading-plus-metric-lines"
+  append_history: "last-append-compatible-recent-20"
   sheets_gid: "metadata-resolved-fail-closed"
   secrets: "do-not-include-google-or-discord-secrets"
 status: enabled

@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes Dashboard on VM
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/hermes-agent
+Environment=HERMES_HOME=%h/.hermes
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.hermes/logs/dashboard.log
+StandardError=append:%h/.hermes/logs/dashboard.log
+
+[Install]
+WantedBy=default.target
