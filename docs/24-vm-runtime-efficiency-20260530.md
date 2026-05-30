@@ -38,3 +38,14 @@
 - `codex-control-api.service`, `codex-discord-relay.service`, `hermes-dashboard.service`, `codex-control-api-healthcheck.timer`는 user scope다.
 - user scope 상태 확인은 `systemctl --user ...`를 사용한다.
 - idle 상태에서 작업큐 반응성이 떨어지지 않도록 task create/resume/manual tick은 즉시 tick을 유지한다.
+
+## 정상 서비스 추가 개선 - 2026-05-30
+
+정상 실행 중인 서비스는 직접 실행 경로를 바꾸지 않고, 감시와 복구의 폭을 넓히는 방향으로 개선했다.
+
+- `dashboard-healthcheck.sh`가 `/api/health`뿐 아니라 dashboard root, public summary, authenticated summary를 확인한다.
+- relay user service가 inactive이면 healthcheck가 같이 복구한다.
+- API 재시작 후 relay가 오래된 secret/env로 403을 내는 상황을 피하기 위해 API 복구 시 relay도 함께 재시작한다.
+- gateway unit 자체는 현재 cron/job scheduler와 Discord ingress를 함께 소유하므로 재시작 정책 변경은 보류하고 운영 기준으로만 기록한다.
+
+검증은 `dashboard-healthcheck.sh`, `dashboard-smoke.sh`, service active 상태, 최근 journal warning/error 확인으로 한다.

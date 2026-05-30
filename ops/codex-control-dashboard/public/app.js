@@ -24,6 +24,8 @@ const supervisorLog = document.querySelector('#supervisorLog');
 let board = 'codex-control';
 let timer = null;
 let csrfToken = '';
+const VISIBLE_POLL_MS = 5000;
+const HIDDEN_POLL_MS = 30000;
 
 function pct(value) {
   const n = Number(value || 0);
@@ -232,12 +234,23 @@ async function postSupervisor(path, body = {}) {
   await loadState();
 }
 
+function pollInterval() {
+  return document.hidden ? HIDDEN_POLL_MS : VISIBLE_POLL_MS;
+}
+
+function pollDashboard() {
+  loadState();
+  loadSupervisor();
+}
+
 function schedule() {
   clearInterval(timer);
-  timer = setInterval(() => {
-    loadState();
-    loadSupervisor();
-  }, 5000);
+  timer = setInterval(pollDashboard, pollInterval());
+}
+
+function refreshDashboard() {
+  pollDashboard();
+  schedule();
 }
 
 boardSelect.addEventListener('change', () => {
@@ -245,7 +258,15 @@ boardSelect.addEventListener('change', () => {
   loadState();
 });
 
-refreshButton.addEventListener('click', loadState);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    schedule();
+    return;
+  }
+  refreshDashboard();
+});
+
+refreshButton.addEventListener('click', refreshDashboard);
 
 startSupervisor.addEventListener('click', async () => {
   await postSupervisor('/api/supervisor/start', {

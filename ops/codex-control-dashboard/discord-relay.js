@@ -13,6 +13,8 @@ const CHANNEL_IDS = csvSet(process.env.DISCORD_CHANNEL_IDS || '');
 const USER_IDS = csvSet(process.env.DISCORD_ALLOWED_USER_IDS || '');
 const GATEWAY_QUEUE_CHANNEL_IDS = csvSet(process.env.DISCORD_GATEWAY_QUEUE_CHANNEL_IDS || '');
 const MAX_ATTACHMENT_BYTES = Number(process.env.DISCORD_MAX_ATTACHMENT_BYTES || 262144);
+const DISCORD_FETCH_TIMEOUT_MS = Math.max(1000, Number(process.env.DISCORD_FETCH_TIMEOUT_MS || 15000) || 15000);
+const STATE_FETCH_TIMEOUT_MS = Math.max(1000, Number(process.env.DISCORD_STATE_FETCH_TIMEOUT_MS || 10000) || 10000);
 const NOTIFY_ACTIVE_INTERVAL_MS = Math.max(1000, Number(process.env.DISCORD_NOTIFY_INTERVAL_MS || 10000) || 10000);
 const NOTIFY_IDLE_INTERVAL_MS = Math.max(NOTIFY_ACTIVE_INTERVAL_MS, Number(process.env.DISCORD_NOTIFY_IDLE_INTERVAL_MS || 60000) || 60000);
 const NOTIFY_ERROR_INTERVAL_MS = Math.max(5000, Number(process.env.DISCORD_NOTIFY_ERROR_INTERVAL_MS || 30000) || 30000);
@@ -142,15 +144,30 @@ function truncate(value, maxLength) {
   return `${text.slice(0, maxLength - 3)}...`;
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = DISCORD_FETCH_TIMEOUT_MS) {
+  const ms = Number(timeoutMs || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return fetch(url, options);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`fetch timed out after ${ms}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function discordFetch(path, options = {}) {
-  const response = await fetch(`${API}${path}`, {
+  const response = await fetchWithTimeout(`${API}${path}`, {
     ...options,
     headers: {
       authorization: `Bot ${TOKEN}`,
       'content-type': 'application/json',
       ...(options.headers || {}),
     },
-  });
+  }, DISCORD_FETCH_TIMEOUT_MS);
   if (!response.ok) {
     throw new Error(`Discord API ${path} failed: ${response.status}`);
   }
@@ -295,7 +312,7 @@ async function readAttachments(message) {
       chunks.push(`[Attachment skipped: ${attachment.filename} exceeds ${MAX_ATTACHMENT_BYTES} bytes]`);
       continue;
     }
-    const response = await fetch(attachment.url);
+    const response = await fetchWithTimeout(attachment.url, {}, DISCORD_FETCH_TIMEOUT_MS);
     if (!response.ok) {
       chunks.push(`[Attachment read failed: ${attachment.filename}]`);
       continue;
@@ -329,16 +346,16 @@ function splitInteractionContent(content) {
 }
 
 async function interactionCallback(interaction, payload) {
-  const response = await fetch(`${API}/interactions/${interaction.id}/${interaction.token}/callback`, {
+  const response = await fetchWithTimeout(`${API}/interactions/${interaction.id}/${interaction.token}/callback`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
-  });
+  }, DISCORD_FETCH_TIMEOUT_MS);
   if (!response.ok) throw new Error(`interaction callback failed: ${response.status}`);
 }
 
 async function interactionFollowup(interaction, content) {
-  const response = await fetch(`${API}/webhooks/${interaction.application_id}/${interaction.token}`, {
+  const response = await fetchWithTimeout(`${API}/webhooks/${interaction.application_id}/${interaction.token}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -424,7 +441,7 @@ async function createTaskFromInteraction(interaction) {
   }
 
   const user = interactionUser(interaction);
-  const response = await fetch(ENDPOINT, {
+  const response = await fetchWithTimeout(ENDPOINT, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -445,7 +462,7 @@ async function createTaskFromInteraction(interaction) {
       assignee: interactionOption(options, ['assignee', 'profile', '담당']),
       orchestrate: false,
     }),
-  });
+  }, STATE_FETCH_TIMEOUT_MS);
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`Task API failed: ${response.status} ${body}`);
@@ -506,7 +523,7 @@ async function handleInteraction(interaction) {
 async function createTask(message) {
   const attachmentText = await readAttachments(message);
   const parsed = parseTaskForQueue(message.content, attachmentText);
-  const response = await fetch(ENDPOINT, {
+  const response = await fetchWithTimeout(ENDPOINT, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -524,7 +541,7 @@ async function createTask(message) {
       board: 'codex-control',
       orchestrate: false,
     }),
-  });
+  }, STATE_FETCH_TIMEOUT_MS);
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`Task API failed: ${response.status} ${body}`);
@@ -560,7 +577,7 @@ async function resumeTask(message) {
     );
     return;
   }
-  const response = await fetch(RESUME_ENDPOINT, {
+  const response = await fetchWithTimeout(RESUME_ENDPOINT, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -576,7 +593,7 @@ async function resumeTask(message) {
       board: 'codex-control',
       unblock: true,
     }),
-  });
+  }, STATE_FETCH_TIMEOUT_MS);
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`Resume API failed: ${response.status} ${body}`);
@@ -815,9 +832,9 @@ async function pollTaskStatus() {
   if (notifyBusy) return { status: 'busy', changed: false };
   notifyBusy = true;
   try {
-    const response = await fetch(STATE_ENDPOINT, {
+    const response = await fetchWithTimeout(STATE_ENDPOINT, {
       headers: { authorization: `Bearer ${STATE_SECRET}` },
-    });
+    }, STATE_FETCH_TIMEOUT_MS);
     if (!response.ok) throw new Error(`state API failed: ${response.status}`);
     const state = await response.json();
     const tasksById = new Map((state.tasks || []).map((task) => [task.id, task]));
@@ -992,10 +1009,13 @@ module.exports = {
     terminalTaskTimestamp,
     isActiveState,
     statusPollDelayMs,
+    fetchWithTimeout,
     intervals: {
       active: NOTIFY_ACTIVE_INTERVAL_MS,
       idle: NOTIFY_IDLE_INTERVAL_MS,
       error: NOTIFY_ERROR_INTERVAL_MS,
+      discordFetchTimeout: DISCORD_FETCH_TIMEOUT_MS,
+      stateFetchTimeout: STATE_FETCH_TIMEOUT_MS,
     },
   },
 };

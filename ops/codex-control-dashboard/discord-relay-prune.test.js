@@ -8,6 +8,8 @@ process.env.DISCORD_RELAY_PRUNE_AFTER_MS = String(24 * 60 * 60 * 1000);
 process.env.DISCORD_NOTIFY_INTERVAL_MS = '10000';
 process.env.DISCORD_NOTIFY_IDLE_INTERVAL_MS = '60000';
 process.env.DISCORD_NOTIFY_ERROR_INTERVAL_MS = '30000';
+process.env.DISCORD_FETCH_TIMEOUT_MS = '15000';
+process.env.DISCORD_STATE_FETCH_TIMEOUT_MS = '10000';
 
 delete require.cache[require.resolve('./discord-relay')];
 const relay = require('./discord-relay');
@@ -67,6 +69,12 @@ function testSavePrunesBeforeAtomicWrite() {
   assert.ok(logs.some((line) => line.includes('maxAgeMs=10')));
 }
 
+function testFetchTimeoutExport() {
+  assert.equal(typeof relay.__test.fetchWithTimeout, 'function');
+  assert.equal(relay.__test.intervals.discordFetchTimeout, 15000);
+  assert.equal(relay.__test.intervals.stateFetchTimeout, 10000);
+}
+
 function testAdaptivePollingState() {
   assert.equal(typeof relay.__test.isActiveState, 'function');
   assert.equal(relay.__test.isActiveState({ summary: { running: 1 }, tasks: [] }, { tasks: {} }), true);
@@ -84,4 +92,5 @@ function testAdaptivePollingState() {
 testPrunesOnlyOldTerminalTasks();
 testSavePrunesBeforeAtomicWrite();
 testAdaptivePollingState();
+testFetchTimeoutExport();
 console.log('discord relay prune tests passed');
