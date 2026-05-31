@@ -143,7 +143,7 @@
 
 - **목적**: 운동 일정 자동화처럼 Calendar write가 포함될 수 있는 workflow를 명시적 확인 토큰 뒤에만 실행하도록 모델링합니다.
 - **입력**: `<YOUR_WORKOUT_SPREADSHEET_URL>`, `<YOUR_WORKOUT_SHEET_RANGE>`, `<YOUR_WORKOUT_CALENDAR_ID>`, `<YOUR_PENDING_WORKOUT_PLAN_SOURCE>` placeholder.
-- **주요 단계**: 고엔트로피 확인 토큰 생성, `/workout confirm <token>` 또는 `/workout deny <token>`만 승인 명령으로 인정, Google Sheets `gid` metadata 해석, 확인되지 않은 Calendar write 차단, deterministic event ID와 `hermes_marker`/`spec_hash` 기반 upsert.
+- **주요 단계**: 고엔트로피 확인 토큰 생성, `/workout confirm <token>` 또는 `/workout deny <token>`만 승인 명령으로 인정, Google Sheets `gid` metadata 해석, 확인되지 않은 Calendar write 차단, deterministic event ID와 `hermes_marker`/`spec_hash` 기반 upsert, `화목토`/`화/목/토` 같은 운동 요일 변경 자연어 해석, deterministic parser 실패 시 Hermes agent fallback.
 - **출력**: `<YOUR_WORKOUT_REVIEW_CHANNEL>` placeholder 대상으로 승인 대기 또는 결과 markdown 생성.
 - **안전 기준**: free-text 승인은 무시하고, token/gid/pending plan 상태가 없으면 fail-closed 처리하며, Google/Discord secret은 공개 예시에 포함하지 않습니다.
 
