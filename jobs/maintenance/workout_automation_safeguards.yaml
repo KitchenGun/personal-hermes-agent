@@ -35,7 +35,9 @@ steps:
   - "Keep the workout Discord channel in free_response_channels and no_thread_channels so direct workout commands are handled without mentions."
   - "Keep deterministic parser handling minimal: workout log, workout inbody, confirm/deny token commands, and optional read-only recent/today/undo/help helpers."
   - "Rewrite all other pending-draft thread natural language to the Hermes agent with sanitized draft context and no token/secret/raw-path exposure."
-  - "In the agent rewrite context, prohibit Calendar writes, Sheets writes, and free-text confirmation; ask questions when ambiguous and propose natural-language revisions when possible."
+  - "Before agent rewrite, read the latest workout log from Sheets in read-only mode and include recent 14-30 day records, latest date by body part, exercise/weight/reps/sets, this-week body-part balance, missing body parts, and over-repeated body parts."
+  - "If the read-only latest-record lookup fails, state that failure in the agent context and tell the agent to propose only from the current draft."
+  - "In the agent rewrite context, include original user text, pending draft summary, latest workout record summary, body-part balance analysis, and prohibit Calendar writes, Sheets writes, and free-text confirmation; ask questions when ambiguous and propose natural-language revisions when possible."
   - "Use deterministic Hermes event IDs plus hermes_marker and spec_hash for idempotent calendar upsert."
 output:
   destination: "<YOUR_WORKOUT_REVIEW_CHANNEL>"
@@ -55,6 +57,7 @@ safety:
   workout_log_block_format: "exercise-heading-plus-metric-lines"
   append_history: "last-append-compatible-recent-20"
   natural_language_revision: "agent-rewrite-with-sanitized-context"
+  latest_record_context: "read-only-before-agent-rewrite; failure-disclosed"
   sheets_gid: "metadata-resolved-fail-closed"
   secrets: "do-not-include-google-or-discord-secrets"
 status: enabled
