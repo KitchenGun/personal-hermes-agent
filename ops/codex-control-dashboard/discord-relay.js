@@ -215,13 +215,16 @@ function identify() {
 function shouldHandle(message) {
   if (!message || message.author?.bot) return false;
   if (isDiscordCommandGeneratedMessage(message)) return false;
-  if (GATEWAY_QUEUE_CHANNEL_IDS.has(message.channel_id)) return false;
   if (USER_IDS.size && !USER_IDS.has(message.author?.id)) return false;
+  const content = String(message.content || '');
+  const queuePrefixed = QUEUE_PREFIX_RE.test(content);
+  const attachmentOnly = !content.trim() && hasTextAttachment(message);
+  if (GATEWAY_QUEUE_CHANNEL_IDS.has(message.channel_id)) return queuePrefixed || attachmentOnly;
   if (CHANNEL_IDS.size && !CHANNEL_IDS.has(message.channel_id)) return false;
   if (QUEUE_ONLY) {
     if (mentionsBot(message)) return false;
-    if (QUEUE_PREFIX_RE.test(String(message.content || ''))) return true;
-    return !String(message.content || '').trim() && hasTextAttachment(message);
+    if (queuePrefixed) return true;
+    return attachmentOnly;
   }
   if (CHANNEL_IDS.size) return true;
   return mentionsBot(message);
@@ -902,7 +905,9 @@ function shouldSendQueueOnlyNotice(message) {
   if (isDiscordCommandGeneratedMessage(message)) return false;
   if (!GATEWAY_QUEUE_CHANNEL_IDS.has(message.channel_id)) return false;
   if (USER_IDS.size && !USER_IDS.has(message.author?.id)) return false;
-  if (!String(message.content || '').trim() && !hasTextAttachment(message)) return false;
+  const content = String(message.content || '');
+  if (QUEUE_PREFIX_RE.test(content) || (!content.trim() && hasTextAttachment(message))) return false;
+  if (!content.trim()) return false;
   const key = `${message.channel_id}:${message.author?.id || 'unknown'}`;
   const now = Date.now();
   const prior = queueNoticeAt.get(key) || 0;
@@ -914,7 +919,7 @@ function shouldSendQueueOnlyNotice(message) {
 async function sendQueueOnlyNotice(message) {
   await sendDiscordMessage(
     message.channel_id,
-    '이 채널은 `/queue` slash command만 사용합니다. 일반 메시지는 작업 큐에 등록되지 않습니다. `/queue`로 다시 등록해주세요.',
+    '이 채널은 작업큐 전용입니다. `/queue`가 Discord 캐시로 실패하면 `[queue] 제목\n상세내용` 형식으로 등록할 수 있습니다.',
     message.id,
   );
 }
@@ -1021,6 +1026,8 @@ module.exports = {
     isActiveState,
     statusPollDelayMs,
     fetchWithTimeout,
+    shouldHandle,
+    shouldSendQueueOnlyNotice,
     intervals: {
       active: NOTIFY_ACTIVE_INTERVAL_MS,
       idle: NOTIFY_IDLE_INTERVAL_MS,

@@ -24,3 +24,8 @@
 - `/api/discord/task` dry smoke로 `codex-control` 작업 생성 확인
 - `codex-discord-relay.service`와 `hermes-gateway.service` 재시작 후 active 확인
 - `DISCORD_RELAY_IGNORED_SLASH_COMMANDS=queue`로 relay가 `/queue` callback을 잡지 않는지 확인
+
+## 재발 방지 추가
+
+- Discord slash command ID가 재시작 때마다 흔들리지 않도록 `DISCORD_COMMAND_SYNC_POLICY=off`를 적용한다. 새 slash command를 추가할 때만 임시로 safe/bulk sync를 켠다.
+- `/queue`가 Discord client cache 때문에 일시적으로 `더는 사용할 수 없는 명령`을 내면 `[queue] 제목\n상세내용` 일반 메시지 fallback을 사용한다. relay는 이 prefix를 queue 전용 채널에서도 허용한다.

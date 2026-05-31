@@ -181,7 +181,14 @@ old = '''        @tree.command(name="queue", description="Queue a prompt for the
         async def slash_queue(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/queue {prompt}", "Queued for the next turn.")
 '''
-new = '''        @tree.command(name="queue", description="Create a Codex Control task in queue channels")
+new = '''        @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
+        @discord.app_commands.describe(prompt="The prompt to queue")
+        async def slash_queue(interaction: discord.Interaction, prompt: str):
+            if await self._run_codex_control_queue_slash(interaction, prompt):
+                return
+            await self._run_simple_slash(interaction, f"/queue {prompt}", "Queued for the next turn.")
+'''
+legacy_patched = '''        @tree.command(name="queue", description="Create a Codex Control task in queue channels")
         @discord.app_commands.describe(prompt="Task prompt to enqueue")
         async def slash_queue(interaction: discord.Interaction, prompt: str):
             if await self._run_codex_control_queue_slash(interaction, prompt):
@@ -190,6 +197,8 @@ new = '''        @tree.command(name="queue", description="Create a Codex Control
 '''
 if old in text:
     text = text.replace(old, new, 1)
+elif legacy_patched in text:
+    text = text.replace(legacy_patched, new, 1)
 elif new not in text:
     raise SystemExit('slash_queue block not found')
 TARGET.write_text(text)
