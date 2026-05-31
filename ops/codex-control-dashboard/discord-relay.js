@@ -28,6 +28,8 @@ const QUEUE_PREFIX_RE = /^\s*(?:\[queue\]|\[codex\]|queue:|codex:|task:|codex-ta
 const RESUME_PREFIX_RE = /^\s*(?:\[resume\]|resume:|unblock:)\s*/i;
 const SLASH_COMMAND_NAMES = new Set(['queue', 'codex', 'task']);
 const TEST_MODE = process.env.DISCORD_RELAY_TEST_MODE === '1';
+const HANDLE_INTERACTIONS = process.env.DISCORD_RELAY_HANDLE_INTERACTIONS !== '0';
+const RELAY_IGNORED_SLASH_COMMANDS = csvSet(process.env.DISCORD_RELAY_IGNORED_SLASH_COMMANDS || 'queue');
 
 let socket = null;
 let heartbeat = null;
@@ -924,6 +926,15 @@ async function handleMessage(event) {
     return;
   }
   if (event.t === 'INTERACTION_CREATE') {
+    const commandName = interactionCommandName(event.d);
+    if (RELAY_IGNORED_SLASH_COMMANDS.has(commandName)) {
+      log('ignored slash interaction', `command=${commandName || '-'} channel=${event.d?.channel_id || '-'}`);
+      return;
+    }
+    if (!HANDLE_INTERACTIONS) {
+      log('ignored interaction event', `command=${commandName || '-'} channel=${event.d?.channel_id || '-'}`);
+      return;
+    }
     try {
       await handleInteraction(event.d);
     } catch (error) {
@@ -1017,5 +1028,7 @@ module.exports = {
       discordFetchTimeout: DISCORD_FETCH_TIMEOUT_MS,
       stateFetchTimeout: STATE_FETCH_TIMEOUT_MS,
     },
+    handleInteractions: HANDLE_INTERACTIONS,
+    ignoredSlashCommands: [...RELAY_IGNORED_SLASH_COMMANDS].sort(),
   },
 };
