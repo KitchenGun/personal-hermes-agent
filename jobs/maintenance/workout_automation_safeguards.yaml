@@ -6,6 +6,8 @@ trigger:
   commands:
     - "/workout confirm <token>"
     - "/workout deny <token>"
+    - "workout confirm (pending thread only)"
+    - "workout deny (pending thread only)"
     - "확정"
     - "캘린더도 수정해라"
     - "토요일 에어소프트가 아닌 운동 루틴으로 교체"
@@ -22,7 +24,8 @@ input:
 steps:
   - "Generate a pending workout plan with a high-entropy confirmation token."
   - "Ignore free-text approval such as ordinary yes/confirm messages."
-  - "Accept only deterministic token commands: /workout confirm <token> or /workout deny <token>."
+  - "Accept deterministic token commands: /workout confirm <token> or /workout deny <token>."
+  - "Accept exact tokenless workout confirm/deny only inside the matching pending draft thread, resolving the token from that thread state."
   - "Resolve Google Sheets gid through sheet metadata to a quoted A1 range."
   - "Fail closed when gid, sheet metadata, token, or pending plan state is missing."
   - "Refuse Google Calendar writes unless the pending plan is explicitly confirmed."
@@ -34,7 +37,8 @@ steps:
   - "Keep last_append for compatibility and maintain append_history for the latest manual workout sheet writes."
   - "Keep the workout Discord channel in free_response_channels and no_thread_channels so direct workout commands are handled without mentions."
   - "Keep deterministic parser handling minimal: workout log, workout inbody, confirm/deny token commands, and optional read-only recent/today/undo/help helpers."
-  - "Rewrite all other pending-draft thread natural language to the Hermes agent with sanitized draft context and no token/secret/raw-path exposure."
+  - "Apply supported deterministic pending-draft revisions, such as replacing Saturday airsoft with lower/core plus cardio, to the draft state before confirmation."
+  - "Rewrite unsupported pending-draft thread natural language to the Hermes agent with sanitized draft context and no token/secret/raw-path exposure."
   - "Before agent rewrite, read the latest workout log from Sheets in read-only mode and include recent 14-30 day records, latest date by body part, exercise/weight/reps/sets, this-week body-part balance, missing body parts, and over-repeated body parts."
   - "If the read-only latest-record lookup fails, state that failure in the agent context and tell the agent to propose only from the current draft."
   - "In the agent rewrite context, include original user text, pending draft summary, latest workout record summary, body-part balance analysis, and prohibit Calendar writes, Sheets writes, and free-text confirmation; ask questions when ambiguous and propose natural-language revisions when possible."
@@ -48,7 +52,7 @@ tools:
   - notification_send
 model: "${HERMES_REASONING_MODEL}"
 safety:
-  confirmation: "token-command-required"
+  confirmation: "token-command-or-thread-local-exact-command-required"
   token_entropy: "128-bit-minimum"
   calendar_write: "confirmed-plan-only"
   idempotency: "deterministic-event-id-and-spec-hash"
@@ -56,7 +60,7 @@ safety:
   inbody_image: "vision-ocr-before-sheets-append"
   workout_log_block_format: "exercise-heading-plus-metric-lines"
   append_history: "last-append-compatible-recent-20"
-  natural_language_revision: "agent-rewrite-with-sanitized-context"
+  natural_language_revision: "deterministic-state-update-when-supported-otherwise-agent-rewrite"
   latest_record_context: "read-only-before-agent-rewrite; failure-disclosed"
   unit_suffix_normalization: "prevent duplicated 회/세트 suffixes in workout summaries"
   sheets_gid: "metadata-resolved-fail-closed"
