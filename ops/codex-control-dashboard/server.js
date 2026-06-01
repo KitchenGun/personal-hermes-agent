@@ -1961,6 +1961,33 @@ function healthGateProbeDecision(state) {
   return { allowed: true, reason: `half-open probe after ${SUPERVISOR_HEALTH_GATE_PROBE_INTERVAL_SECONDS}s backoff` };
 }
 
+function shouldRunDispatchMaintenance(state) {
+  // `hermes kanban dispatch --max 0` performs reclaim/crash checks without spawning.
+  return Number(state?.summary?.running || 0) > 0;
+}
+
+async function runSupervisorDispatch(reason, dispatchSlots, failureLimit, descriptor) {
+  const output = await runHermes([
+    'kanban',
+    '--board',
+    supervisor.board,
+    'dispatch',
+    '--max',
+    String(dispatchSlots),
+    '--failure-limit',
+    String(failureLimit),
+    '--json',
+  ]);
+  const dispatch = JSON.parse(output);
+  supervisor.lastDispatch = dispatch;
+  supervisor.lastError = null;
+  const spawned = (dispatch.spawned || []).map((task) => task.task_id).join(', ') || 'none';
+  pushSupervisorLog('info', `dispatch ${reason}: ${descriptor || `slots=${dispatchSlots}`}, spawned=${spawned}`, dispatch);
+  invalidateSummaryCache(supervisor.board);
+  resetSupervisorBackoff();
+  return dispatch;
+}
+
 function scheduleSupervisor() {
   clearTimeout(supervisor.timer);
   supervisor.timer = null;
@@ -2004,10 +2031,13 @@ async function supervisorTick(reason = 'manual') {
 
       let availableSlots = Math.max(0, supervisor.concurrency - state.summary.running);
       let failureLimit = supervisor.failureLimit;
+      let maintenanceDispatch = shouldRunDispatchMaintenance(state);
       if (gateActive) {
         const probe = healthGateProbeDecision(state);
         if (!probe.allowed) {
-          if (!/^probe backoff /.test(probe.reason)) {
+          if (maintenanceDispatch) {
+            await runSupervisorDispatch(reason, 0, failureLimit, `maintenance=running-check, gate=${probe.reason}`);
+          } else if (!/^probe backoff /.test(probe.reason)) {
             pushSupervisorLog('debug', `health gate pause: ${probe.reason}`);
           }
           return supervisorSnapshot();
@@ -2020,25 +2050,14 @@ async function supervisorTick(reason = 'manual') {
 
       const dispatchableReady = dispatchableReadyCount(state);
       const dispatchSlots = Math.min(availableSlots, dispatchableReady);
-      if (dispatchSlots > 0) {
-        const output = await runHermes([
-          'kanban',
-          '--board',
-          supervisor.board,
-          'dispatch',
-          '--max',
-          String(dispatchSlots),
-          '--failure-limit',
-          String(failureLimit),
-          '--json',
-        ]);
-        const dispatch = JSON.parse(output);
-        supervisor.lastDispatch = dispatch;
-        supervisor.lastError = null;
-        const spawned = (dispatch.spawned || []).map((task) => task.task_id).join(', ') || 'none';
-        pushSupervisorLog('info', `dispatch ${reason}: slots=${dispatchSlots}, spawned=${spawned}`, dispatch);
-        invalidateSummaryCache(supervisor.board);
-        resetSupervisorBackoff();
+      maintenanceDispatch = maintenanceDispatch && dispatchSlots === 0;
+      if (dispatchSlots > 0 || maintenanceDispatch) {
+        await runSupervisorDispatch(
+          reason,
+          dispatchSlots,
+          failureLimit,
+          dispatchSlots > 0 ? `slots=${dispatchSlots}` : 'maintenance=running-check',
+        );
       } else {
         pushSupervisorLog('debug', `tick ${reason}: running=${state.summary.running}, ready=${state.summary.ready}, dispatchable_ready=${dispatchableReady}`);
       }
@@ -2354,6 +2373,7 @@ module.exports = {
     restoreLoadBoardState: () => { loadBoardStateForTest = null; },
     resetSupervisorBackoff,
     updateSupervisorBackoff,
+    shouldRunDispatchMaintenance,
     idempotencyKey,
     duplicateReport,
     fingerprintComponents,

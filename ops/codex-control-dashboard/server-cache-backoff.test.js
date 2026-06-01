@@ -72,9 +72,24 @@ function testSupervisorIdleBackoffAndReset() {
   assert.equal(supervisor.idleBackoffStreak, 0);
 }
 
+function testSupervisorDispatchMaintenanceForRunningTasks() {
+  assert.equal(typeof dashboard.__test.shouldRunDispatchMaintenance, 'function');
+  assert.equal(
+    dashboard.__test.shouldRunDispatchMaintenance(state('codex-control', 1, { running: 1 })),
+    true,
+    'running tasks need dispatch maintenance even when no ready task exists',
+  );
+  assert.equal(
+    dashboard.__test.shouldRunDispatchMaintenance(state('codex-control', 0)),
+    false,
+    'idle boards should not run maintenance dispatch',
+  );
+}
+
 (async () => {
   await testSummaryCacheUsesTtlAndInvalidates();
   testSupervisorIdleBackoffAndReset();
+  testSupervisorDispatchMaintenanceForRunningTasks();
   dashboard.__test.restoreLoadBoardState();
   console.log('server cache/backoff tests passed');
 })().catch((error) => {

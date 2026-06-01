@@ -58,6 +58,7 @@ safety:
   append_history: "last-append-compatible-recent-20"
   natural_language_revision: "agent-rewrite-with-sanitized-context"
   latest_record_context: "read-only-before-agent-rewrite; failure-disclosed"
+  unit_suffix_normalization: "prevent duplicated 회/세트 suffixes in workout summaries"
   sheets_gid: "metadata-resolved-fail-closed"
   secrets: "do-not-include-google-or-discord-secrets"
 status: enabled
