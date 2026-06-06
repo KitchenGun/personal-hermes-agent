@@ -25,9 +25,9 @@ def main():
     where = "" if include_archived else "where status != 'archived'"
     rows = con.execute(
         f"""
-        select id, title, body, assignee, status, priority, tenant,
+        select id, title, substr(coalesce(body, ''), 1, 4000) as body, assignee, status, priority, tenant,
                workspace_kind, workspace_path, created_by, created_at,
-               started_at, completed_at, result, skills, max_retries
+               started_at, completed_at, substr(coalesce(result, ''), 1, 2000) as result, skills, max_retries
         from tasks
         {where}
         order by priority desc, created_at asc

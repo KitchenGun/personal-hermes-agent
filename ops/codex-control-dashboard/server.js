@@ -40,6 +40,7 @@ const SUMMARY_CACHE_SWR_MS = Math.max(SUMMARY_CACHE_TTL_MS, Math.min(60_000, Num
 const SUPERVISOR_IDLE_BACKOFF_MAX_MS = Math.max(15_000, Math.min(300_000, Number(process.env.SUPERVISOR_IDLE_BACKOFF_MAX_MS || 300_000) || 300_000));
 const SUPERVISOR_IDLE_BACKOFF_INITIAL_MS = Math.max(15_000, Math.min(SUPERVISOR_IDLE_BACKOFF_MAX_MS, Number(process.env.SUPERVISOR_IDLE_BACKOFF_INITIAL_MS || 60_000) || 60_000));
 const SYSTEMIC_WORKER_FAILURE_RE = /pid\s+\d+\s+not alive|'NoneType' object is not iterable|Non-streaming API call timed out|Non-retryable client error/i;
+const EXEC_MAX_BUFFER_BYTES = Math.max(1024 * 1024, Math.min(64 * 1024 * 1024, Number(process.env.CODEX_CONTROL_EXEC_MAX_BUFFER_BYTES || 16 * 1024 * 1024) || 16 * 1024 * 1024));
 const CONTROL_SHARED_SECRET = process.env.CONTROL_SHARED_SECRET || '';
 const CONTROL_CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY || '';
@@ -376,7 +377,7 @@ function hermesCommand(args) {
 function runHermes(args) {
   return new Promise((resolve, reject) => {
     const command = hermesCommand(args);
-    execFile(command.file, command.args, { timeout: 120000 }, (error, stdout, stderr) => {
+    execFile(command.file, command.args, { timeout: 120000, maxBuffer: EXEC_MAX_BUFFER_BYTES }, (error, stdout, stderr) => {
       if (error) {
         const message = (stderr || stdout || error.message || '').trim();
         reject(new Error(message || `hermes exited with ${error.code ?? 'error'}`));
@@ -390,7 +391,7 @@ function runHermes(args) {
 function runHermesLong(args, timeout = 120000) {
   return new Promise((resolve, reject) => {
     const command = hermesCommand(args);
-    execFile(command.file, command.args, { timeout }, (error, stdout, stderr) => {
+    execFile(command.file, command.args, { timeout, maxBuffer: EXEC_MAX_BUFFER_BYTES }, (error, stdout, stderr) => {
       if (error) {
         const message = (stderr || stdout || error.message || '').trim();
         reject(new Error(message || `hermes exited with ${error.code ?? 'error'}`));
@@ -403,7 +404,7 @@ function runHermesLong(args, timeout = 120000) {
 
 function readDashboardSqlite(scriptName, args, timeout = 10000) {
   return new Promise((resolve, reject) => {
-    execFile('python3', [path.join(ROOT, scriptName), ...args], { timeout }, (error, stdout, stderr) => {
+    execFile('python3', [path.join(ROOT, scriptName), ...args], { timeout, maxBuffer: EXEC_MAX_BUFFER_BYTES }, (error, stdout, stderr) => {
       if (error) {
         const message = (stderr || stdout || error.message || '').trim();
         reject(new Error(message || `${scriptName} failed`));
