@@ -3,6 +3,7 @@ const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
+const kisReportDelivery = require('./kis-report-delivery-adapter');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
 const PORT = Number(process.env.PORT || 17640);
@@ -2280,6 +2281,34 @@ async function apiDiscord(req, res) {
   errJson(res, 404, 'not found');
 }
 
+async function apiKisReport(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method !== 'POST') {
+    errJson(res, 405, 'method not allowed');
+    return;
+  }
+  if (url.pathname !== '/api/kis/report/dry-run' && url.pathname !== '/api/kis/report/send-once') {
+    errJson(res, 404, 'not found');
+    return;
+  }
+  try {
+    assertControlAuth(req);
+  } catch (controlError) {
+    assertSharedSecret(req);
+  }
+
+  const body = await readJson(req);
+  const result = url.pathname === '/api/kis/report/dry-run'
+    ? kisReportDelivery.runKisReportDeliveryDryRun(body)
+    : await kisReportDelivery.runKisReportDeliverySendOnce(body);
+  okJson(res, {
+    ok: result.status === 'success' || result.status === 'hold',
+    ...result,
+    message_preview: undefined,
+    payload_text: undefined,
+  });
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -2331,6 +2360,10 @@ const server = http.createServer(async (req, res) => {
       await apiTasks(req, res);
       return;
     }
+    if (req.url.startsWith('/api/kis/report')) {
+      await apiKisReport(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/discord')) {
       await apiDiscord(req, res);
       return;
@@ -2379,5 +2412,6 @@ module.exports = {
     duplicateReport,
     fingerprintComponents,
     planFingerprintSpec,
+    kisReportDelivery,
   },
 };
