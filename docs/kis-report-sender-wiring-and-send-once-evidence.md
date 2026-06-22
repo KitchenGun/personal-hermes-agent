@@ -118,6 +118,47 @@ No second restart and no second send-once attempt were made because the approval
 - extra send-once call: false
 - note: the active process still requires a new approved restart/reload before it can load the patched runtime export.
 
+
+## Final Runtime Send Addendum
+
+- addendum date: 2026-06-22
+- reason: active service was restarted after verifying runtime `discord-relay.js` exports `sendDiscordRelayMessage`.
+- restart_or_reload_count_this_addendum: 1
+- gateway_health_after: `200`
+- dry_run_called: true
+- dry_run_http_status: 200
+- dry_run_passed: true
+- dry_run_payload_validated: true
+- dry_run_message_built: true
+- dry_run_discord_sent: false
+- dry_run_send_attempt_count: 0
+- send_once_called: true
+- send_once_http_status: 200
+- send_once_status: success
+- send_once_route_status: `adapter_discord_send_verified`
+- send_once_payload_validated: true
+- send_once_message_built: true
+- discord_sent: true
+- send_attempt_count: 1
+- direct_discord_retry: false
+- service_restart_reported_by_route: false
+- recommendation_output: false
+- secret_like_detected: false
+- row_value_detected: false
+- numeric_score_detected: false
+- error_class: none
+- target_channel_id: `1512691418605420634`
+
+Final boundary confirmation:
+
+- direct Discord client path: false
+- direct Discord retry: false
+- KIS API call: false
+- order/account/balance/condition-search/WebSocket call: false
+- DB write: false
+- cron or timer change: false
+- token, webhook, secret, raw response, row values, numeric score values, PnL values, or recommendation output printed: false
+
 ## Result
 
-Conclusion: `HERMES_KIS_REPORT_SEND_ONCE_FAIL_CLOSED`
+Conclusion: `HERMES_KIS_REPORT_SEND_ONCE_PASS`
