@@ -103,7 +103,7 @@ async function testFakeSendOnceCallsSenderExactlyOnce() {
   assert.equal(routedChannel, adapter.TARGET_CHANNEL_ID);
   assert.equal(summary.discord_sent, true);
   assert.equal(summary.send_attempt_count, 1);
-  assert.equal(summary.route_status, 'adapter_fake_send_verified');
+  assert.equal(summary.route_status, 'adapter_discord_send_verified');
 }
 
 async function testSendFailureDoesNotRetry() {

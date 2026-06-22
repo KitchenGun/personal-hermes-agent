@@ -28,6 +28,7 @@ const QUEUE_PREFIX_RE = /^\s*(?:\[queue\]|\[codex\]|queue:|codex:|task:|codex-ta
 const RESUME_PREFIX_RE = /^\s*(?:\[resume\]|resume:|unblock:)\s*/i;
 const SLASH_COMMAND_NAMES = new Set(['queue', 'codex', 'task']);
 const TEST_MODE = process.env.DISCORD_RELAY_TEST_MODE === '1';
+const IS_MAIN = require.main === module;
 const HANDLE_INTERACTIONS = process.env.DISCORD_RELAY_HANDLE_INTERACTIONS !== '0';
 const RELAY_IGNORED_SLASH_COMMANDS = csvSet(process.env.DISCORD_RELAY_IGNORED_SLASH_COMMANDS || 'queue');
 
@@ -40,17 +41,17 @@ let botUserId = '';
 let relayState = loadRelayState();
 const queueNoticeAt = new Map();
 
-if (!TEST_MODE && !TOKEN) {
+if (IS_MAIN && !TEST_MODE && !TOKEN) {
   console.error('DISCORD_BOT_TOKEN is required.');
   process.exit(1);
 }
 
-if (!TEST_MODE && !SECRET) {
+if (IS_MAIN && !TEST_MODE && !SECRET) {
   console.error('DISCORD_SHARED_SECRET is required.');
   process.exit(1);
 }
 
-if (!TEST_MODE && !STATE_SECRET) {
+if (IS_MAIN && !TEST_MODE && !STATE_SECRET) {
   console.error('CONTROL_SHARED_SECRET or DISCORD_SHARED_SECRET is required for status polling.');
   process.exit(1);
 }
@@ -192,6 +193,18 @@ async function sendDiscordMessage(channelId, content, referenceMessageId = '') {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+async function sendDiscordRelayMessage(message = {}) {
+  const targetChannelId = String(message.targetChannelId || '').trim();
+  if (!targetChannelId) throw new Error('target channel id is required');
+  if (!TOKEN) throw new Error('DISCORD_BOT_TOKEN is required');
+  await sendDiscordMessage(targetChannelId, message.content);
+  return {
+    discord_sent: true,
+    target_channel_id: targetChannelId,
+    delivery_layer: message.deliveryLayer || 'discord_relay',
+  };
 }
 
 function send(op, d = null) {
@@ -1007,7 +1020,7 @@ async function connect() {
   });
 }
 
-if (!TEST_MODE) {
+if (IS_MAIN && !TEST_MODE) {
   saveRelayStateToFile(relayState, STATE_FILE, { writeWhenUnchanged: false });
 
   connect().catch((error) => {
@@ -1019,6 +1032,7 @@ if (!TEST_MODE) {
 }
 
 module.exports = {
+  sendDiscordRelayMessage,
   __test: {
     pruneRelayState,
     saveRelayStateToFile,

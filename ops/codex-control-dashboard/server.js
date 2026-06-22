@@ -4,6 +4,7 @@ const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
+const discordRelay = require('./discord-relay');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
 const PORT = Number(process.env.PORT || 17640);
@@ -2281,6 +2282,21 @@ async function apiDiscord(req, res) {
   errJson(res, 404, 'not found');
 }
 
+async function sendKisReportViaDiscordRelay(message) {
+  const targetChannelId = String(message?.targetChannelId || '').trim();
+  if (targetChannelId !== kisReportDelivery.TARGET_CHANNEL_ID) {
+    return { discord_sent: false, error_class: 'invalid_target_channel' };
+  }
+  if (!discordRelay || typeof discordRelay.sendDiscordRelayMessage !== 'function') {
+    return { discord_sent: false, error_class: 'sender_missing' };
+  }
+  return discordRelay.sendDiscordRelayMessage({
+    targetChannelId,
+    content: message.content,
+    deliveryLayer: message.deliveryLayer,
+  });
+}
+
 async function apiKisReport(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method !== 'POST') {
@@ -2300,7 +2316,9 @@ async function apiKisReport(req, res) {
   const body = await readJson(req);
   const result = url.pathname === '/api/kis/report/dry-run'
     ? kisReportDelivery.runKisReportDeliveryDryRun(body)
-    : await kisReportDelivery.runKisReportDeliverySendOnce(body);
+    : await kisReportDelivery.runKisReportDeliverySendOnce(body, {
+      sender: sendKisReportViaDiscordRelay,
+    });
   okJson(res, {
     ok: result.status === 'success' || result.status === 'hold',
     ...result,

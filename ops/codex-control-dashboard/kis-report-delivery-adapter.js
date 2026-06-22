@@ -277,16 +277,17 @@ async function runKisReportDeliverySendOnce(payload, options = {}) {
     });
     summary.discord_sent = Boolean(result && result.discord_sent);
     summary.status = summary.discord_sent ? 'success' : 'fail';
-    summary.error_class = summary.discord_sent ? 'none' : 'fake_sender_failed';
-    summary.route_status = summary.discord_sent ? 'adapter_fake_send_verified' : 'adapter_fake_send_failed';
+    const senderErrorClass = result?.error_class || 'discord_send_failed';
+    summary.error_class = summary.discord_sent ? 'none' : senderErrorClass;
+    summary.route_status = summary.discord_sent ? 'adapter_discord_send_verified' : 'adapter_discord_send_failed';
     summary.actual_send_pending_approval = !summary.discord_sent;
     summary.incident = incidentSummary(summary.error_class);
     return summary;
   } catch (error) {
     summary.discord_sent = false;
     summary.status = 'fail';
-    summary.error_class = 'fake_sender_failed';
-    summary.route_status = 'adapter_fake_send_failed';
+    summary.error_class = 'discord_send_failed';
+    summary.route_status = 'adapter_discord_send_failed';
     summary.actual_send_pending_approval = true;
     summary.incident = incidentSummary(summary.error_class);
     return summary;
