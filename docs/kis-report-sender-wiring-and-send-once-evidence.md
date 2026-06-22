@@ -107,8 +107,17 @@ No second restart and no second send-once attempt were made because the approval
 - KIS repo tests: `569 passed`
 - Hermes repo broad test command: `npm` unavailable, Python pytest found no tests
 
+## Runtime Export Addendum
+
+- addendum date: 2026-06-22
+- runtime file patched after fail-closed result: `/home/ubuntu/.hermes/codex-control-dashboard/discord-relay.js`
+- runtime backup: `/home/ubuntu/.hermes/backups/kis-report-runtime-relay-export-20260622T075410Z`
+- exported sender check: `exported_sender=true`
+- extra service restart: false
+- extra dry-run call: false
+- extra send-once call: false
+- note: the active process still requires a new approved restart/reload before it can load the patched runtime export.
+
 ## Result
 
 Conclusion: `HERMES_KIS_REPORT_SEND_ONCE_FAIL_CLOSED`
-
-Required next action: submit a follow-up approval that allows one additional runtime restart and one additional send-once attempt after verifying the active runtime `discord-relay.js` exports `sendDiscordRelayMessage`.
