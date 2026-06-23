@@ -4,6 +4,7 @@ const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
+const kisPredictionValidationTask = require('./kis-prediction-validation-task');
 const discordRelay = require('./discord-relay');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
@@ -59,6 +60,7 @@ const DISCORD_ALLOWED_USER_IDS = new Set(
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
+const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask();
 
 if (!CONTROL_SHARED_SECRET) {
   console.error('CONTROL_SHARED_SECRET is required for dashboard control endpoints.');
@@ -2327,6 +2329,29 @@ async function apiKisReport(req, res) {
   });
 }
 
+
+async function apiKisPredictionValidation(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-validation/status') {
+    okJson(res, { ok: true, ...kisPredictionTaskRuntime.status() });
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-validation/run-once') {
+    try {
+      assertControlAuth(req);
+    } catch (controlError) {
+      assertSharedSecret(req);
+    }
+    const result = await kisPredictionTaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
+    okJson(res, {
+      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
+      ...result,
+    });
+    return;
+  }
+  errJson(res, 404, 'not found');
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -2378,6 +2403,10 @@ const server = http.createServer(async (req, res) => {
       await apiTasks(req, res);
       return;
     }
+    if (req.url.startsWith('/api/kis/prediction-validation')) {
+      await apiKisPredictionValidation(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/kis/report')) {
       await apiKisReport(req, res);
       return;
@@ -2411,6 +2440,11 @@ if (require.main === module) {
         console.error(`supervisor auto-start failed: ${error.message || String(error)}`);
       }
     }
+      try {
+        kisPredictionTaskRuntime.start();
+      } catch (error) {
+        console.error(`kis prediction validation scheduler start failed: ${error.message || String(error)}`);
+      }
   });
 }
 
@@ -2431,5 +2465,7 @@ module.exports = {
     fingerprintComponents,
     planFingerprintSpec,
     kisReportDelivery,
+    kisPredictionValidationTask,
+    kisPredictionTaskRuntime,
   },
 };
