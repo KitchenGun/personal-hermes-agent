@@ -122,6 +122,119 @@ async function testNoRetryOnError() {
   assert.equal(state.last_run.error_class, 'timeout');
 }
 
+async function testProgressMessageOnDistinctDayIncrease() {
+  const sent = [];
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ distinct_trading_days: 3 }), '');
+  }, {
+    progressSender: async (message) => {
+      sent.push(message);
+      return { discord_sent: true };
+    },
+  });
+  task.activate();
+  const state = await task.runOnce({ invokedBy: 'test' });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].targetChannelId, taskModule.PROGRESS_TARGET_CHANNEL_ID);
+  assert.equal(sent[0].content, '[KIS \uc608\uce21 \uac80\uc99d]\n\uc9c4\ud589: 3/20 \uac70\ub798\uc77c\n\uc0c1\ud0dc: \ud45c\ubcf8 \uc218\uc9d1 \uc911');
+  assert.equal(state.progress_notifications.last_distinct_trading_days, 3);
+}
+
+async function testNoProgressMessageForSameDistinctDay() {
+  let calls = 0;
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ distinct_trading_days: 2 }), '');
+  }, {
+    progressSender: async () => {
+      calls += 1;
+      return { discord_sent: true };
+    },
+  });
+  task.activate();
+  await task.runOnce({ invokedBy: 'test' });
+  await task.runOnce({ invokedBy: 'test' });
+  assert.equal(calls, 1);
+}
+
+async function testPausedTransitionSendsStatusMessage() {
+  const sent = [];
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ status: 'paused', action_type: 'paused', fail_closed: true, error_class: 'market_calendar_unknown', distinct_trading_days: 2 }), '');
+  }, {
+    progressSender: async (message) => {
+      sent.push(message);
+      return { discord_sent: true };
+    },
+  });
+  task.activate();
+  const state = await task.runOnce({ invokedBy: 'test' });
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].content, /\uc0c1\ud0dc: \ubcf4\ud638 \uc911\ub2e8/);
+}
+
+async function testCompletedSendsMinimumReachedMessage() {
+  const sent = [];
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ distinct_trading_days: 20 }), '');
+  }, {
+    progressSender: async (message) => {
+      sent.push(message);
+      return { discord_sent: true };
+    },
+  });
+  task.activate();
+  const state = await task.runOnce({ invokedBy: 'test' });
+  assert.equal(state.state, 'COMPLETED');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].content, /\uc9c4\ud589: 20\/20 \uac70\ub798\uc77c/);
+  assert.match(sent[0].content, /\uc0c1\ud0dc: \ucd5c\uc18c \uac80\uc99d \uc644\ub8cc/);
+}
+
+async function testDuplicateProgressKeySkipsSend() {
+  let calls = 0;
+  const key = taskModule.progressIdempotencyKey({ distinctTradingDays: 2, taskState: 'ACTIVE' });
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ distinct_trading_days: 2 }), '');
+  }, {
+    progressSender: async () => {
+      calls += 1;
+      return { discord_sent: true };
+    },
+  });
+  const active = task.activate();
+  fs.writeFileSync(task.statePath, JSON.stringify({
+    ...active,
+    last_run: { distinct_trading_days: 2 },
+    progress_notifications: {
+      sent_keys: { [key]: '2026-06-23T00:00:00Z' },
+      last_distinct_trading_days: 2,
+      last_task_state: 'ACTIVE',
+    },
+  }));
+  const state = await task.notifyCurrentProgress({ invokedBy: 'test' });
+  assert.equal(calls, 0);
+  assert.equal(state.progress_notifications.last_delivery.duplicate_skipped, true);
+}
+
+async function testDiscordFailureDoesNotPauseTaskOrRetry() {
+  let calls = 0;
+  const task = makeTask((_command, _args, _options, callback) => {
+    callback(null, successOutput({ distinct_trading_days: 3 }), '');
+  }, {
+    progressSender: async () => {
+      calls += 1;
+      return { discord_sent: false, error_class: 'discord_send_failed' };
+    },
+  });
+  task.activate();
+  const state = await task.runOnce({ invokedBy: 'test' });
+  assert.equal(calls, 1);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.progress_notifications.last_delivery.discord_sent, false);
+  assert.equal(state.progress_notifications.last_delivery.send_attempt_count, 1);
+}
+
 function testScheduleAndDuplicateSchedulerGuard() {
   assert.equal(taskModule.nextRunAt(new Date('2026-06-23T06:00:00Z')), '2026-06-23T07:10:00.000Z');
   assert.equal(taskModule.nextRunAt(new Date('2026-06-23T07:20:00Z')), '2026-06-24T07:10:00.000Z');
@@ -140,6 +253,12 @@ function testScheduleAndDuplicateSchedulerGuard() {
   await testConcurrencyPreventsDuplicateRun();
   await testProdDbPathBlocksBeforeExec();
   await testNoRetryOnError();
+  await testProgressMessageOnDistinctDayIncrease();
+  await testNoProgressMessageForSameDistinctDay();
+  await testPausedTransitionSendsStatusMessage();
+  await testCompletedSendsMinimumReachedMessage();
+  await testDuplicateProgressKeySkipsSend();
+  await testDiscordFailureDoesNotPauseTaskOrRetry();
   testScheduleAndDuplicateSchedulerGuard();
   console.log('KIS prediction validation task tests passed');
 })().catch((error) => {

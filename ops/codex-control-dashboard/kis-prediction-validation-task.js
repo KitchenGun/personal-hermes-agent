@@ -15,6 +15,8 @@ const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const PROD_DB_PATH = '/var/lib/kis-trading-lab/kis-prod.sqlite3';
 const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
 const POLL_INTERVAL_MS = 60_000;
+const PROGRESS_TARGET_CHANNEL_ID = '1512691418605420634';
+const PROGRESS_DELIVERY_LAYER = 'discord_relay';
 const EXEC_TIMEOUT_MS = 10 * 60_000;
 const MAX_BUFFER_BYTES = 512 * 1024;
 
@@ -153,7 +155,7 @@ function nextRunAt(from = new Date()) {
 
 function defaultState(overrides = {}) {
   const createdAt = nowIso();
-  return {
+  const state = {
     canonical_task_id: TASK_ID,
     task_name: TASK_NAME,
     task_owner: TASK_OWNER,
@@ -171,8 +173,11 @@ function defaultState(overrides = {}) {
     created_at: createdAt,
     updated_at: createdAt,
     last_run: null,
+    progress_notifications: normalizeProgressNotifications(overrides.progress_notifications),
     ...overrides,
   };
+  state.progress_notifications = normalizeProgressNotifications(state.progress_notifications);
+  return state;
 }
 
 function readState(statePath) {
@@ -216,6 +221,120 @@ function activeSchedulerCount({ codexTaskState = 'PAUSED', hermesTaskState = 'DI
   };
 }
 
+function normalizeProgressNotifications(value = {}) {
+  const normalized = value && typeof value === 'object' ? value : {};
+  const sentKeys = normalized.sent_keys && typeof normalized.sent_keys === 'object' ? normalized.sent_keys : {};
+  return {
+    sent_keys: sentKeys,
+    last_distinct_trading_days: Number(normalized.last_distinct_trading_days || 0),
+    last_task_state: sanitizeText(normalized.last_task_state || '', 40),
+    last_delivery: normalized.last_delivery && typeof normalized.last_delivery === 'object' ? normalized.last_delivery : null,
+  };
+}
+
+function progressTaskState(state, distinctTradingDays) {
+  const taskState = String(state?.state || '').toUpperCase();
+  if (distinctTradingDays >= 20 || taskState === 'COMPLETED') return 'COMPLETED';
+  if (taskState === 'PAUSED') return 'PAUSED';
+  return 'ACTIVE';
+}
+
+function progressStatusLabel(taskState) {
+  if (taskState === 'COMPLETED') return '\ucd5c\uc18c \uac80\uc99d \uc644\ub8cc';
+  if (taskState === 'PAUSED') return '\ubcf4\ud638 \uc911\ub2e8';
+  return '\ud45c\ubcf8 \uc218\uc9d1 \uc911';
+}
+
+function buildProgressMessage({ distinctTradingDays, taskState }) {
+  const day = Math.max(0, Math.min(20, Number(distinctTradingDays || 0)));
+  return [
+    '[KIS \uc608\uce21 \uac80\uc99d]',
+    `\uc9c4\ud589: ${day}/20 \uac70\ub798\uc77c`,
+    `\uc0c1\ud0dc: ${progressStatusLabel(taskState)}`,
+  ].join('\n');
+}
+
+function progressIdempotencyKey({ taskId = TASK_ID, distinctTradingDays, taskState }) {
+  return `kis_prediction_progress:${taskId}:${Number(distinctTradingDays || 0)}:${String(taskState || 'ACTIVE').toUpperCase()}`;
+}
+
+function progressCandidate(previousState = {}, nextState = {}, options = {}) {
+  const progress = normalizeProgressNotifications(nextState.progress_notifications);
+  const lastRun = nextState.last_run || previousState.last_run || {};
+  const distinctTradingDays = Number(lastRun.distinct_trading_days || progress.last_distinct_trading_days || 0);
+  if (!Number.isFinite(distinctTradingDays) || distinctTradingDays <= 0) return null;
+
+  const taskState = progressTaskState(nextState, distinctTradingDays);
+  const key = progressIdempotencyKey({ distinctTradingDays, taskState });
+  if (progress.sent_keys[key]) {
+    return { duplicate: true, key, distinctTradingDays, taskState };
+  }
+
+  const previousDistinct = Number(previousState.last_run?.distinct_trading_days || progress.last_distinct_trading_days || 0);
+  const previousTaskState = progressTaskState(previousState, previousDistinct);
+  const dayIncreased = distinctTradingDays > Number(progress.last_distinct_trading_days || 0);
+  const stateTransition = previousTaskState !== taskState && ['PAUSED', 'COMPLETED'].includes(taskState);
+  if (!options.forceCurrent && !dayIncreased && !stateTransition) return null;
+
+  return {
+    key,
+    distinctTradingDays,
+    taskState,
+    content: buildProgressMessage({ distinctTradingDays, taskState }),
+  };
+}
+
+async function applyProgressNotification(previousState, nextState, options = {}) {
+  const candidate = progressCandidate(previousState, nextState, options);
+  if (!candidate) return nextState;
+
+  const progress = normalizeProgressNotifications(nextState.progress_notifications);
+  const delivery = {
+    key: candidate.key,
+    target_channel_id: PROGRESS_TARGET_CHANNEL_ID,
+    distinct_trading_days: candidate.distinctTradingDays,
+    task_state: candidate.taskState,
+    duplicate_skipped: Boolean(candidate.duplicate),
+    send_attempt_count: 0,
+    discord_sent: false,
+    error_class: candidate.duplicate ? 'duplicate_skipped' : 'not_attempted',
+    invoked_by: sanitizeText(options.invokedBy || '', 60),
+    attempted_at: nowIso(),
+  };
+
+  if (candidate.duplicate) {
+    return { ...nextState, progress_notifications: { ...progress, last_delivery: delivery } };
+  }
+
+  if (typeof options.progressSender !== 'function') {
+    delivery.error_class = 'sender_missing';
+    return { ...nextState, progress_notifications: { ...progress, last_delivery: delivery } };
+  }
+
+  delivery.send_attempt_count = 1;
+  try {
+    const result = await options.progressSender({
+      targetChannelId: PROGRESS_TARGET_CHANNEL_ID,
+      content: candidate.content,
+      deliveryLayer: PROGRESS_DELIVERY_LAYER,
+      idempotencyKey: candidate.key,
+    });
+    delivery.discord_sent = Boolean(result && result.discord_sent);
+    delivery.error_class = delivery.discord_sent ? 'none' : sanitizeText(result?.error_class || 'discord_send_failed', 80);
+  } catch {
+    delivery.discord_sent = false;
+    delivery.error_class = 'discord_send_failed';
+  }
+
+  if (delivery.discord_sent) {
+    progress.sent_keys[candidate.key] = delivery.attempted_at;
+    progress.last_distinct_trading_days = Math.max(Number(progress.last_distinct_trading_days || 0), candidate.distinctTradingDays);
+    progress.last_task_state = candidate.taskState;
+  }
+  progress.last_delivery = delivery;
+  return { ...nextState, progress_notifications: progress };
+}
+
 function createKisPredictionValidationTask(options = {}) {
   const statePath = options.statePath || process.env.KIS_PREDICTION_TASK_STATE_PATH || DEFAULT_STATE_PATH;
   const execFile = options.execFile || defaultExecFile;
@@ -227,8 +346,15 @@ function createKisPredictionValidationTask(options = {}) {
   let timer = null;
 
   function save(next) {
-    writeState(statePath, next);
-    return next;
+    const normalized = { ...next, progress_notifications: normalizeProgressNotifications(next.progress_notifications) };
+    writeState(statePath, normalized);
+    return normalized;
+  }
+
+  async function saveWithProgressNotification(previousState, nextState, opts = {}) {
+    const saved = save(nextState);
+    const notified = await applyProgressNotification(previousState, saved, { ...opts, progressSender: options.progressSender });
+    return notified === saved ? saved : save(notified);
   }
 
   function status() {
@@ -237,6 +363,11 @@ function createKisPredictionValidationTask(options = {}) {
 
   function prepareDisabled() {
     return save(defaultState({ state: 'DISABLED', next_run_at: null, last_run: null }));
+  }
+
+  function notifyCurrentProgress({ invokedBy = 'hermes_current_status' } = {}) {
+    const current = status();
+    return saveWithProgressNotification(current, current, { forceCurrent: true, invokedBy });
   }
 
   function activate() {
@@ -269,7 +400,7 @@ function createKisPredictionValidationTask(options = {}) {
       commandSpec = buildCommand(options);
     } catch (error) {
       const lastRun = { status: 'paused', action_type: 'paused', fail_closed: true, error_class: sanitizeText(error.message, 80), invoked_by: invokedBy, completed_at: nowIso() };
-      return Promise.resolve(save({ ...current, state: 'PAUSED', pause_reason: lastRun.error_class, last_run: lastRun, next_run_at: null }));
+      return saveWithProgressNotification(current, { ...current, state: 'PAUSED', pause_reason: lastRun.error_class, last_run: lastRun, next_run_at: null }, { invokedBy });
     }
 
     running = true;
@@ -286,7 +417,7 @@ function createKisPredictionValidationTask(options = {}) {
         if (error) {
           const errorClass = classifyError(error);
           const lastRun = { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: invokedBy, started_at: startedAt, completed_at: completedAt };
-          resolve(save({ ...status(), state: 'PAUSED', pause_reason: errorClass, last_run: lastRun, next_run_at: null }));
+          saveWithProgressNotification(current, { ...status(), state: 'PAUSED', pause_reason: errorClass, last_run: lastRun, next_run_at: null }, { invokedBy }).then(resolve);
           return;
         }
         const parsed = parseKisCliOutput(stdout);
@@ -300,7 +431,7 @@ function createKisPredictionValidationTask(options = {}) {
           next_run_at: mapped.state === 'ACTIVE' ? nextRunAt() : null,
           last_run: lastRun,
         };
-        resolve(save(next));
+        saveWithProgressNotification(current, next, { invokedBy }).then(resolve);
       });
     });
   }
@@ -334,7 +465,7 @@ function createKisPredictionValidationTask(options = {}) {
     return status();
   }
 
-  return { statePath, status, prepareDisabled, activate, pause, complete, runOnce, start, stop, buildCommand: () => buildCommand(options) };
+  return { statePath, status, prepareDisabled, activate, pause, complete, notifyCurrentProgress, runOnce, start, stop, buildCommand: () => buildCommand(options) };
 }
 
 let defaultTask = null;
@@ -352,6 +483,7 @@ async function cli(argv = process.argv.slice(2)) {
   else if (action === 'activate') result = task.activate();
   else if (action === 'pause') result = task.pause(argv[1] || 'operator_pause');
   else if (action === 'complete') result = task.complete(argv[1] || 'minimum_reached');
+  else if (action === 'notify-current') result = await task.notifyCurrentProgress({ invokedBy: 'hermes_cli' });
   else if (action === 'run-once') result = await task.runOnce({ invokedBy: 'hermes_cli', force: true });
   else if (action === 'command') result = task.buildCommand();
   else result = task.status();
@@ -379,6 +511,11 @@ module.exports = {
   parseKisCliOutput,
   mapSummaryToTaskState,
   nextRunAt,
+  PROGRESS_TARGET_CHANNEL_ID,
+  PROGRESS_DELIVERY_LAYER,
+  buildProgressMessage,
+  progressIdempotencyKey,
+  progressCandidate,
   buildCommand,
   activeSchedulerCount,
   createKisPredictionValidationTask,

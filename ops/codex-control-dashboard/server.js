@@ -60,7 +60,9 @@ const DISCORD_ALLOWED_USER_IDS = new Set(
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
-const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask();
+const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask({
+  progressSender: sendKisPredictionProgressViaDiscordRelay,
+});
 
 if (!CONTROL_SHARED_SECRET) {
   console.error('CONTROL_SHARED_SECRET is required for dashboard control endpoints.');
@@ -2299,6 +2301,21 @@ async function sendKisReportViaDiscordRelay(message) {
   });
 }
 
+async function sendKisPredictionProgressViaDiscordRelay(message) {
+  const targetChannelId = String(message?.targetChannelId || '').trim();
+  if (targetChannelId !== kisPredictionValidationTask.PROGRESS_TARGET_CHANNEL_ID) {
+    return { discord_sent: false, error_class: 'invalid_target_channel' };
+  }
+  if (!discordRelay || typeof discordRelay.sendDiscordRelayMessage !== 'function') {
+    return { discord_sent: false, error_class: 'sender_missing' };
+  }
+  return discordRelay.sendDiscordRelayMessage({
+    targetChannelId,
+    content: message.content,
+    deliveryLayer: message.deliveryLayer,
+  });
+}
+
 async function apiKisReport(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method !== 'POST') {
@@ -2442,6 +2459,9 @@ if (require.main === module) {
     }
       try {
         kisPredictionTaskRuntime.start();
+        kisPredictionTaskRuntime.notifyCurrentProgress({ invokedBy: 'hermes_startup' }).catch((error) => {
+          console.error(`kis prediction validation progress notification failed: ${error.message || String(error)}`);
+        });
       } catch (error) {
         console.error(`kis prediction validation scheduler start failed: ${error.message || String(error)}`);
       }
