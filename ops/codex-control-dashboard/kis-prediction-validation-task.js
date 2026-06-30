@@ -57,6 +57,8 @@ const SAFE_OUTPUT_KEYS = new Set([
   'neutral_predictions',
   'not_evaluable_predictions',
   'pending_predictions',
+  'paper_trade_count',
+  'live_trade_count',
   'sample_status',
   'automation_paused',
   'prod_db_touched',
@@ -72,7 +74,7 @@ const SAFE_OUTPUT_KEYS = new Set([
   'status',
 ]);
 const BOOLEAN_KEYS = new Set(['executed', 'idempotent_no_op', 'automation_paused', 'prod_db_touched', 'order_attempted', 'cron_changed', 'secret_exposed', 'raw_response_persisted', 'new_nonessential_features', 'fail_closed']);
-const NUMBER_KEYS = new Set(['max_distinct_trading_days', 'market_data_api_calls', 'market_rows_inserted', 'predictions_inserted', 'prediction_duplicates_skipped', 'outcomes_resolved', 'outcome_rows_inserted', 'outcome_duplicates_skipped', 'automation_run_inserted', 'distinct_trading_days', 'total_predictions', 'resolved_predictions', 'correct_predictions', 'incorrect_predictions', 'neutral_predictions', 'not_evaluable_predictions', 'pending_predictions']);
+const NUMBER_KEYS = new Set(['max_distinct_trading_days', 'market_data_api_calls', 'market_rows_inserted', 'predictions_inserted', 'prediction_duplicates_skipped', 'outcomes_resolved', 'outcome_rows_inserted', 'outcome_duplicates_skipped', 'automation_run_inserted', 'distinct_trading_days', 'total_predictions', 'resolved_predictions', 'correct_predictions', 'incorrect_predictions', 'neutral_predictions', 'not_evaluable_predictions', 'pending_predictions', 'paper_trade_count', 'live_trade_count']);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret|[A-Za-z0-9+/]{64,}={0,2})/ig;
 
 function nowIso(now = new Date()) {
@@ -245,12 +247,49 @@ function progressStatusLabel(taskState) {
   return '\ud45c\ubcf8 \uc218\uc9d1 \uc911';
 }
 
-function buildProgressMessage({ distinctTradingDays, taskState }) {
+function nonNegativeInteger(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.trunc(parsed);
+}
+
+function progressSummaryCounts(summary = {}) {
+  const totalPredictions = nonNegativeInteger(summary.total_predictions);
+  const resolvedPredictions = nonNegativeInteger(summary.resolved_predictions);
+  const correctPredictions = nonNegativeInteger(summary.correct_predictions);
+  const incorrectPredictions = nonNegativeInteger(summary.incorrect_predictions);
+  const neutralPredictions = nonNegativeInteger(summary.neutral_predictions);
+  const pendingPredictions = totalPredictions >= resolvedPredictions
+    ? totalPredictions - resolvedPredictions
+    : nonNegativeInteger(summary.pending_predictions);
+  return {
+    totalPredictions,
+    resolvedPredictions,
+    correctPredictions,
+    incorrectPredictions,
+    neutralPredictions,
+    pendingPredictions,
+    paperTradeCount: nonNegativeInteger(summary.paper_trade_count),
+  };
+}
+
+function progressTradeLabel(counts) {
+  if (counts.paperTradeCount > 0) return `\ubaa8\uc758 ${counts.paperTradeCount}\uac74 \u00b7 \uc2e4\uc804 \uac70\ub798 \uc5c6\uc74c`;
+  return '\uac70\ub798 \uc5c6\uc74c';
+}
+
+function buildProgressSummaryLine(summary = {}) {
+  const counts = progressSummaryCounts(summary);
+  return `\uc694\uc57d: \uc608\uce21 ${counts.totalPredictions}\uac74 \u00b7 \ub300\uc870 ${counts.resolvedPredictions}\uac74(\uc815\ub2f5 ${counts.correctPredictions}/\uc624\ub2f5 ${counts.incorrectPredictions}/\uc911\ub9bd ${counts.neutralPredictions}) \u00b7 \ub300\uae30 ${counts.pendingPredictions}\uac74 \u00b7 ${progressTradeLabel(counts)}`;
+}
+
+function buildProgressMessage({ distinctTradingDays, taskState, summary = {} }) {
   const day = Math.max(0, Math.min(20, Number(distinctTradingDays || 0)));
   return [
     '[KIS \uc608\uce21 \uac80\uc99d]',
     `\uc9c4\ud589: ${day}/20 \uac70\ub798\uc77c`,
     `\uc0c1\ud0dc: ${progressStatusLabel(taskState)}`,
+    buildProgressSummaryLine(summary),
   ].join('\n');
 }
 
@@ -280,7 +319,7 @@ function progressCandidate(previousState = {}, nextState = {}, options = {}) {
     key,
     distinctTradingDays,
     taskState,
-    content: buildProgressMessage({ distinctTradingDays, taskState }),
+    content: buildProgressMessage({ distinctTradingDays, taskState, summary: lastRun }),
   };
 }
 
@@ -514,6 +553,8 @@ module.exports = {
   PROGRESS_TARGET_CHANNEL_ID,
   PROGRESS_DELIVERY_LAYER,
   buildProgressMessage,
+  buildProgressSummaryLine,
+  progressSummaryCounts,
   progressIdempotencyKey,
   progressCandidate,
   buildCommand,

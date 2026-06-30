@@ -14,6 +14,7 @@ New validation day:
 [KIS 예측 검증]
 진행: {distinct_trading_days}/20 거래일
 상태: 표본 수집 중
+요약: 예측 {total_predictions}건 · 대조 {resolved_predictions}건(정답 {correct_predictions}/오답 {incorrect_predictions}/중립 {neutral_predictions}) · 대기 {pending_predictions}건 · 거래 없음
 ```
 
 Minimum reached:
@@ -22,6 +23,7 @@ Minimum reached:
 [KIS 예측 검증]
 진행: 20/20 거래일
 상태: 최소 검증 완료
+요약: 예측 {total_predictions}건 · 대조 {resolved_predictions}건(정답 {correct_predictions}/오답 {incorrect_predictions}/중립 {neutral_predictions}) · 대기 {pending_predictions}건 · 거래 없음
 ```
 
 Protective pause:
@@ -30,13 +32,25 @@ Protective pause:
 [KIS 예측 검증]
 진행: {distinct_trading_days}/20 거래일
 상태: 보호 중단
+요약: 예측 {total_predictions}건 · 대조 {resolved_predictions}건(정답 {correct_predictions}/오답 {incorrect_predictions}/중립 {neutral_predictions}) · 대기 {pending_predictions}건 · 거래 없음
 ```
 
-Messages do not include symbols, prices, scores, returns, prediction direction, commentary, recommendations, commits, or logs.
+Messages do not include symbols, prices, row values, scores, returns, PnL, prediction direction, commentary, recommendations, commits, or logs.
 
 ## Progress Source
 
 Progress is based only on `distinct_trading_days` from the sanitized KIS prediction validation CLI result.
+
+The summary line uses sanitized aggregate counts only:
+
+- `total_predictions`
+- `resolved_predictions`
+- `correct_predictions`
+- `incorrect_predictions`
+- `neutral_predictions`
+- `pending_predictions = total_predictions - resolved_predictions`
+
+If no paper/live trades exist, the trade phrase is `거래 없음`.
 
 The following do not count as validation progress:
 
@@ -74,3 +88,14 @@ Initial current-state message was sent once after runtime sync:
 ```
 
 Result: `discord_sent=true`, `send_attempt_count=1`, `error_class=none`.
+
+## Current 7/20 preview
+
+```text
+[KIS 예측 검증]
+진행: 7/20 거래일
+상태: 표본 수집 중
+요약: 예측 21건 · 대조 17건(정답 9/오답 5/중립 3) · 대기 4건 · 거래 없음
+```
+
+The preview is count-only. It does not include symbols, prices, row values, scores, PnL, raw responses, secrets, or recommendation text.

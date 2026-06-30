@@ -136,8 +136,27 @@ async function testProgressMessageOnDistinctDayIncrease() {
   const state = await task.runOnce({ invokedBy: 'test' });
   assert.equal(sent.length, 1);
   assert.equal(sent[0].targetChannelId, taskModule.PROGRESS_TARGET_CHANNEL_ID);
-  assert.equal(sent[0].content, '[KIS \uc608\uce21 \uac80\uc99d]\n\uc9c4\ud589: 3/20 \uac70\ub798\uc77c\n\uc0c1\ud0dc: \ud45c\ubcf8 \uc218\uc9d1 \uc911');
+  assert.equal(sent[0].content, '[KIS \uc608\uce21 \uac80\uc99d]\n\uc9c4\ud589: 3/20 \uac70\ub798\uc77c\n\uc0c1\ud0dc: \ud45c\ubcf8 \uc218\uc9d1 \uc911\n\uc694\uc57d: \uc608\uce21 3\uac74 \u00b7 \ub300\uc870 3\uac74(\uc815\ub2f5 2/\uc624\ub2f5 1/\uc911\ub9bd 0) \u00b7 \ub300\uae30 0\uac74 \u00b7 \uac70\ub798 \uc5c6\uc74c');
   assert.equal(state.progress_notifications.last_distinct_trading_days, 3);
+}
+
+function testProgressMessageSummaryLineForCurrentCounts() {
+  const message = taskModule.buildProgressMessage({
+    distinctTradingDays: 7,
+    taskState: 'ACTIVE',
+    summary: {
+      total_predictions: 21,
+      resolved_predictions: 17,
+      correct_predictions: 9,
+      incorrect_predictions: 5,
+      neutral_predictions: 3,
+      pending_predictions: 999,
+      paper_trade_count: 0,
+      live_trade_count: 0,
+    },
+  });
+  assert.equal(message, '[KIS \uc608\uce21 \uac80\uc99d]\n\uc9c4\ud589: 7/20 \uac70\ub798\uc77c\n\uc0c1\ud0dc: \ud45c\ubcf8 \uc218\uc9d1 \uc911\n\uc694\uc57d: \uc608\uce21 21\uac74 \u00b7 \ub300\uc870 17\uac74(\uc815\ub2f5 9/\uc624\ub2f5 5/\uc911\ub9bd 3) \u00b7 \ub300\uae30 4\uac74 \u00b7 \uac70\ub798 \uc5c6\uc74c');
+  assert.equal(/005930|000660|005380|\ub9e4\uc218|\ub9e4\ub3c4|recommend|PnL|score|price/i.test(message), false);
 }
 
 async function testNoProgressMessageForSameDistinctDay() {
@@ -254,6 +273,7 @@ function testScheduleAndDuplicateSchedulerGuard() {
   await testProdDbPathBlocksBeforeExec();
   await testNoRetryOnError();
   await testProgressMessageOnDistinctDayIncrease();
+  testProgressMessageSummaryLineForCurrentCounts();
   await testNoProgressMessageForSameDistinctDay();
   await testPausedTransitionSendsStatusMessage();
   await testCompletedSendsMinimumReachedMessage();
