@@ -1,79 +1,66 @@
-# KIS Prediction V2 Validation Preparation
+# KIS Prediction V2 Bounded Validation
 
-## Status
+## Runtime Contract
 
-- canonical_task_id: `kis-prediction-v2-validation`
+- canonical task ID: `kis-prediction-validation-cycle-v2`
 - owner: `hermes`
-- task_state: `DISABLED`
-- scheduler_registered: `false`
-- server_registered: `false`
-- live_execution_enabled: `false`
-- orders_enabled: `false`
-- retry: `false`
-- retry_on_failure: `false`
-- max_concurrent_runs: `1`
+- timezone: `Asia/Seoul`
+- schedule: weekdays at `16:10 KST`
+- state file: `/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json`
+- maximum distinct trading days: `20`
+- maximum concurrent runs: `1`
+- retry on failure: `false`
+- orders enabled: `false`
+- OS cron/systemd timers: unused
 
-## Bounded CLI Contract
+The legacy task `kis-prediction-validation-cycle` must remain `PAUSED`. Model v2 activation reads and validates that persisted legacy state while holding the shared cutover lock, and the server does not start the legacy scheduler loop. A legacy manual run is rejected while Model v2 is active or its persisted state is invalid.
 
-The wrapper records, but does not invoke, only this command:
+## Fixed KIS Command
 
 ```text
-python3 -m kis_trading_lab prediction-v2-validation-auto-once --approval APPROVE_KIS_MODEL_V2_BOUNDED_VALIDATION_START_V1
+python3 -m kis_trading_lab prediction-v2-validation-auto-once --approval APPROVE_KIS_MODEL_V2_BOUNDED_VALIDATION_START_V1 --db /var/lib/kis-trading-lab/kis-vps.sqlite3
 ```
 
 - cwd: `/home/ubuntu/.hermes/jobs/repos/kis-trading-lab`
-- canonical VPS mock DB path: `/var/lib/kis-trading-lab/kis-vps.sqlite3`
-- production DB path blocked: `/var/lib/kis-trading-lab/kis-prod.sqlite3`
+- canonical VPS mock DB only
+- production and alternate DB paths are rejected
+- stdout is reduced to the strict 45-key sanitized contract
+- child process timeout and output buffer are bounded
 
-No scheduler, server hook, runtime sync, state file, environment mutation, database access, or process execution is included in this preparation wrapper.
-Caller overrides cannot change the fixed cwd or the disabled, non-executing, non-registered, no-order, no-retry, single-run invariants.
+## State Mapping
 
-## Accepted Output and State Mapping
+- valid `ready`, `waiting`, and `market_closed_no_op` results keep the task `ACTIVE`
+- valid `completed` at 20 distinct decision days moves the task to `COMPLETED`
+- blocked output, malformed output, process failure, timeout, or any unsafe effect moves the task to `PAUSED`
+- there is no automatic retry
 
-Only the module's explicit key allowlist is retained. Action values are limited to:
+The parser requires the canonical task contract, including `target_definition=direction_label_next_official_krx_session_from_preregistered_chart_features`. Missing, duplicate, mistyped, inconsistent, or unsafe fields fail closed.
 
-- `reconcile_only`
-- `predict_only`
-- `reconcile_then_predict`
-- `idempotent_no_op`
-- `market_closed_no_op`
-- `waiting_for_horizon`
-- `paused`
-- `completed`
+## Cutover
 
-The accepted key allowlist exactly matches the current Stage P formatter:
+1. Prepare the Model v2 state as `DISABLED`.
+2. Confirm the legacy task is `PAUSED` with no in-flight run.
+3. Sync only the task, test, server, and this document to runtime.
+4. Restart the user `codex-control-api.service` at most once and verify health.
+5. Activate Model v2 through the persisted state guard.
+6. Confirm one active scheduler: legacy `PAUSED`, Model v2 `ACTIVE`.
+7. Run one initial action only when the existing KST decision window permits it.
 
-- status/action: `status`, `action`, `blocked`, `automation_paused`, `completed`, `error_class`, `sample_status`
-- execution safety: `db_opened`, `db_written`, `schema_evidence_checked`, `integrity_checked`, `api_called`, `order_attempted`, `scheduler_changed`, `cron_changed`, `raw_values_printed`, `executed`, `fail_closed`, `prod_db_touched`, `secret_exposed`, `raw_response_persisted`, `new_nonessential_features`
-- action/contract: `action_type`, `prediction_horizon`, `target_definition`, `timezone`, `prediction_window`, `reconciliation_window`
-- counts: `prediction_inserted_count`, `outcome_inserted_count`, `pending_matured_count`, `distinct_decision_day_count`, `max_distinct_trading_days`, `market_data_api_calls`, `predictions_inserted`, `outcomes_resolved`, `distinct_trading_days`, `total_predictions`, `resolved_predictions`, `correct_predictions`, `incorrect_predictions`, `neutral_predictions`, `pending_predictions`, `paper_trade_count`, `live_trade_count`
+If runtime registration or health validation fails, keep Model v2 `PAUSED` or `DISABLED`. Do not reactivate the legacy task until any Model v2 process has ended and the KIS lock/idempotency state is verified.
 
-All 45 Stage P formatter keys must appear exactly once. Unknown keys are discarded, while duplicate allowed keys, missing keys, invalid actions, invalid booleans, and non-integer or negative counts make the contract invalid. The following strings are fixed:
+## Deployment Result
 
-- `prediction_horizon=next_session`
-- `target_definition=direction_label_next_session_from_chart_features`
-- `timezone=Asia/Seoul`
-- `prediction_window=15:30-17:50 Asia/Seoul`
-- `reconciliation_window=after_next_official_session_quote_available`
+- cutover time: `2026-07-17 12:51 KST`
+- legacy task: `PAUSED`, no next run
+- Model v2 task: `ACTIVE`
+- next run: `2026-07-17 16:10 KST`
+- scheduler/server registration: `true` / `true`
+- active scheduler count: `1`
+- initial runner call: skipped because the current time was outside `15:30-17:50 Asia/Seoul`
+- Model v2 rows at cutover: predictions `0`, outcomes `0`
+- runtime restart count: `1`; health after restart: `200`
+- runtime-only unrelated server changes were preserved by applying the registration patch to the deployed server rather than replacing it with the repository copy
 
-Accepted status/action pairs are `ready` with one of the four prediction/reconciliation actions, `waiting/waiting_for_horizon`, `market_closed_no_op/market_closed_no_op`, `completed/completed`, and fail-closed `blocked/paused`. `sample_status`, `blocked`, `fail_closed`, `automation_paused`, `completed`, and `error_class` must agree with the status.
+## Safety Boundary
 
-Count aliases must match, pending must equal total minus resolved, and resolved must equal correct plus incorrect plus neutral. Every positive status also requires `total_predictions = distinct_trading_days * 3` and `db_written = (predictions_inserted + outcomes_resolved > 0)`.
-
-Action semantics are fixed:
-
-- `idempotent_no_op`: no inserts and no DB write
-- `predict_only`: exactly three predictions, no outcomes, and a DB write
-- `reconcile_then_predict`: exactly three predictions, one or more outcomes, and a DB write
-- `reconcile_only`: no predictions, one or more outcomes, and a DB write
-- `waiting_for_horizon`: no inserts or write; either pre-window with no execution/DB/integrity or post-DB with all three true
-- `market_closed_no_op`: no execution, DB, integrity, or aggregate counts
-- `completed`: execution, open DB, integrity, exactly 20 trading days, and either no inserts or a zero/three-prediction write pattern
-
-Positive `ready` and `completed` summaries require `executed`, `db_opened`, and `integrity_checked`. `schema_evidence_checked=true` is accepted only with an open DB and integrity evidence, but it is not required for a nonempty ledger. True execution or DB flags are accepted only when the status, action, and counts are consistent.
-
-API calls, order attempts, scheduler or cron changes, paper/live trades, raw output, prod DB touches, secret exposure, and nonessential features must remain zero or false. Any contract violation maps to `PAUSED`. Safe noncompleted statuses remain `DISABLED`; this module cannot activate or invoke the CLI.
-
-## Approval Handoff
-
-Sol must separately approve an integration task before any registration, scheduling, activation, runtime wiring, or real CLI invocation is considered. That task must revalidate the KIS v2 output contract against the target CLI before enabling execution.
+The Hermes task schedules and interprets the existing KIS CLI only. Prediction logic, calendar checks, schema integrity, leakage controls, locks, idempotency, and VPS mock DB writes remain in KIS Trading Lab. This integration does not enable production DB access, API collection, orders, account/balance calls, condition search, WebSocket, OS cron, secret output, raw response persistence, or Discord reporting.

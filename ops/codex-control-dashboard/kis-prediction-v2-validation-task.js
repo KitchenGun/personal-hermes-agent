@@ -1,6 +1,10 @@
 'use strict';
 
-const TASK_ID = 'kis-prediction-v2-validation';
+const { execFile: defaultExecFile } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const TASK_ID = 'kis-prediction-validation-cycle-v2';
 const TASK_NAME = 'KIS Prediction V2 Validation';
 const TASK_OWNER = 'hermes';
 const TASK_STATE = 'DISABLED';
@@ -11,6 +15,16 @@ const PROD_DB_PATH = '/var/lib/kis-trading-lab/kis-prod.sqlite3';
 const MAX_DISTINCT_TRADING_DAYS = 20;
 const MAX_CONCURRENT_RUNS = 1;
 const RETRY_ON_FAILURE = false;
+const TIMEZONE = 'Asia/Seoul';
+const SCHEDULE_RRULE = 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=10;BYSECOND=0';
+const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json';
+const LEGACY_TASK_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
+const SCHEDULER_CUTOVER_LOCK_PATH = '/tmp/kis-prediction-scheduler-cutover.lock';
+const LEGACY_KIS_RUN_LOCK_PATH = '/tmp/kis-trading-lab-prediction-validation-auto.lock';
+const HERMES_RUN_LOCK_PATH = '/tmp/kis-prediction-validation-cycle-v2-hermes.lock';
+const POLL_INTERVAL_MS = 60_000;
+const EXEC_TIMEOUT_MS = 10 * 60_000;
+const MAX_BUFFER_BYTES = 512 * 1024;
 
 const ALLOWED_ACTIONS = new Set([
   'reconcile_only',
@@ -110,7 +124,7 @@ const NUMBER_KEYS = new Set([
 ]);
 const FIXED_TEXT_FIELDS = Object.freeze({
   prediction_horizon: 'next_session',
-  target_definition: 'direction_label_next_session_from_chart_features',
+  target_definition: 'direction_label_next_official_krx_session_from_preregistered_chart_features',
   timezone: 'Asia/Seoul',
   prediction_window: '15:30-17:50 Asia/Seoul',
   reconciliation_window: 'after_next_official_session_quote_available',
@@ -329,69 +343,370 @@ function mapSummaryToTaskState(summary = {}) {
   if (summary.status === 'completed') {
     return { state: 'COMPLETED', reason: 'minimum_distinct_trading_days_reached' };
   }
-  return { state: 'DISABLED', reason: 'disabled_only_no_execution' };
+  return { state: 'ACTIVE', reason: 'last_run_success' };
+}
+
+function nowIso(now = new Date()) {
+  return now.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function classifyError(error) {
+  const text = String(error && (error.code || error.message || error) || '').toLowerCase();
+  if (/timeout|timedout/.test(text)) return 'timeout';
+  if (/enoent|not found|missing/.test(text)) return 'missing_dependency';
+  if (/permission|denied|forbidden|unauthorized/.test(text)) return 'permission';
+  return 'process_error';
+}
+
+function parseKstParts(date) {
+  const shifted = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+    weekday: shifted.getUTCDay(),
+  };
+}
+
+function nextRunAt(from = new Date()) {
+  for (let offset = 0; offset < 10; offset += 1) {
+    const base = new Date(from.getTime() + offset * 24 * 60 * 60 * 1000);
+    const parts = parseKstParts(base);
+    if (parts.weekday === 0 || parts.weekday === 6) continue;
+    const candidateUtc = new Date(Date.UTC(parts.year, parts.month, parts.day, 7, 10, 0));
+    if (candidateUtc.getTime() > from.getTime()) return candidateUtc.toISOString();
+  }
+  return new Date(from.getTime() + 24 * 60 * 60 * 1000).toISOString();
 }
 
 function defaultState(overrides = {}) {
-  return {
+  const createdAt = nowIso();
+  const state = {
     canonical_task_id: TASK_ID,
     task_name: TASK_NAME,
     task_owner: TASK_OWNER,
-    last_run: null,
-    ...overrides,
     state: TASK_STATE,
+    timezone: TIMEZONE,
+    schedule: SCHEDULE_RRULE,
+    next_run_at: null,
+    last_run: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+    ...overrides,
+  };
+  return {
+    ...state,
+    canonical_task_id: TASK_ID,
+    task_name: TASK_NAME,
+    task_owner: TASK_OWNER,
+    timezone: TIMEZONE,
+    schedule: SCHEDULE_RRULE,
     max_distinct_trading_days: MAX_DISTINCT_TRADING_DAYS,
     max_concurrent_runs: MAX_CONCURRENT_RUNS,
     retry: false,
     retry_on_failure: RETRY_ON_FAILURE,
     orders_enabled: false,
-    live_execution_enabled: false,
-    scheduler_registered: false,
-    server_registered: false,
+    os_cron_used: false,
+    live_execution_enabled: state.state === 'ACTIVE',
+    scheduler_registered: Boolean(state.scheduler_registered && state.state === 'ACTIVE'),
+    server_registered: Boolean(state.server_registered && state.state === 'ACTIVE'),
   };
 }
 
-function createKisPredictionV2ValidationTask(options = {}) {
-  const state = defaultState(options.state);
-  let running = false;
-
-  function status() {
-    return { ...state, last_run: state.last_run && { ...state.last_run } };
+function readState(statePath) {
+  try {
+    return defaultState(JSON.parse(fs.readFileSync(statePath, 'utf8')));
+  } catch {
+    return defaultState();
   }
+}
 
-  function prepareDisabled() {
+function writeState(statePath, state) {
+  fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+  const temporaryPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temporaryPath, 'wx', 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify({ ...state, updated_at: nowIso() }, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temporaryPath, statePath);
+    if (process.platform !== 'win32') fs.chmodSync(statePath, 0o600);
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.unlinkSync(temporaryPath); } catch (cleanupError) {
+      if (cleanupError.code !== 'ENOENT') throw cleanupError;
+    }
+    throw error;
+  }
+}
+
+function acquireExclusiveLock(lockPath) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, 'wx', 0o600);
+    fs.writeFileSync(fd, 'kis_prediction_scheduler_lock\n', 'utf8');
+    fs.fsyncSync(fd);
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    throw new Error(error.code === 'EEXIST' ? 'scheduler_lock_active' : 'scheduler_lock_failed');
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    fs.closeSync(fd);
+    fs.unlinkSync(lockPath);
+  };
+}
+
+function readPausedLegacyTaskState(legacyStatePath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(legacyStatePath, 'utf8'));
+  } catch {
+    throw new Error('legacy_v1_state_unavailable');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+    || String(parsed.state || '').toUpperCase() !== 'PAUSED'
+    || parsed.next_run_at !== null) {
+    throw new Error('legacy_v1_state_must_be_paused');
+  }
+  return parsed;
+}
+
+function safeLastRun(summary, overrides = {}) {
+  const safe = {};
+  for (const key of SAFE_OUTPUT_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(summary, key)) safe[key] = summary[key];
+  }
+  return { ...safe, ...overrides };
+}
+
+function boundedPositive(value, fallback, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.trunc(parsed), maximum) : fallback;
+}
+
+function createKisPredictionV2ValidationTask(options = {}) {
+  const statePath = options.statePath || DEFAULT_STATE_PATH;
+  const legacyStatePath = options.legacyStatePath || LEGACY_TASK_STATE_PATH;
+  const cutoverLockPath = options.cutoverLockPath || SCHEDULER_CUTOVER_LOCK_PATH;
+  const legacyRunLockPath = options.legacyRunLockPath || LEGACY_KIS_RUN_LOCK_PATH;
+  const runLockPath = options.runLockPath || HERMES_RUN_LOCK_PATH;
+  const execFile = options.execFile || defaultExecFile;
+  const logger = options.logger || { error() {} };
+  const pollIntervalMs = boundedPositive(options.pollIntervalMs, POLL_INTERVAL_MS, POLL_INTERVAL_MS);
+  const execTimeoutMs = boundedPositive(options.execTimeoutMs, EXEC_TIMEOUT_MS, EXEC_TIMEOUT_MS);
+  const maxBuffer = boundedPositive(options.maxBuffer, MAX_BUFFER_BYTES, MAX_BUFFER_BYTES);
+  const setTimer = options.setTimer || setTimeout;
+  const clearTimer = options.clearTimer || clearTimeout;
+  let running = false;
+  let timer = null;
+
+  function save(next) {
+    const normalized = defaultState(next);
+    writeState(statePath, normalized);
     return status();
   }
 
+  function status() {
+    const current = readState(statePath);
+    return { ...current, last_run: current.last_run && { ...current.last_run } };
+  }
+
+  function prepareDisabled() {
+    return save({ ...status(), state: 'DISABLED', next_run_at: null, last_run: null, scheduler_registered: false, server_registered: false });
+  }
+
+  function activate({ invokedBy = 'hermes' } = {}) {
+    let releaseCutover;
+    let releaseLegacyRun;
+    try {
+      releaseCutover = acquireExclusiveLock(cutoverLockPath);
+      releaseLegacyRun = acquireExclusiveLock(legacyRunLockPath);
+      readPausedLegacyTaskState(legacyStatePath);
+      const current = status();
+      if (current.state !== 'DISABLED') throw new Error('v2_task_must_be_disabled');
+      return save({
+        ...current,
+        state: 'ACTIVE',
+        activated_at: nowIso(),
+        activated_by: sanitizeText(invokedBy, 80),
+        next_run_at: nextRunAt(),
+        scheduler_registered: false,
+        server_registered: false,
+      });
+    } finally {
+      if (releaseLegacyRun) releaseLegacyRun();
+      if (releaseCutover) releaseCutover();
+    }
+  }
+
+  function pause(reason = 'operator_pause') {
+    return save({ ...status(), state: 'PAUSED', pause_reason: sanitizeText(reason, 80), next_run_at: null, scheduler_registered: false, server_registered: false });
+  }
+
   function runOnce({ invokedBy = 'hermes' } = {}) {
+    const current = status();
+    if (current.state !== 'ACTIVE') {
+      return Promise.resolve({ ...current, last_run: { status: 'skipped', action_type: 'idempotent_no_op', error_class: 'task_not_active', invoked_by: sanitizeText(invokedBy, 80) } });
+    }
     if (running) {
-      state.last_run = {
+      return Promise.resolve(save({ ...current, last_run: {
         status: 'skipped',
         action_type: 'idempotent_no_op',
         error_class: 'previous_run_active',
         duplicate_execution_prevented: true,
         invoked_by: sanitizeText(invokedBy, 80),
-      };
-      return Promise.resolve(status());
+        completed_at: nowIso(),
+      } }));
     }
 
-    running = true;
-    return Promise.resolve()
-      .then(() => {
-        state.last_run = {
+    let releaseRunLock;
+    try {
+      releaseRunLock = acquireExclusiveLock(runLockPath);
+    } catch (error) {
+      return Promise.resolve({
+        ...current,
+        last_run: {
           status: 'skipped',
           action_type: 'idempotent_no_op',
-          error_class: 'disabled_only_no_execution',
+          error_class: sanitizeText(error.message, 80),
+          duplicate_execution_prevented: true,
           invoked_by: sanitizeText(invokedBy, 80),
-        };
-        return status();
-      })
-      .finally(() => {
-        running = false;
+          completed_at: nowIso(),
+        },
       });
+    }
+
+    let commandSpec;
+    try {
+      commandSpec = buildCommand(options);
+    } catch (error) {
+      releaseRunLock();
+      return Promise.resolve(pause(sanitizeText(error.message, 80)));
+    }
+    running = true;
+    const startedAt = nowIso();
+    return new Promise((resolve) => {
+      const finishPaused = (errorClass) => {
+        if (timer) clearTimer(timer);
+        timer = null;
+        const saved = save({
+        ...status(), state: 'PAUSED', pause_reason: errorClass, next_run_at: null,
+        scheduler_registered: false, server_registered: false,
+        last_run: { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: sanitizeText(invokedBy, 80), started_at: startedAt, completed_at: nowIso() },
+        });
+        releaseRunLock();
+        resolve(saved);
+      };
+      try {
+        execFile(commandSpec.command, commandSpec.args, {
+          cwd: commandSpec.cwd,
+          env: process.env,
+          timeout: execTimeoutMs,
+          maxBuffer,
+        }, (error, stdout) => {
+          running = false;
+          if (error) return finishPaused(classifyError(error));
+          try {
+            const parsed = parseKisV2CliOutput(stdout);
+            const mapped = mapSummaryToTaskState(parsed);
+            if (mapped.state !== 'ACTIVE' && timer) clearTimer(timer);
+            if (mapped.state !== 'ACTIVE') timer = null;
+            const next = {
+              ...status(), state: mapped.state,
+              pause_reason: mapped.state === 'PAUSED' ? mapped.reason : undefined,
+              completion_reason: mapped.state === 'COMPLETED' ? mapped.reason : undefined,
+              next_run_at: mapped.state === 'ACTIVE' ? nextRunAt() : null,
+              scheduler_registered: mapped.state === 'ACTIVE' && Boolean(timer) && options.schedulerRegistered === true,
+              server_registered: mapped.state === 'ACTIVE' && Boolean(timer) && options.schedulerRegistered === true && options.serverRegistered === true,
+              last_run: safeLastRun(parsed, { invoked_by: sanitizeText(invokedBy, 80), started_at: startedAt, completed_at: nowIso() }),
+            };
+            const saved = save(next);
+            releaseRunLock();
+            resolve(saved);
+          } catch (callbackError) {
+            finishPaused(classifyError(callbackError));
+          }
+        });
+      } catch (error) {
+        running = false;
+        finishPaused(classifyError(error));
+      }
+    });
   }
 
-  return { status, prepareDisabled, runOnce, buildCommand: () => buildCommand(options) };
+  function tick() {
+    let current = status();
+    if (current.state === 'ACTIVE'
+      && (current.scheduler_registered !== (options.schedulerRegistered === true)
+        || current.server_registered !== (options.schedulerRegistered === true && options.serverRegistered === true))) {
+      current = save({
+        ...current,
+        scheduler_registered: options.schedulerRegistered === true,
+        server_registered: options.schedulerRegistered === true && options.serverRegistered === true,
+      });
+    }
+    if (current.state === 'ACTIVE' && current.next_run_at && new Date(current.next_run_at).getTime() <= Date.now()) {
+      runOnce({ invokedBy: 'hermes_scheduler' }).catch((error) => logger.error(sanitizeText(error.message || error, 120))).finally(scheduleTick);
+      return;
+    }
+    scheduleTick();
+  }
+
+  function scheduleTick() {
+    if (timer) clearTimer(timer);
+    timer = setTimer(tick, pollIntervalMs);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  }
+
+  function start() {
+    const current = status();
+    if (current.state === 'ACTIVE') save({
+      ...current,
+      scheduler_registered: options.schedulerRegistered === true,
+      server_registered: options.schedulerRegistered === true && options.serverRegistered === true,
+    });
+    scheduleTick();
+    return status();
+  }
+
+  function stop() {
+    if (timer) clearTimer(timer);
+    timer = null;
+    const current = status();
+    return current.state === 'ACTIVE'
+      ? save({ ...current, scheduler_registered: false, server_registered: false })
+      : current;
+  }
+
+  return { statePath, status, prepareDisabled, activate, pause, runOnce, start, stop, tick, buildCommand: () => buildCommand(options) };
+}
+
+async function cli(argv = process.argv.slice(2)) {
+  const action = argv[0] || 'status';
+  const task = createKisPredictionV2ValidationTask();
+  let result;
+  if (action === 'prepare-disabled') result = task.prepareDisabled();
+  else if (action === 'activate') result = task.activate({ invokedBy: 'hermes_cli' });
+  else if (action === 'pause') result = task.pause(argv[1] || 'operator_pause');
+  else if (action === 'run-once') result = await task.runOnce({ invokedBy: 'hermes_cli' });
+  else if (action === 'start') result = task.start();
+  else if (action === 'stop') result = task.stop();
+  else if (action === 'command') result = task.buildCommand();
+  else result = task.status();
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
+if (require.main === module) {
+  cli().catch((error) => {
+    process.stderr.write(`${sanitizeText(error.message || error)}\n`);
+    process.exit(1);
+  });
 }
 
 module.exports = {
@@ -406,10 +721,18 @@ module.exports = {
   MAX_DISTINCT_TRADING_DAYS,
   MAX_CONCURRENT_RUNS,
   RETRY_ON_FAILURE,
+  TIMEZONE,
+  SCHEDULE_RRULE,
+  DEFAULT_STATE_PATH,
+  LEGACY_TASK_STATE_PATH,
+  SCHEDULER_CUTOVER_LOCK_PATH,
+  LEGACY_KIS_RUN_LOCK_PATH,
+  HERMES_RUN_LOCK_PATH,
   ALLOWED_ACTIONS,
   SAFE_OUTPUT_KEYS,
   parseKisV2CliOutput,
   mapSummaryToTaskState,
+  nextRunAt,
   buildCommand,
   createKisPredictionV2ValidationTask,
 };
