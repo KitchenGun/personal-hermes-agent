@@ -100,8 +100,6 @@ test('single strict validator rejects missing, mistyped, unsafe, and inconsisten
     { executed: false },
     { db_opened: false },
     { integrity_checked: false, schema_evidence_checked: false },
-    { api_called: true },
-    { market_data_api_calls: 1 },
     { paper_trade_count: 1 },
     { live_trade_count: 1 },
     { order_attempted: true },
@@ -121,6 +119,22 @@ test('single strict validator rejects missing, mistyped, unsafe, and inconsisten
   const invalidNumber = taskModule.parseKisV2CliOutput(output({ distinct_trading_days: 'twenty' }));
   assert.equal(taskModule.mapSummaryToTaskState(invalidBoolean).state, 'PAUSED');
   assert.equal(taskModule.mapSummaryToTaskState(invalidNumber).state, 'PAUSED');
+});
+
+test('bounded market-data quotation calls require a matching boolean', () => {
+  const accepted = taskModule.parseKisV2CliOutput(output({ api_called: true, market_data_api_calls: 3 }));
+  assert.deepEqual(taskModule.mapSummaryToTaskState(accepted), { state: 'ACTIVE', reason: 'last_run_success' });
+
+  for (const fixture of [
+    { api_called: true, market_data_api_calls: 0 },
+    { api_called: false, market_data_api_calls: 1 },
+    { api_called: true, market_data_api_calls: -1 },
+    { api_called: true, market_data_api_calls: '1.5' },
+    { api_called: true, market_data_api_calls: 4 },
+  ]) {
+    const parsed = taskModule.parseKisV2CliOutput(output(fixture));
+    assert.equal(taskModule.mapSummaryToTaskState(parsed).state, 'PAUSED', JSON.stringify(fixture));
+  }
 });
 
 test('persistence defaults disabled and writes owner-only state', () => {

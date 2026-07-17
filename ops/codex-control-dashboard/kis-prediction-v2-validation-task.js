@@ -315,8 +315,9 @@ function hasValidPositiveSemantics(summary) {
 }
 
 function hasSafeExternalEffects(summary) {
-  return summary.api_called === false
-    && summary.market_data_api_calls === 0
+  return summary.market_data_api_calls >= 0
+    && summary.market_data_api_calls <= 3
+    && summary.api_called === (summary.market_data_api_calls > 0)
     && summary.paper_trade_count === 0
     && summary.live_trade_count === 0
     && summary.order_attempted === false
