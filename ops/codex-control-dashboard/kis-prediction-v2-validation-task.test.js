@@ -144,12 +144,16 @@ function withoutKey(output, key) {
 function testExactCommandAndCanonicalPath() {
   const command = taskModule.buildCommand();
   assert.equal(command.command, 'python3');
-  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'prediction-v2-validation-auto-once', '--approval', 'APPROVE_KIS_MODEL_V2_BOUNDED_VALIDATION_START_V1']);
+  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'prediction-v2-validation-auto-once', '--approval', 'APPROVE_KIS_MODEL_V2_BOUNDED_VALIDATION_START_V1', '--db', taskModule.VPS_MOCK_DB_PATH]);
   assert.equal(command.cwd, '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab');
   assert.equal(command.targetDbPath, taskModule.VPS_MOCK_DB_PATH);
   assert.throws(() => taskModule.buildCommand({ targetDbPath: taskModule.PROD_DB_PATH }), /noncanonical_or_prod_db_path_blocked/);
   assert.throws(() => taskModule.buildCommand({ targetDbPath: '/tmp/kis.sqlite3' }), /noncanonical_or_prod_db_path_blocked/);
+  for (const targetDbPath of ['', null, false, 0]) {
+    assert.throws(() => taskModule.buildCommand({ targetDbPath }), /noncanonical_or_prod_db_path_blocked/);
+  }
   assert.throws(() => taskModule.buildCommand({ kisRepo: '/tmp/kis-trading-lab' }), /fixed_kis_repo_required/);
+  assert.throws(() => taskModule.buildCommand({ python: 'python' }), /fixed_python_command_required/);
 }
 
 function testExactStagePOutputAndActionContract() {
@@ -318,6 +322,18 @@ function testInvalidTypedOutputFailsClosed() {
   assert.equal(taskModule.mapSummaryToTaskState(invalidNumber).state, 'PAUSED');
 }
 
+function testSampleStatusAndErrorClassMismatchFailClosed() {
+  const sampleStatusMismatch = taskModule.parseKisV2CliOutput(v2Output({ sample_status: 'waiting' }));
+  assert.deepEqual(taskModule.mapSummaryToTaskState(sampleStatusMismatch), {
+    state: 'PAUSED', reason: 'invalid_stage_p_contract',
+  });
+
+  const errorClassMismatch = taskModule.parseKisV2CliOutput(v2Output({ error_class: 'blocked' }));
+  assert.deepEqual(taskModule.mapSummaryToTaskState(errorClassMismatch), {
+    state: 'PAUSED', reason: 'invalid_stage_p_contract',
+  });
+}
+
 async function testDisabledOnlyNoInvocationOrRegistration() {
   let mockInvocationCount = 0;
   const task = taskModule.createKisPredictionV2ValidationTask({
@@ -354,6 +370,25 @@ async function testDisabledOnlyNoInvocationOrRegistration() {
   assert.equal(result.last_run.error_class, 'disabled_only_no_execution');
 }
 
+async function testConcurrentDisabledRunsPreventDuplicateExecution() {
+  let mockInvocationCount = 0;
+  const task = taskModule.createKisPredictionV2ValidationTask({
+    execFile: () => { mockInvocationCount += 1; },
+  });
+  const first = task.runOnce({ invokedBy: 'first' });
+  const second = await task.runOnce({ invokedBy: 'second' });
+  const firstResult = await first;
+
+  assert.equal(mockInvocationCount, 0);
+  assert.equal(firstResult.state, 'DISABLED');
+  assert.equal(firstResult.last_run.error_class, 'disabled_only_no_execution');
+  assert.equal(second.state, 'DISABLED');
+  assert.equal(second.last_run.status, 'skipped');
+  assert.equal(second.last_run.duplicate_execution_prevented, true);
+  assert.equal(second.last_run.error_class, 'previous_run_active');
+  assert.equal(task.status().last_run.error_class, 'disabled_only_no_execution');
+}
+
 (async () => {
   testExactCommandAndCanonicalPath();
   testExactStagePOutputAndActionContract();
@@ -363,7 +398,9 @@ async function testDisabledOnlyNoInvocationOrRegistration() {
   testAdversarialStagePContractsFailClosed();
   testReviewerSemanticAdversarialCases();
   testInvalidTypedOutputFailsClosed();
+  testSampleStatusAndErrorClassMismatchFailClosed();
   await testDisabledOnlyNoInvocationOrRegistration();
+  await testConcurrentDisabledRunsPreventDuplicateExecution();
   console.log('KIS prediction v2 disabled validation task tests passed');
 })().catch((error) => {
   console.error(error);

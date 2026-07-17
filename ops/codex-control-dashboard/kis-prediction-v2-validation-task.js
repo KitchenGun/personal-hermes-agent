@@ -182,7 +182,7 @@ function parseKisV2CliOutput(stdout) {
 }
 
 function buildCommand(config = {}) {
-  const targetDbPath = config.targetDbPath || VPS_MOCK_DB_PATH;
+  const targetDbPath = config.targetDbPath === undefined ? VPS_MOCK_DB_PATH : config.targetDbPath;
   if (targetDbPath !== VPS_MOCK_DB_PATH || targetDbPath === PROD_DB_PATH) {
     throw new Error('noncanonical_or_prod_db_path_blocked');
   }
@@ -194,7 +194,7 @@ function buildCommand(config = {}) {
   }
   return {
     command: 'python3',
-    args: ['-m', 'kis_trading_lab', 'prediction-v2-validation-auto-once', '--approval', KIS_APPROVAL],
+    args: ['-m', 'kis_trading_lab', 'prediction-v2-validation-auto-once', '--approval', KIS_APPROVAL, '--db', targetDbPath],
     cwd: KIS_REPO,
     targetDbPath,
   };
@@ -353,6 +353,7 @@ function defaultState(overrides = {}) {
 
 function createKisPredictionV2ValidationTask(options = {}) {
   const state = defaultState(options.state);
+  let running = false;
 
   function status() {
     return { ...state, last_run: state.last_run && { ...state.last_run } };
@@ -363,13 +364,31 @@ function createKisPredictionV2ValidationTask(options = {}) {
   }
 
   function runOnce({ invokedBy = 'hermes' } = {}) {
-    state.last_run = {
-      status: 'skipped',
-      action_type: 'idempotent_no_op',
-      error_class: 'disabled_only_no_execution',
-      invoked_by: sanitizeText(invokedBy, 80),
-    };
-    return Promise.resolve(status());
+    if (running) {
+      state.last_run = {
+        status: 'skipped',
+        action_type: 'idempotent_no_op',
+        error_class: 'previous_run_active',
+        duplicate_execution_prevented: true,
+        invoked_by: sanitizeText(invokedBy, 80),
+      };
+      return Promise.resolve(status());
+    }
+
+    running = true;
+    return Promise.resolve()
+      .then(() => {
+        state.last_run = {
+          status: 'skipped',
+          action_type: 'idempotent_no_op',
+          error_class: 'disabled_only_no_execution',
+          invoked_by: sanitizeText(invokedBy, 80),
+        };
+        return status();
+      })
+      .finally(() => {
+        running = false;
+      });
   }
 
   return { status, prepareDisabled, runOnce, buildCommand: () => buildCommand(options) };
