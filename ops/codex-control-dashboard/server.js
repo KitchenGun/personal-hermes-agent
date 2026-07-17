@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
 const kisPredictionValidationTask = require('./kis-prediction-validation-task');
+const kisPredictionV2ValidationTask = require('./kis-prediction-v2-validation-task');
 const discordRelay = require('./discord-relay');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
@@ -62,6 +63,10 @@ const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|au
 let kanbanListSupportsSort = true;
 const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask({
   progressSender: sendKisPredictionProgressViaDiscordRelay,
+});
+const kisPredictionV2TaskRuntime = kisPredictionV2ValidationTask.createKisPredictionV2ValidationTask({
+  schedulerRegistered: true,
+  serverRegistered: true,
 });
 
 if (!CONTROL_SHARED_SECRET) {
@@ -2359,7 +2364,48 @@ async function apiKisPredictionValidation(req, res) {
     } catch (controlError) {
       assertSharedSecret(req);
     }
+    if (String(kisPredictionV2TaskRuntime.status().state || '').toUpperCase() === 'ACTIVE') {
+      errJson(res, 409, 'Model v2 prediction scheduler is active');
+      return;
+    }
     const result = await kisPredictionTaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
+    okJson(res, {
+      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
+      ...result,
+    });
+    return;
+  }
+  errJson(res, 404, 'not found');
+}
+
+async function apiKisPredictionV2Validation(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-v2-validation/status') {
+    okJson(res, { ok: true, ...kisPredictionV2TaskRuntime.status() });
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/activate') {
+    try {
+      assertControlAuth(req);
+    } catch (controlError) {
+      assertSharedSecret(req);
+    }
+    const result = kisPredictionV2TaskRuntime.activate({ invokedBy: 'hermes_api' });
+    okJson(res, { ok: result.state === 'ACTIVE', ...result });
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/run-once') {
+    try {
+      assertControlAuth(req);
+    } catch (controlError) {
+      assertSharedSecret(req);
+    }
+    const legacyState = String(kisPredictionTaskRuntime.status().state || '').toUpperCase();
+    if (legacyState !== 'PAUSED') {
+      errJson(res, 409, 'legacy prediction scheduler must remain paused');
+      return;
+    }
+    const result = await kisPredictionV2TaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
     okJson(res, {
       ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
       ...result,
@@ -2424,6 +2470,10 @@ const server = http.createServer(async (req, res) => {
       await apiKisPredictionValidation(req, res);
       return;
     }
+    if (req.url.startsWith('/api/kis/prediction-v2-validation')) {
+      await apiKisPredictionV2Validation(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/kis/report')) {
       await apiKisReport(req, res);
       return;
@@ -2458,12 +2508,9 @@ if (require.main === module) {
       }
     }
       try {
-        kisPredictionTaskRuntime.start();
-        kisPredictionTaskRuntime.notifyCurrentProgress({ invokedBy: 'hermes_startup' }).catch((error) => {
-          console.error(`kis prediction validation progress notification failed: ${error.message || String(error)}`);
-        });
+        kisPredictionV2TaskRuntime.start();
       } catch (error) {
-        console.error(`kis prediction validation scheduler start failed: ${error.message || String(error)}`);
+        console.error(`kis prediction v2 validation scheduler start failed: ${error.message || String(error)}`);
       }
   });
 }

@@ -14,6 +14,8 @@ const KIS_APPROVAL = 'APPROVE_KIS_CODEX_PREDICTION_VALIDATION_AUTOMATION_V1';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const PROD_DB_PATH = '/var/lib/kis-trading-lab/kis-prod.sqlite3';
 const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
+const V2_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json';
+const CUTOVER_LOCK_PATH = '/tmp/kis-prediction-scheduler-cutover.lock';
 const POLL_INTERVAL_MS = 60_000;
 const PROGRESS_TARGET_CHANNEL_ID = '1512691418605420634';
 const PROGRESS_DELIVERY_LAYER = 'discord_relay';
@@ -196,6 +198,45 @@ function writeState(statePath, state) {
   fs.writeFileSync(statePath, `${JSON.stringify({ ...state, updated_at: nowIso() }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
+function v2SchedulerAllowsLegacyExecution(v2StatePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(v2StatePath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      && parsed.canonical_task_id === 'kis-prediction-validation-cycle-v2'
+      && parsed.task_owner === 'hermes'
+      && parsed.state === 'DISABLED'
+      && parsed.next_run_at === null
+      && parsed.scheduler_registered === false
+      && parsed.server_registered === false
+      && parsed.live_execution_enabled === false
+      && parsed.max_concurrent_runs === 1
+      && parsed.orders_enabled === false
+      && parsed.os_cron_used === false;
+  } catch (error) {
+    return error && error.code === 'ENOENT';
+  }
+}
+
+function acquireCutoverLock(lockPath) {
+  try {
+    return { fd: fs.openSync(lockPath, 'wx', 0o600) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+function releaseCutoverLock(lockPath, fd) {
+  try {
+    fs.closeSync(fd);
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // The lock was created by this process; do not retry or remove unknown locks.
+    }
+  }
+}
+
 function safeLastRun(summary, overrides = {}) {
   const safe = {};
   for (const key of SAFE_OUTPUT_KEYS) {
@@ -376,6 +417,9 @@ async function applyProgressNotification(previousState, nextState, options = {})
 
 function createKisPredictionValidationTask(options = {}) {
   const statePath = options.statePath || process.env.KIS_PREDICTION_TASK_STATE_PATH || DEFAULT_STATE_PATH;
+  // These injectable paths are intentionally test-only; production always uses the canonical paths.
+  const v2StatePath = options.v2StatePath || V2_STATE_PATH;
+  const cutoverLockPath = options.cutoverLockPath || CUTOVER_LOCK_PATH;
   const execFile = options.execFile || defaultExecFile;
   const logger = options.logger || { info() {}, warn() {}, error() {} };
   const pollIntervalMs = Number(options.pollIntervalMs || POLL_INTERVAL_MS);
@@ -442,16 +486,26 @@ function createKisPredictionValidationTask(options = {}) {
       return saveWithProgressNotification(current, { ...current, state: 'PAUSED', pause_reason: lastRun.error_class, last_run: lastRun, next_run_at: null }, { invokedBy });
     }
 
+    const lock = acquireCutoverLock(cutoverLockPath);
+    if (lock.error) {
+      const errorClass = lock.error.code === 'EEXIST' ? 'scheduler_cutover_lock_held' : 'scheduler_cutover_lock_unavailable';
+      const lastRun = { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: invokedBy, completed_at: nowIso() };
+      return saveWithProgressNotification(current, { ...status(), state: 'PAUSED', pause_reason: errorClass, last_run: lastRun, next_run_at: null }, { invokedBy });
+    }
+
+    if (!v2SchedulerAllowsLegacyExecution(v2StatePath)) {
+      releaseCutoverLock(cutoverLockPath, lock.fd);
+      const errorClass = 'model_v2_scheduler_active_or_invalid';
+      const lastRun = { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: invokedBy, completed_at: nowIso() };
+      return saveWithProgressNotification(current, { ...status(), state: 'PAUSED', pause_reason: errorClass, last_run: lastRun, next_run_at: null }, { invokedBy });
+    }
+
     running = true;
     const startedAt = nowIso();
     return new Promise((resolve) => {
-      execFile(commandSpec.command, commandSpec.args, {
-        cwd: commandSpec.cwd,
-        env: process.env,
-        timeout: Number(options.execTimeoutMs || EXEC_TIMEOUT_MS),
-        maxBuffer: Number(options.maxBuffer || MAX_BUFFER_BYTES),
-      }, (error, stdout) => {
+      const finish = (error, stdout) => {
         running = false;
+        releaseCutoverLock(cutoverLockPath, lock.fd);
         const completedAt = nowIso();
         if (error) {
           const errorClass = classifyError(error);
@@ -471,7 +525,17 @@ function createKisPredictionValidationTask(options = {}) {
           last_run: lastRun,
         };
         saveWithProgressNotification(current, next, { invokedBy }).then(resolve);
-      });
+      };
+      try {
+        execFile(commandSpec.command, commandSpec.args, {
+          cwd: commandSpec.cwd,
+          env: process.env,
+          timeout: Number(options.execTimeoutMs || EXEC_TIMEOUT_MS),
+          maxBuffer: Number(options.maxBuffer || MAX_BUFFER_BYTES),
+        }, finish);
+      } catch (error) {
+        finish(error, '');
+      }
     });
   }
 
@@ -547,6 +611,8 @@ module.exports = {
   VPS_DB_PATH,
   PROD_DB_PATH,
   DEFAULT_STATE_PATH,
+  V2_STATE_PATH,
+  CUTOVER_LOCK_PATH,
   parseKisCliOutput,
   mapSummaryToTaskState,
   nextRunAt,

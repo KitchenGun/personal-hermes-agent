@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const taskModule = require('./kis-prediction-validation-task');
+const v2TaskModule = require('./kis-prediction-v2-validation-task');
 
 function tempStatePath(name) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kis-pred-task-')), `${name}.json`);
@@ -34,14 +35,133 @@ function successOutput(overrides = {}) {
 }
 
 function makeTask(execFile, extra = {}) {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-pred-task-'));
   return taskModule.createKisPredictionValidationTask({
-    statePath: tempStatePath('state'),
+    statePath: path.join(testDir, 'state.json'),
+    v2StatePath: path.join(testDir, 'v2-state.json'),
+    cutoverLockPath: path.join(testDir, 'cutover.lock'),
     execFile,
     pollIntervalMs: 1000000,
     setTimer: () => ({ unref() {} }),
     clearTimer: () => {},
     ...extra,
   });
+}
+
+function disabledV2State(overrides = {}) {
+  return {
+    canonical_task_id: 'kis-prediction-validation-cycle-v2',
+    task_owner: 'hermes',
+    state: 'DISABLED',
+    next_run_at: null,
+    scheduler_registered: false,
+    server_registered: false,
+    live_execution_enabled: false,
+    max_concurrent_runs: 1,
+    orders_enabled: false,
+    os_cron_used: false,
+    ...overrides,
+  };
+}
+
+async function testV2StateBlocksLegacyExecution() {
+  for (const state of ['ACTIVE', 'PAUSED', 'COMPLETED']) {
+    let calls = 0;
+    const v2StatePath = tempStatePath(`v2-${state.toLowerCase()}`);
+    fs.writeFileSync(v2StatePath, JSON.stringify({ state }));
+    const task = makeTask(() => { calls += 1; }, { v2StatePath });
+    const result = await task.runOnce({ invokedBy: 'test' });
+    assert.equal(calls, 0, `${state} must block legacy execution`);
+    assert.equal(result.state, 'PAUSED');
+    assert.equal(result.last_run.error_class, 'model_v2_scheduler_active_or_invalid');
+  }
+
+  let malformedCalls = 0;
+  const malformedPath = tempStatePath('v2-malformed');
+  fs.writeFileSync(malformedPath, '{not json');
+  const malformedTask = makeTask(() => { malformedCalls += 1; }, { v2StatePath: malformedPath });
+  const malformedResult = await malformedTask.runOnce({ invokedBy: 'test' });
+  assert.equal(malformedCalls, 0);
+  assert.equal(malformedResult.last_run.error_class, 'model_v2_scheduler_active_or_invalid');
+
+  let incompleteCalls = 0;
+  const incompletePath = tempStatePath('v2-incomplete-disabled');
+  fs.writeFileSync(incompletePath, JSON.stringify({ state: 'DISABLED' }));
+  const incompleteTask = makeTask(() => { incompleteCalls += 1; }, { v2StatePath: incompletePath });
+  const incompleteResult = await incompleteTask.runOnce({ invokedBy: 'test' });
+  assert.equal(incompleteCalls, 0);
+  assert.equal(incompleteResult.last_run.error_class, 'model_v2_scheduler_active_or_invalid');
+}
+
+async function testMissingOrDisabledV2StateAllowsLegacyExecution() {
+  for (const v2State of [null, 'DISABLED']) {
+    let calls = 0;
+    const v2StatePath = tempStatePath(`v2-${v2State || 'missing'}`);
+    if (v2State) fs.writeFileSync(v2StatePath, JSON.stringify(disabledV2State()));
+    const task = makeTask((_command, _args, _options, callback) => {
+      calls += 1;
+      callback(null, successOutput(), '');
+    }, { v2StatePath });
+    await task.runOnce({ invokedBy: 'test' });
+    assert.equal(calls, 1, `${v2State || 'missing'} must allow legacy execution`);
+  }
+}
+
+async function testCutoverLockMakesV1RunAndV2ActivationAtomic() {
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-pred-cutover-race-'));
+  const v1StatePath = path.join(testDir, 'v1-state.json');
+  const v2StatePath = path.join(testDir, 'v2-state.json');
+  const cutoverLockPath = path.join(testDir, 'cutover.lock');
+  const legacyRunLockPath = path.join(testDir, 'legacy-run.lock');
+  let v1Callback;
+  const v1Task = taskModule.createKisPredictionValidationTask({
+    statePath: v1StatePath,
+    v2StatePath,
+    cutoverLockPath,
+    execFile(command, args, options, callback) { v1Callback = callback; },
+  });
+  v1Task.pause('test');
+  const v2Task = v2TaskModule.createKisPredictionV2ValidationTask({
+    statePath: v2StatePath,
+    legacyStatePath: v1StatePath,
+    cutoverLockPath,
+    legacyRunLockPath,
+    runLockPath: path.join(testDir, 'v2-run.lock'),
+  });
+  v2Task.prepareDisabled();
+  const v1Run = v1Task.runOnce({ invokedBy: 'test', force: true });
+  assert.equal(fs.existsSync(cutoverLockPath), true);
+  assert.throws(() => v2Task.activate({ invokedBy: 'test' }), /scheduler_lock_active/);
+  assert.equal(v2Task.status().state, 'DISABLED');
+  v1Callback(null, successOutput(), '');
+  await v1Run;
+  assert.equal(fs.existsSync(cutoverLockPath), false);
+  v1Task.pause('cutover_ready');
+  assert.equal(v2Task.activate({ invokedBy: 'test' }).state, 'ACTIVE');
+}
+
+async function testExistingCutoverLockBlocksWithoutChildCall() {
+  let calls = 0;
+  const cutoverLockPath = tempStatePath('cutover-lock');
+  fs.writeFileSync(cutoverLockPath, 'held');
+  const task = makeTask(() => { calls += 1; }, { cutoverLockPath });
+  const result = await task.runOnce({ invokedBy: 'test' });
+  assert.equal(calls, 0);
+  assert.equal(result.state, 'PAUSED');
+  assert.equal(result.last_run.error_class, 'scheduler_cutover_lock_held');
+  assert.equal(fs.existsSync(cutoverLockPath), true);
+}
+
+async function testCutoverLockReleasesAfterChildCallbacks() {
+  for (const outcome of ['success', 'error']) {
+    const cutoverLockPath = tempStatePath(`cutover-release-${outcome}`);
+    const task = makeTask((_command, _args, _options, callback) => {
+      if (outcome === 'success') callback(null, successOutput(), '');
+      else callback(new Error('synthetic failure'), '', '');
+    }, { cutoverLockPath });
+    await task.runOnce({ invokedBy: 'test' });
+    assert.equal(fs.existsSync(cutoverLockPath), false, `${outcome} callback must release cutover lock`);
+  }
 }
 
 async function testCommandAndCwdAreFixed() {
@@ -272,6 +392,11 @@ function testScheduleAndDuplicateSchedulerGuard() {
   await testConcurrencyPreventsDuplicateRun();
   await testProdDbPathBlocksBeforeExec();
   await testNoRetryOnError();
+  await testV2StateBlocksLegacyExecution();
+  await testMissingOrDisabledV2StateAllowsLegacyExecution();
+  await testExistingCutoverLockBlocksWithoutChildCall();
+  await testCutoverLockReleasesAfterChildCallbacks();
+  await testCutoverLockMakesV1RunAndV2ActivationAtomic();
   await testProgressMessageOnDistinctDayIncrease();
   testProgressMessageSummaryLineForCurrentCounts();
   await testNoProgressMessageForSameDistinctDay();
