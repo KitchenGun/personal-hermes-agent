@@ -330,6 +330,20 @@ function hasSafeExternalEffects(summary) {
     && summary.new_nonessential_features === false;
 }
 
+function hasSafeFailClosedSemantics(summary) {
+  return summary.status === 'blocked'
+    && summary.action === 'paused'
+    && summary.action_type === 'paused'
+    && summary.fail_closed === true
+    && summary.db_written === false
+    && summary.prediction_inserted_count === 0
+    && summary.outcome_inserted_count === 0
+    && summary.predictions_inserted === 0
+    && summary.outcomes_resolved === 0
+    && summary.api_called === false
+    && summary.market_data_api_calls === 0;
+}
+
 function mapSummaryToTaskState(summary = {}) {
   const validContract = hasExactOutputKeys(summary)
     && hasValidTypedOutput(summary)
@@ -357,6 +371,13 @@ function classifyError(error) {
   if (/enoent|not found|missing/.test(text)) return 'missing_dependency';
   if (/permission|denied|forbidden|unauthorized/.test(text)) return 'permission';
   return 'process_error';
+}
+
+function isExpectedFailClosedExit(error) {
+  return Boolean(error)
+    && Number(error.code) === 2
+    && error.killed !== true
+    && !error.signal;
 }
 
 function parseKstParts(date) {
@@ -502,14 +523,16 @@ function createKisPredictionV2ValidationTask(options = {}) {
   const pollIntervalMs = boundedPositive(options.pollIntervalMs, POLL_INTERVAL_MS, POLL_INTERVAL_MS);
   const execTimeoutMs = boundedPositive(options.execTimeoutMs, EXEC_TIMEOUT_MS, EXEC_TIMEOUT_MS);
   const maxBuffer = boundedPositive(options.maxBuffer, MAX_BUFFER_BYTES, MAX_BUFFER_BYTES);
+  const stateWriter = options.stateWriter || writeState;
   const setTimer = options.setTimer || setTimeout;
   const clearTimer = options.clearTimer || clearTimeout;
   let running = false;
+  let schedulerFaulted = false;
   let timer = null;
 
   function save(next) {
     const normalized = defaultState(next);
-    writeState(statePath, normalized);
+    stateWriter(statePath, normalized);
     return status();
   }
 
@@ -592,17 +615,29 @@ function createKisPredictionV2ValidationTask(options = {}) {
     }
     running = true;
     const startedAt = nowIso();
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      const releaseRunLockOnce = () => {
+        if (!releaseRunLock) return;
+        const release = releaseRunLock;
+        releaseRunLock = null;
+        release();
+      };
       const finishPaused = (errorClass) => {
         if (timer) clearTimer(timer);
         timer = null;
-        const saved = save({
-        ...status(), state: 'PAUSED', pause_reason: errorClass, next_run_at: null,
-        scheduler_registered: false, server_registered: false,
-        last_run: { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: sanitizeText(invokedBy, 80), started_at: startedAt, completed_at: nowIso() },
-        });
-        releaseRunLock();
-        resolve(saved);
+        try {
+          const saved = save({
+            ...status(), state: 'PAUSED', pause_reason: errorClass, next_run_at: null,
+            scheduler_registered: false, server_registered: false,
+            last_run: { status: 'paused', action_type: 'paused', fail_closed: true, error_class: errorClass, invoked_by: sanitizeText(invokedBy, 80), started_at: startedAt, completed_at: nowIso() },
+          });
+          releaseRunLockOnce();
+          resolve(saved);
+        } catch (stateError) {
+          schedulerFaulted = true;
+          releaseRunLockOnce();
+          reject(stateError);
+        }
       };
       try {
         execFile(commandSpec.command, commandSpec.args, {
@@ -612,10 +647,17 @@ function createKisPredictionV2ValidationTask(options = {}) {
           maxBuffer,
         }, (error, stdout) => {
           running = false;
-          if (error) return finishPaused(classifyError(error));
+          if (error && !isExpectedFailClosedExit(error)) return finishPaused(classifyError(error));
           try {
             const parsed = parseKisV2CliOutput(stdout);
             const mapped = mapSummaryToTaskState(parsed);
+            if (error && !(mapped.state === 'PAUSED'
+              && mapped.reason === 'blocked'
+              && parsed.status === 'blocked'
+              && parsed.fail_closed === true
+              && hasSafeFailClosedSemantics(parsed))) {
+              return finishPaused(classifyError(error));
+            }
             if (mapped.state !== 'ACTIVE' && timer) clearTimer(timer);
             if (mapped.state !== 'ACTIVE') timer = null;
             const next = {
@@ -628,7 +670,7 @@ function createKisPredictionV2ValidationTask(options = {}) {
               last_run: safeLastRun(parsed, { invoked_by: sanitizeText(invokedBy, 80), started_at: startedAt, completed_at: nowIso() }),
             };
             const saved = save(next);
-            releaseRunLock();
+            releaseRunLockOnce();
             resolve(saved);
           } catch (callbackError) {
             finishPaused(classifyError(callbackError));
@@ -653,7 +695,12 @@ function createKisPredictionV2ValidationTask(options = {}) {
       });
     }
     if (current.state === 'ACTIVE' && current.next_run_at && new Date(current.next_run_at).getTime() <= Date.now()) {
-      runOnce({ invokedBy: 'hermes_scheduler' }).catch((error) => logger.error(sanitizeText(error.message || error, 120))).finally(scheduleTick);
+      runOnce({ invokedBy: 'hermes_scheduler' })
+        .catch((error) => logger.error(sanitizeText(error.message || error, 120)))
+        .finally(() => {
+          if (!schedulerFaulted && status().state === 'ACTIVE') scheduleTick();
+          else timer = null;
+        });
       return;
     }
     scheduleTick();
@@ -667,6 +714,7 @@ function createKisPredictionV2ValidationTask(options = {}) {
 
   function start() {
     const current = status();
+    if (schedulerFaulted) return current;
     if (current.state === 'ACTIVE') save({
       ...current,
       scheduler_registered: options.schedulerRegistered === true,
