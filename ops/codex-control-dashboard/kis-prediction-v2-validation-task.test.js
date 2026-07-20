@@ -272,6 +272,126 @@ test('invalid contract and process error pause with no retry', async () => {
   assert.equal(calls, 1);
 });
 
+test('exit code 2 preserves only a valid sanitized fail-closed result', async () => {
+  const failClosedError = Object.assign(new Error('Command failed'), { code: 2 });
+  let calls = 0;
+  const runLockPath = statePath('exit-two-run.lock');
+  const blockedTask = activeTask({
+    runLockPath,
+    execFile(command, args, options, callback) {
+      calls += 1;
+      callback(failClosedError, blockedFormatterOutput());
+    },
+  });
+  const blocked = await blockedTask.runOnce({ invokedBy: 'test' });
+  assert.equal(calls, 1);
+  assert.equal(blocked.state, 'PAUSED');
+  assert.equal(blocked.pause_reason, 'blocked');
+  assert.equal(blocked.last_run.status, 'blocked');
+  assert.equal(blocked.last_run.fail_closed, true);
+  assert.equal(blocked.last_run.error_class, 'blocked');
+  assert.equal(blocked.last_run.market_data_api_calls, 0);
+  assert.equal(fs.existsSync(runLockPath), false);
+
+  for (const [error, stdout] of [
+    [Object.assign(new Error('Command failed'), { code: 2 }), output()],
+    [Object.assign(new Error('Command failed'), { code: 2 }), withoutKey(blockedFormatterOutput(), 'prod_db_touched')],
+    [Object.assign(new Error('Command failed'), { code: 1 }), blockedFormatterOutput()],
+    [Object.assign(new Error('Command failed'), { code: 2 }), blockedFormatterOutput().replace('db_written=false', 'db_written=true').replace('prediction_inserted_count=0', 'prediction_inserted_count=3').replace('predictions_inserted=0', 'predictions_inserted=3')],
+    [Object.assign(new Error('Command failed'), { code: 2 }), blockedFormatterOutput().replace('api_called=false', 'api_called=true').replace('market_data_api_calls=0', 'market_data_api_calls=3')],
+    [Object.assign(new Error('Command failed'), { code: 2, signal: 'SIGTERM' }), blockedFormatterOutput()],
+    [Object.assign(new Error('Command timed out'), { code: 2, killed: true }), blockedFormatterOutput()],
+  ]) {
+    const task = activeTask({
+      execFile(command, args, options, callback) {
+        callback(error, stdout);
+      },
+    });
+    const state = await task.runOnce({ invokedBy: 'test' });
+    assert.equal(state.state, 'PAUSED');
+    assert.equal(state.pause_reason, 'process_error');
+    assert.equal(state.last_run.error_class, 'process_error');
+  }
+});
+
+test('scheduled fail-closed run does not re-register the polling timer', async () => {
+  const file = statePath('scheduled-fail-closed');
+  const callbacks = [];
+  const task = activeTask({
+    statePath: file,
+    schedulerRegistered: true,
+    serverRegistered: true,
+    setTimer(fn) { callbacks.push(fn); return { unref() {} }; },
+    clearTimer() {},
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('Command failed'), { code: 2 }), blockedFormatterOutput());
+    },
+  });
+  task.start();
+  const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+  persisted.next_run_at = '2020-01-01T00:00:00Z';
+  fs.writeFileSync(file, `${JSON.stringify(persisted)}\n`, 'utf8');
+  assert.equal(callbacks.length, 1);
+  callbacks[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(task.status().state, 'PAUSED');
+  assert.equal(callbacks.length, 1);
+});
+
+test('state persistence failure releases the shared run lock and rejects once', async () => {
+  const file = statePath('state-write-failure');
+  const runLockPath = statePath('state-write-failure-run.lock');
+  let failWrites = false;
+  const task = activeTask({
+    statePath: file,
+    runLockPath,
+    stateWriter(target, state) {
+      if (failWrites) throw new Error('state_write_failed');
+      fs.writeFileSync(target, `${JSON.stringify(state)}\n`, 'utf8');
+    },
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('Command failed'), { code: 2 }), blockedFormatterOutput());
+    },
+  });
+  failWrites = true;
+  await assert.rejects(task.runOnce({ invokedBy: 'test' }), /state_write_failed/);
+  assert.equal(fs.existsSync(runLockPath), false);
+});
+
+test('scheduled state persistence failure latches fail-closed without another poll', async () => {
+  const file = statePath('scheduled-state-write-failure');
+  const runLockPath = statePath('scheduled-state-write-failure-run.lock');
+  const callbacks = [];
+  let failWrites = false;
+  const task = activeTask({
+    statePath: file,
+    runLockPath,
+    schedulerRegistered: true,
+    serverRegistered: true,
+    stateWriter(target, state) {
+      if (failWrites) throw new Error('state_write_failed');
+      fs.writeFileSync(target, `${JSON.stringify(state)}\n`, 'utf8');
+    },
+    setTimer(fn) { callbacks.push(fn); return { unref() {} }; },
+    clearTimer() {},
+    logger: { error() {} },
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('Command failed'), { code: 2 }), blockedFormatterOutput());
+    },
+  });
+  task.start();
+  const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+  persisted.next_run_at = '2020-01-01T00:00:00Z';
+  fs.writeFileSync(file, `${JSON.stringify(persisted)}\n`, 'utf8');
+  failWrites = true;
+  callbacks[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(runLockPath), false);
+  assert.equal(callbacks.length, 1);
+  assert.equal(task.start().state, 'ACTIVE');
+  assert.equal(callbacks.length, 1);
+});
+
 test('same-process duplicate is skipped and completed state stops scheduler', async () => {
   let callback;
   let calls = 0;
