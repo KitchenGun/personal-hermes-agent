@@ -8,12 +8,21 @@ const test = require('node:test');
 const mod = require('./kis-ai-market-open-dry-run-task');
 
 function good(taskId, status = 'success', extra = {}) {
+  const defaultAction = {
+    [mod.TASKS[0].id]: 'market_open_supervisor',
+    [mod.TASKS[1].id]: 'intraday_shadow',
+    [mod.TASKS[2].id]: 'post_close_learning',
+    [mod.TASKS[3].id]: 'daily_learning_report',
+  }[taskId];
+  const blocked = status === 'blocked';
   return JSON.stringify({
     task_id: taskId,
     status,
-    action_type: status === 'blocked' ? 'paused' : 'intraday_shadow',
-    official_trade_date: '2026-07-21',
-    official_session_state: 'regular_session',
+    action_type: blocked ? 'paused' : defaultAction,
+    official_trade_date: blocked ? null : '2026-07-21',
+    official_session_state: blocked ? 'unknown' : 'regular_session',
+    official_calendar_verified: !blocked,
+    official_calendar_source_hash: blocked ? null : `sha256:${'a'.repeat(64)}`,
     api_calls: 0,
     quote_api_calls: 0,
     decisions: 0,
@@ -32,8 +41,8 @@ function good(taskId, status = 'success', extra = {}) {
     retry: false,
     catch_up: false,
     backfill: false,
-    fail_closed: status === 'blocked',
-    error_class: status === 'blocked' ? 'safe_block' : 'none',
+    fail_closed: blocked,
+    error_class: blocked ? 'safe_block' : 'none',
     report_message: null,
     ...extra,
   });
@@ -125,6 +134,9 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { report_message: 'app_secret=x' }), mod.TASKS[1].id), /unsafe/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_session_state: 'closed' }), mod.TASKS[1].id), /calendar/);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', { action_type: 'market_closed_no_op', official_session_state: 'closed' }), mod.TASKS[1].id));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_verified: false }), mod.TASKS[1].id), /calendar/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_source_hash: 'sha256:fake' }), mod.TASKS[1].id), /calendar/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'success'), mod.TASKS[3].id), /task_result/);
 });
 
 test('missed slot is not executed but advances so the next slot runs once', async () => {

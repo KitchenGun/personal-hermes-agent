@@ -31,6 +31,7 @@ const ACTIVE_STATUSES = new Set(['success', 'no_op', 'waiting', 'report_ready'])
 const ALL_STATUSES = new Set([...ACTIVE_STATUSES, 'blocked']);
 const OUTPUT_KEYS = new Set([
   'task_id', 'status', 'action_type', 'official_trade_date', 'official_session_state',
+  'official_calendar_verified', 'official_calendar_source_hash',
   'api_calls', 'quote_api_calls',
   'decisions', 'simulated_orders', 'simulated_positions', 'experience_rows', 'incidents',
   'outbox_rows', 'challenger_trained', 'champion_changed', 'order_api_calls',
@@ -43,9 +44,10 @@ const COUNT_KEYS = new Set([
 ]);
 const BOOLEAN_KEYS = new Set([
   'challenger_trained', 'champion_changed', 'raw_response_persisted', 'secret_exposure',
-  'retry', 'catch_up', 'backfill', 'fail_closed',
+  'retry', 'catch_up', 'backfill', 'fail_closed', 'official_calendar_verified',
 ]);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret)/i;
+const OFFICIAL_SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
 
 function seoulParts(date) {
   const values = new Intl.DateTimeFormat('en-US', {
@@ -100,6 +102,31 @@ function validateReportMessage(value) {
   return reportMessage;
 }
 
+function validateTaskMeaning(value) {
+  if (value.status === 'blocked') return;
+  if (value.action_type === 'market_closed_no_op') {
+    if (value.status !== 'no_op') throw new Error('invalid_task_result_contract');
+    return;
+  }
+  if (value.action_type === 'waiting_window') {
+    if (value.status !== 'waiting') throw new Error('invalid_task_result_contract');
+    return;
+  }
+  if (value.action_type === 'idempotent_no_op') {
+    if (value.status !== 'no_op') throw new Error('invalid_task_result_contract');
+    return;
+  }
+  const expected = {
+    'kis-ai-market-open-supervisor-v1': { statuses: new Set(['success']), actions: new Set(['activation_preflight', 'market_open_supervisor']) },
+    'kis-ai-intraday-shadow-validation-v1': { statuses: new Set(['success']), actions: new Set(['intraday_shadow']) },
+    'kis-ai-post-close-learning-v1': { statuses: new Set(['success']), actions: new Set(['post_close_learning']) },
+    'kis-ai-daily-learning-report-v1': { statuses: new Set(['report_ready']), actions: new Set(['daily_learning_report']) },
+  }[value.task_id];
+  if (!expected.statuses.has(value.status) || !expected.actions.has(value.action_type)) {
+    throw new Error('invalid_task_result_contract');
+  }
+}
+
 function parseKisAiMarketOpenOutput(stdout, expectedTaskId) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_or_oversized_output');
@@ -122,9 +149,13 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId) {
   const marketClosed = value.action_type === 'market_closed_no_op';
   if (marketClosed !== (value.official_session_state === 'closed')
     || (!blocked && !marketClosed && value.official_session_state !== 'regular_session')
-    || (value.official_session_state !== 'unknown' && value.official_trade_date === null)) {
+    || (value.official_session_state !== 'unknown' && value.official_trade_date === null)
+    || (!blocked && (value.official_calendar_verified !== true
+      || !OFFICIAL_SOURCE_HASH_RE.test(String(value.official_calendar_source_hash || ''))))
+    || (blocked && (value.official_calendar_verified !== false || value.official_calendar_source_hash !== null))) {
     throw new Error('official_calendar_contract_invalid');
   }
+  validateTaskMeaning(value);
   let reportMessage = null;
   if (value.status === 'report_ready') reportMessage = validateReportMessage(value.report_message);
   else if (value.report_message !== null) throw new Error('unexpected_report_message');
