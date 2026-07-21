@@ -48,9 +48,59 @@ function good(taskId, status = 'success', extra = {}) {
     backfill: false,
     fail_closed: blocked,
     error_class: blocked ? 'safe_block' : 'none',
+    failure_phase: 'none',
+    failure_symbol: null,
+    failure_exception_type: 'none',
+    failure_errno: null,
+    failure_attempt_number: 0,
+    transport_degraded: false,
     report_message: null,
     ...extra,
   });
+}
+
+function diagnostic() {
+  const occurredAt = '2026-07-21T00:00:00Z';
+  return JSON.stringify({
+    status: 'pass',
+    task_id: 'kis-ai-quote-transport-diagnose-v1',
+    official_trade_date: '2026-07-21',
+    occurred_at: occurredAt,
+    symbols_attempted: 3,
+    symbols_succeeded: 3,
+    failed_symbol_count: 0,
+    transport_error_class: 'none',
+    results: ['005930', '000660', '005380'].map((symbol, index) => ({
+      symbol,
+      status: 'pass',
+      phase: 'quote_parse',
+      error_class: 'none',
+      exception_type: 'none',
+      sanitized_errno: null,
+      attempt_number: index + 1,
+      occurred_at: occurredAt,
+      retry: false,
+      order_api_calls: 0,
+    })),
+    api_retries: 0,
+    order_api_calls: 0,
+    vps_live_orders: 0,
+    prod_orders: 0,
+    raw_response_persisted: false,
+    secret_exposure: false,
+    retry: false,
+  });
+}
+
+function blockedDiagnostic() {
+  const value = JSON.parse(diagnostic());
+  value.status = 'blocked';
+  value.symbols_attempted = 0;
+  value.symbols_succeeded = 0;
+  value.failed_symbol_count = 0;
+  value.transport_error_class = 'unknown_runtime_io_failed';
+  value.results = [];
+  return JSON.stringify(value);
 }
 
 function fixture(options = {}) {
@@ -68,6 +118,10 @@ function fixture(options = {}) {
   let clock = new Date('2026-07-20T23:59:00Z');
   const taskExec = options.execFile || ((c, a, o, cb) => cb(null, good(a[a.indexOf('--task-id') + 1])));
   const execFile = (command, args, execOptions, callback) => {
+    if (args.includes('ai-quote-transport-diagnose-once')) {
+      callback(null, options.diagnosticOutput || diagnostic());
+      return;
+    }
     if (args.includes('--activation-preflight')) {
       callback(null, good(mod.TASKS[0].id, 'success', { action_type: 'activation_preflight', api_calls: 2 }));
       return;
@@ -78,6 +132,8 @@ function fixture(options = {}) {
     ...paths,
     now: () => clock,
     runtimeHealthCheck: options.runtimeHealthCheck || (async () => true),
+    sourceParityCheck: options.sourceParityCheck || (() => true),
+    resumeBlockingLockPaths: options.resumeBlockingLockPaths,
     execFile,
     reportSender: options.reportSender,
     calendarProofResolver: options.calendarProofResolver || (() => calendarProof(true)),
@@ -168,6 +224,25 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_source_hash: 'sha256:fake' }), mod.TASKS[1].id, trading), /calendar/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, () => ({ isTradingDay: true, sourceHash: `sha256:${'b'.repeat(64)}` })), /proof/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'success'), mod.TASKS[3].id, trading), /task_result/);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+    failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'TimeoutError',
+    failure_errno: 110, failure_attempt_number: 1,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'transport_degraded_no_op', error_class: 'tls_failed', transport_degraded: true,
+    failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'SSLError',
+    failure_errno: null, failure_attempt_number: 1,
+  }), mod.TASKS[1].id, trading), /task_result/);
+});
+
+test('quote diagnosis parser requires sanitized exact three-of-three success', () => {
+  assert.deepEqual(mod.parseQuoteTransportDiagnosticOutput(diagnostic()), {
+    passed: true, symbolsAttempted: 3, symbolsSucceeded: 3, errorClass: 'none',
+  });
+  const unsafe = JSON.parse(diagnostic());
+  unsafe.results[0].detail = 'authorization=private';
+  assert.throws(() => mod.parseQuoteTransportDiagnosticOutput(JSON.stringify(unsafe)), /unsafe|fields|result/);
 });
 
 test('official calendar proof is bound to the versioned local snapshot', () => {
@@ -221,6 +296,79 @@ test('invalid output, blocked result, and timeout pause all tasks without retry'
     assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
     assert.equal(fs.existsSync(value.paths.runLockPath), false);
   }
+});
+
+test('one transient transport no-op stays active, success resets, and consecutive two pauses', async () => {
+  let mode = 'degraded';
+  const value = await active({ execFile(c, a, o, cb) {
+    const taskId = a[a.indexOf('--task-id') + 1];
+    if (mode === 'success') cb(null, good(taskId));
+    else cb(null, good(taskId, 'no_op', {
+      action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+      failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'TimeoutError',
+      failure_errno: 110, failure_attempt_number: 1,
+    }));
+  } });
+  value.setClock('2026-07-21T00:10:00Z');
+  let state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].consecutive_transport_failures, 1);
+  mode = 'success'; value.setClock('2026-07-21T00:20:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:20:00Z') });
+  assert.equal(state.tasks[mod.TASKS[1].id].consecutive_transport_failures, 0);
+  mode = 'degraded'; value.setClock('2026-07-21T00:30:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:30:00Z') });
+  assert.equal(state.state, 'ACTIVE');
+  value.setClock('2026-07-21T00:40:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:40:00Z') });
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+});
+
+test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: `${mod.RESUME_AFTER_IO_FIX_APPROVAL} ` }), /exact_resume/);
+  value.setClock('2026-07-21T00:11:00Z');
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(Object.values(state.tasks).every((item) => item.state === 'ACTIVE'), true);
+  assert.equal(new Date(state.tasks[mod.TASKS[1].id].next_run_at).getTime() > new Date('2026-07-21T00:11:00Z').getTime(), true);
+  assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('IO resume remains paused when health, writer lock, parity, or diagnosis fails', async () => {
+  for (const failure of ['health', 'lock', 'parity', 'diagnosis']) {
+    const lockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-resume-lock-'));
+    const blockingLock = path.join(lockRoot, 'writer.lock');
+    let resumePhase = false;
+    const value = await active({
+      runtimeHealthCheck: async () => !(resumePhase && failure === 'health'),
+      sourceParityCheck: () => failure !== 'parity',
+      resumeBlockingLockPaths: [blockingLock],
+      diagnosticOutput: failure === 'diagnosis' ? blockedDiagnostic() : diagnostic(),
+    });
+    const paused = value.task.status();
+    paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+    for (const item of Object.values(paused.tasks)) {
+      item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+    }
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+    if (failure === 'lock') fs.writeFileSync(blockingLock, 'active');
+    resumePhase = true;
+    let rejection = null;
+    try { await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }); }
+    catch (error) { rejection = error; }
+    assert.ok(rejection, `resume should reject on ${failure}`);
+    assert.equal(value.task.status().state, 'PAUSED');
+  }
+  assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/.hermes/jobs/worktrees/hermes-ai-dry-run-pr7-deploy/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
+  assert.equal(mod.defaultSourceParityCheck(), false);
 });
 
 test('state corruption faults and pauses polling without executing child', async () => {
