@@ -8,12 +8,14 @@ const path = require('node:path');
 
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const RESUME_AFTER_IO_FIX_APPROVAL = 'APPROVE_KIS_HERMES_AI_DRY_RUN_RESUME_AFTER_IO_FIX_V1';
+const ORDER_ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_VPS_AUTONOMOUS_PILOT_V1';
 const KIS_REPO = '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
 const KIS_VENV_PYTHON = '/home/ubuntu/.hermes/venvs/kis-trading-lab/bin/python';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const STRATEGY_MANIFEST = 'config/adaptive_ai_dry_run_strategy_v1.json';
 const DEFAULT_CALENDAR_SNAPSHOT_PATH = path.join(KIS_REPO, 'data/market_calendar/krx_market_calendar_snapshot_20260623_v2.json');
 const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-ai-market-open-dry-run-v1.json';
+const ORDER_ATTESTATION_DIR = '/home/ubuntu/.hermes/state/kis-vps-model-v3-attestations';
 const LEGACY_V1_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
 const LEGACY_V2_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json';
 const LEGACY_V1_RUN_LOCK_PATH = '/tmp/kis-trading-lab-prediction-validation-auto.lock';
@@ -332,9 +334,16 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
       if (!/^[a-f0-9]{32}$/.test(schedulerToken) || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) {
         throw new Error('scheduler_attestation_required');
       }
-      args.push('--scheduler-token', schedulerToken, '--due-key', invocationDueKey);
     }
-    return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO };
+    return {
+      command: KIS_VENV_PYTHON,
+      args,
+      cwd: KIS_REPO,
+      env: activationPreflight ? {} : {
+        KIS_HERMES_SCHEDULER_TOKEN: schedulerToken,
+        KIS_HERMES_DUE_KEY: invocationDueKey,
+      },
+    };
   }
   const args = ['-m', 'kis_trading_lab', 'ai-market-open-dry-run-once', '--approval', ACTIVATION_APPROVAL, '--task-id', taskId, '--strategy-manifest', STRATEGY_MANIFEST, '--db', VPS_DB_PATH];
   if (activationPreflight) args.push('--activation-preflight');
@@ -472,6 +481,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const legacyV1RunLockPath = options.legacyV1RunLockPath || LEGACY_V1_RUN_LOCK_PATH;
   const legacyV2RunLockPath = options.legacyV2RunLockPath || LEGACY_V2_RUN_LOCK_PATH;
   const runLockPath = options.runLockPath || DEFAULT_RUN_LOCK_PATH;
+  const orderAttestationDir = options.orderAttestationDir || ORDER_ATTESTATION_DIR;
   const execFile = options.execFile || defaultExecFile;
   const now = options.now || (() => new Date());
   const setTimer = options.setTimer || setTimeout;
@@ -552,7 +562,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   function execute(command) {
     return new Promise((resolve) => {
-      execFile(command.command, command.args, { cwd: command.cwd, env: process.env, timeout: execTimeoutMs, maxBuffer }, (error, stdout) => resolve({ error, stdout }));
+      execFile(command.command, command.args, {
+        cwd: command.cwd,
+        env: { ...process.env, ...(command.env || {}) },
+        timeout: execTimeoutMs,
+        maxBuffer,
+      }, (error, stdout) => resolve({ error, stdout }));
     });
   }
   async function activate({ approval, invokedBy = 'hermes_cli' } = {}) {
@@ -623,8 +638,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { if (release) release(); }
   }
-  async function enableOrderTask({ confirm = false, invokedBy = 'hermes_cli' } = {}) {
+  async function enableOrderTask({ confirm = false, approval = '', invokedBy = 'hermes_cli' } = {}) {
     if (confirm !== true) throw new Error('order_task_confirmation_required');
+    if (approval !== ORDER_ACTIVATION_APPROVAL) throw new Error('exact_order_activation_approval_required');
     const current = loadStrict();
     const prior = current.tasks[ORDER_TASK.id];
     if (current.state !== 'ACTIVE' || prior.state !== 'DISABLED') throw new Error('order_task_must_be_disabled');
@@ -701,11 +717,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       token_hash: crypto.createHash('sha256').update(schedulerToken).digest('hex'),
       expires_at: new Date(now().getTime() + (5 * 60_000)).toISOString(),
     } : null;
-    save({ ...current, tasks: { ...current.tasks, [taskId]: {
-      ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime), pending_invocation: pendingInvocation,
-    } } });
-    const command = buildCommand(taskId, { schedulerToken, dueKey: key });
+    let attestationPath = null;
     try {
+      save({ ...current, tasks: { ...current.tasks, [taskId]: {
+        ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime), pending_invocation: pendingInvocation,
+      } } });
+      if (task.kind === 'order') {
+        attestationPath = attestationFileForDueKey(key, orderAttestationDir);
+        atomicWrite(attestationPath, pendingInvocation);
+      }
+      const command = buildCommand(taskId, { schedulerToken, dueKey: key });
       const { error, stdout } = await execute(command);
       if (error && Number(error.code) !== 2) return pauseForTask(loadStrict(), error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
       let parsed;
@@ -762,7 +783,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         lastRun.status = 'report_sent'; lastRun.delivery_attempted = true; lastRun.delivery_succeeded = true;
       }
       return save({ ...latest, tasks: { ...latest.tasks, [taskId]: { ...latestTask, state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } } });
-    } finally { if (release) release(); }
+    } finally {
+      if (attestationPath) {
+        try { fs.unlinkSync(attestationPath); } catch (error) { if (error.code !== 'ENOENT') schedulerFaulted = true; }
+      }
+      if (release) release();
+    }
   }
   async function tick() {
     if (ticking || schedulerFaulted) return status();
@@ -804,12 +830,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   return { statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask, runOnce, start, stop, tick, buildCommand };
 }
 
+function attestationFileForDueKey(value, directory = ORDER_ATTESTATION_DIR) {
+  return path.join(directory, `${crypto.createHash('sha256').update(value).digest('hex')}.json`);
+}
+
 async function cli(argv = process.argv.slice(2)) {
   const task = createKisAiMarketOpenDryRunTask(); const action = argv[0] || 'status';
+  const approvalIndex = argv.indexOf('--approval');
+  const approval = approvalIndex >= 0 ? argv[approvalIndex + 1] : '';
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'enable-order' ? await task.enableOrderTask({ confirm: argv[1] === '--confirm', invokedBy: 'hermes_cli' })
+    : action === 'enable-order' ? await task.enableOrderTask({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()
     : action === 'start' ? task.start()
     : action === 'stop' ? task.stop()
@@ -820,7 +852,9 @@ async function cli(argv = process.argv.slice(2)) {
 if (require.main === module) cli().catch((error) => { process.stderr.write(`${safeText(error.message, 100)}\n`); process.exitCode = 1; });
 
 module.exports = {
-  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, KIS_REPO, KIS_VENV_PYTHON, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
+  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, ORDER_ACTIVATION_APPROVAL,
+  KIS_REPO, KIS_VENV_PYTHON, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
+  ORDER_ATTESTATION_DIR,
   APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
   TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, TASKS,

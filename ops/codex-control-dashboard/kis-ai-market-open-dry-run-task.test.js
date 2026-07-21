@@ -142,6 +142,7 @@ function fixture(options = {}) {
     legacyV1RunLockPath: path.join(root, 'v1.lock'),
     legacyV2RunLockPath: path.join(root, 'v2.lock'),
     runLockPath: path.join(root, 'ai.lock'),
+    orderAttestationDir: path.join(root, 'attestations'),
   };
   fs.writeFileSync(paths.legacyV1StatePath, JSON.stringify({ state: 'PAUSED', next_run_at: null }));
   fs.writeFileSync(paths.legacyV2StatePath, JSON.stringify({ state: 'PAUSED', next_run_at: null }));
@@ -210,10 +211,9 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '1'.repeat(32), dueKey });
   assert.equal(command.command, mod.KIS_VENV_PYTHON);
   assert.equal(command.cwd, mod.KIS_REPO);
-  assert.deepEqual(command.args, [
-    '-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once',
-    '--scheduler-token', '1'.repeat(32), '--due-key', dueKey,
-  ]);
+  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once']);
+  assert.equal(command.env.KIS_HERMES_SCHEDULER_TOKEN, '1'.repeat(32));
+  assert.equal(command.env.KIS_HERMES_DUE_KEY, dueKey);
   assert.equal(command.args.includes('--approval'), false);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
 });
@@ -245,7 +245,9 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
 test('explicit enable check activates only the fifth order task without creating a scheduler', async () => {
   const value = await active();
   await assert.rejects(value.task.enableOrderTask(), /confirmation/);
-  const state = await value.task.enableOrderTask({ confirm: true });
+  await assert.rejects(value.task.enableOrderTask({ confirm: true, approval: 'wrong' }), /exact_order_activation/);
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'DISABLED');
+  const state = await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -260,7 +262,7 @@ test('blocked autonomous order pauses only the order task and leaves dry-run tas
     if (args.includes('vps-autonomous-order')) callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked'));
     else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
-  await value.task.enableOrderTask({ confirm: true });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   value.setClock(due);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
@@ -278,7 +280,7 @@ test('invalid autonomous output pauses only the order task without retry', async
       callback(null, '{"unsafe":"output"}');
     } else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
-  await value.task.enableOrderTask({ confirm: true });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
   assert.equal(runCalls, 1);
@@ -293,12 +295,13 @@ test('order invocation uses one-time hashed scheduler attestation and clears pen
   let invocationDueKey;
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
-      schedulerToken = args[args.indexOf('--scheduler-token') + 1];
-      invocationDueKey = args[args.indexOf('--due-key') + 1];
+      schedulerToken = options.env.KIS_HERMES_SCHEDULER_TOKEN;
+      invocationDueKey = options.env.KIS_HERMES_DUE_KEY;
+      assert.equal(args.includes(schedulerToken), false);
       callback(null, orderGood());
     } else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
-  await value.task.enableOrderTask({ confirm: true });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   value.setClock(due);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
@@ -314,7 +317,7 @@ test('artifact hash drift pauses only the order task', async () => {
     if (args.includes('vps-autonomous-order')) callback(null, orderGood('no_op', { artifact_hash: 'b'.repeat(64) }));
     else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
-  await value.task.enableOrderTask({ confirm: true });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   value.setClock(due);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
