@@ -9,6 +9,7 @@ const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const KIS_REPO = '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const STRATEGY_MANIFEST = 'config/adaptive_ai_dry_run_strategy_v1.json';
+const DEFAULT_CALENDAR_SNAPSHOT_PATH = path.join(KIS_REPO, 'data/market_calendar/krx_market_calendar_snapshot_20260623_v2.json');
 const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-ai-market-open-dry-run-v1.json';
 const LEGACY_V1_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
 const LEGACY_V2_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json';
@@ -127,7 +128,22 @@ function validateTaskMeaning(value) {
   }
 }
 
-function parseKisAiMarketOpenOutput(stdout, expectedTaskId) {
+function loadOfficialCalendarProof(tradeDate, calendarSnapshotPath = DEFAULT_CALENDAR_SNAPSHOT_PATH) {
+  let payload;
+  try { payload = JSON.parse(fs.readFileSync(calendarSnapshotPath, 'utf8')); }
+  catch { throw new Error('official_calendar_proof_unavailable'); }
+  const metadata = payload?.metadata;
+  if (!metadata || metadata.source_type !== 'official' || metadata.environment !== 'live_candidate'
+    || metadata.is_official !== true || metadata.valid_for_live_manual_run !== true
+    || metadata.timezone !== TIMEZONE || !OFFICIAL_SOURCE_HASH_RE.test(String(metadata.source_hash || ''))
+    || !Array.isArray(payload.sessions)) throw new Error('official_calendar_proof_invalid');
+  const matches = payload.sessions.filter((item) => item?.trade_date === tradeDate);
+  if (matches.length !== 1 || typeof matches[0].is_trading_day !== 'boolean'
+    || matches[0].source_hash !== metadata.source_hash) throw new Error('official_calendar_proof_invalid');
+  return Object.freeze({ isTradingDay: matches[0].is_trading_day, sourceHash: metadata.source_hash });
+}
+
+function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolver = loadOfficialCalendarProof) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_or_oversized_output');
   let value;
@@ -154,6 +170,13 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId) {
       || !OFFICIAL_SOURCE_HASH_RE.test(String(value.official_calendar_source_hash || ''))))
     || (blocked && (value.official_calendar_verified !== false || value.official_calendar_source_hash !== null))) {
     throw new Error('official_calendar_contract_invalid');
+  }
+  if (!blocked) {
+    let proof;
+    try { proof = calendarProofResolver(value.official_trade_date); }
+    catch { throw new Error('official_calendar_proof_invalid'); }
+    if (!proof || proof.sourceHash !== value.official_calendar_source_hash
+      || proof.isTradingDay !== !marketClosed) throw new Error('official_calendar_proof_invalid');
   }
   validateTaskMeaning(value);
   let reportMessage = null;
@@ -237,6 +260,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const clearTimer = options.clearTimer || clearTimeout;
   const runtimeHealthCheck = options.runtimeHealthCheck || defaultRuntimeHealthCheck;
   const reportSender = options.reportSender || null;
+  const calendarProofResolver = options.calendarProofResolver || loadOfficialCalendarProof;
   const schedulerRegistered = options.schedulerRegistered === true;
   const serverRegistered = options.serverRegistered === true;
   const execTimeoutMs = Math.min(Number(options.execTimeoutMs || EXEC_TIMEOUT_MS), EXEC_TIMEOUT_MS);
@@ -295,7 +319,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const command = buildCommand(TASKS[0].id, { activationPreflight: true });
       const { error, stdout } = await execute(command);
       if (error) throw new Error('activation_preflight_process_error');
-      const parsed = parseKisAiMarketOpenOutput(stdout, TASKS[0].id);
+      const parsed = parseKisAiMarketOpenOutput(stdout, TASKS[0].id, calendarProofResolver);
       if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_preflight') throw new Error('activation_preflight_failed');
       const activatedAt = now();
       const tasks = Object.fromEntries(TASKS.map((task) => [task.id, { ...(current.tasks[task.id] || {}), state: 'ACTIVE', schedule: task.schedule, next_run_at: nextRunAt(task, activatedAt), last_due_at: current.tasks[task.id]?.last_due_at || null, last_run: task.id === TASKS[0].id ? { status: 'success', action_type: 'activation_preflight', fail_closed: false, invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString() } : current.tasks[task.id]?.last_run || null }]));
@@ -335,7 +359,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const { error, stdout } = await execute(command);
       if (error && Number(error.code) !== 2) return pauseAll(loadStrict(), taskId, error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
       let parsed;
-      try { parsed = parseKisAiMarketOpenOutput(stdout, taskId); }
+      try { parsed = parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver); }
       catch (parseError) { return pauseAll(loadStrict(), taskId, safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true }); }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
       const lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
@@ -377,7 +401,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   function schedule() {
     if (!timer || schedulerFaulted) return;
-    timer = setTimer(() => { tick().finally(() => { if (!schedulerFaulted && status().state === 'ACTIVE') schedule(); }); }, POLL_INTERVAL_MS);
+    timer = setTimer(() => { tick().finally(() => { if (!schedulerFaulted) schedule(); }); }, POLL_INTERVAL_MS);
     if (typeof timer.unref === 'function') timer.unref();
   }
   function start() {
@@ -405,8 +429,8 @@ async function cli(argv = process.argv.slice(2)) {
 if (require.main === module) cli().catch((error) => { process.stderr.write(`${safeText(error.message, 100)}\n`); process.exitCode = 1; });
 
 module.exports = {
-  ACTIVATION_APPROVAL, KIS_REPO, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH,
+  ACTIVATION_APPROVAL, KIS_REPO, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
   TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, TASKS,
-  parseKisAiMarketOpenOutput, nextRunAt, buildCommand, createKisAiMarketOpenDryRunTask,
+  parseKisAiMarketOpenOutput, loadOfficialCalendarProof, nextRunAt, buildCommand, createKisAiMarketOpenDryRunTask,
 };

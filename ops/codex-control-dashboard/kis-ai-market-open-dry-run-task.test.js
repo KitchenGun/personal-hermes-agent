@@ -6,6 +6,11 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const mod = require('./kis-ai-market-open-dry-run-task');
+const CALENDAR_HASH = `sha256:${'a'.repeat(64)}`;
+
+function calendarProof(isTradingDay = true) {
+  return { isTradingDay, sourceHash: CALENDAR_HASH };
+}
 
 function good(taskId, status = 'success', extra = {}) {
   const defaultAction = {
@@ -22,7 +27,7 @@ function good(taskId, status = 'success', extra = {}) {
     official_trade_date: blocked ? null : '2026-07-21',
     official_session_state: blocked ? 'unknown' : 'regular_session',
     official_calendar_verified: !blocked,
-    official_calendar_source_hash: blocked ? null : `sha256:${'a'.repeat(64)}`,
+    official_calendar_source_hash: blocked ? null : CALENDAR_HASH,
     api_calls: 0,
     quote_api_calls: 0,
     decisions: 0,
@@ -75,6 +80,7 @@ function fixture(options = {}) {
     runtimeHealthCheck: options.runtimeHealthCheck || (async () => true),
     execFile,
     reportSender: options.reportSender,
+    calendarProofResolver: options.calendarProofResolver || (() => calendarProof(true)),
     schedulerRegistered: options.schedulerRegistered,
     serverRegistered: options.serverRegistered,
     setTimer: options.setTimer,
@@ -124,19 +130,58 @@ test('next runs skip catch-up and retain 14:40/14:50 monitor slots', () => {
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:51:00Z')), '2026-07-22T00:10:00.000Z');
 });
 
+test('server polling survives DISABLED state and adopts later CLI activation', async () => {
+  const callbacks = [];
+  let scheduledRuns = 0;
+  const value = fixture({
+    schedulerRegistered: true,
+    serverRegistered: true,
+    setTimer(fn) { callbacks.push(fn); return { unref() {} }; },
+    clearTimer() {},
+    execFile(c, a, o, cb) { scheduledRuns += 1; cb(null, good(a[a.indexOf('--task-id') + 1])); },
+  });
+  value.task.prepareDisabled();
+  value.task.start();
+  callbacks.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(callbacks.length, 1);
+  await value.task.activate({ approval: mod.ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:31Z');
+  callbacks.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduledRuns, 1);
+  assert.equal(value.task.status().state, 'ACTIVE');
+});
+
 test('strict command and output contract reject drift and unsafe fields', () => {
   const command = mod.buildCommand(mod.TASKS[1].id);
   assert.equal(command.command, 'python3'); assert.equal(command.cwd, mod.KIS_REPO);
   assert.equal(command.args.includes('--activation-preflight'), false);
-  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id));
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { unknown: 1 }), mod.TASKS[1].id), /fields/);
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { fail_closed: undefined }), mod.TASKS[1].id), /fields|boolean/);
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { report_message: 'app_secret=x' }), mod.TASKS[1].id), /unsafe/);
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_session_state: 'closed' }), mod.TASKS[1].id), /calendar/);
-  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', { action_type: 'market_closed_no_op', official_session_state: 'closed' }), mod.TASKS[1].id));
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_verified: false }), mod.TASKS[1].id), /calendar/);
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_source_hash: 'sha256:fake' }), mod.TASKS[1].id), /calendar/);
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'success'), mod.TASKS[3].id), /task_result/);
+  const trading = () => calendarProof(true);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { unknown: 1 }), mod.TASKS[1].id, trading), /fields/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { fail_closed: undefined }), mod.TASKS[1].id, trading), /fields|boolean/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { report_message: 'app_secret=x' }), mod.TASKS[1].id, trading), /unsafe/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_session_state: 'closed' }), mod.TASKS[1].id, trading), /calendar/);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', { action_type: 'market_closed_no_op', official_session_state: 'closed' }), mod.TASKS[1].id, () => calendarProof(false)));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_verified: false }), mod.TASKS[1].id, trading), /calendar/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { official_calendar_source_hash: 'sha256:fake' }), mod.TASKS[1].id, trading), /calendar/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, () => ({ isTradingDay: true, sourceHash: `sha256:${'b'.repeat(64)}` })), /proof/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'success'), mod.TASKS[3].id, trading), /task_result/);
+});
+
+test('official calendar proof is bound to the versioned local snapshot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-calendar-'));
+  const snapshot = path.join(root, 'calendar.json');
+  const payload = {
+    metadata: { source_type: 'official', environment: 'live_candidate', is_official: true, valid_for_live_manual_run: true, timezone: 'Asia/Seoul', source_hash: CALENDAR_HASH },
+    sessions: [{ trade_date: '2026-07-21', is_trading_day: true, source_hash: CALENDAR_HASH }],
+  };
+  fs.writeFileSync(snapshot, JSON.stringify(payload));
+  assert.deepEqual(mod.loadOfficialCalendarProof('2026-07-21', snapshot), calendarProof(true));
+  payload.sessions[0].source_hash = `sha256:${'b'.repeat(64)}`;
+  fs.writeFileSync(snapshot, JSON.stringify(payload));
+  assert.throws(() => mod.loadOfficialCalendarProof('2026-07-21', snapshot), /proof/);
 });
 
 test('missed slot is not executed but advances so the next slot runs once', async () => {
