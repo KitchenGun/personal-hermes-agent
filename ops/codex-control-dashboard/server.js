@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
 const kisPredictionValidationTask = require('./kis-prediction-validation-task');
 const kisPredictionV2ValidationTask = require('./kis-prediction-v2-validation-task');
+const kisAiMarketOpenDryRunTask = require('./kis-ai-market-open-dry-run-task');
 const discordRelay = require('./discord-relay');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
@@ -67,6 +68,11 @@ const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPrediction
 const kisPredictionV2TaskRuntime = kisPredictionV2ValidationTask.createKisPredictionV2ValidationTask({
   schedulerRegistered: true,
   serverRegistered: true,
+});
+const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarketOpenDryRunTask({
+  schedulerRegistered: true,
+  serverRegistered: true,
+  reportSender: sendKisReportViaDiscordRelay,
 });
 
 if (!CONTROL_SHARED_SECRET) {
@@ -2415,6 +2421,15 @@ async function apiKisPredictionV2Validation(req, res) {
   errJson(res, 404, 'not found');
 }
 
+function apiKisAiMarketOpenDryRun(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method === 'GET' && url.pathname === '/api/kis/ai-market-open-dry-run/status') {
+    okJson(res, { ok: true, ...kisAiMarketOpenDryRunRuntime.status() });
+    return;
+  }
+  errJson(res, 404, 'not found');
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -2474,6 +2489,10 @@ const server = http.createServer(async (req, res) => {
       await apiKisPredictionV2Validation(req, res);
       return;
     }
+    if (req.url.startsWith('/api/kis/ai-market-open-dry-run')) {
+      apiKisAiMarketOpenDryRun(req, res);
+      return;
+    }
     if (req.url.startsWith('/api/kis/report')) {
       await apiKisReport(req, res);
       return;
@@ -2512,6 +2531,11 @@ if (require.main === module) {
       } catch (error) {
         console.error(`kis prediction v2 validation scheduler start failed: ${error.message || String(error)}`);
       }
+      try {
+        kisAiMarketOpenDryRunRuntime.start();
+      } catch (error) {
+        console.error(`kis ai market open dry run scheduler start failed: ${error.message || String(error)}`);
+      }
   });
 }
 
@@ -2534,5 +2558,7 @@ module.exports = {
     kisReportDelivery,
     kisPredictionValidationTask,
     kisPredictionTaskRuntime,
+    kisAiMarketOpenDryRunTask,
+    kisAiMarketOpenDryRunRuntime,
   },
 };
