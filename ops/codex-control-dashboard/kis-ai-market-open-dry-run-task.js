@@ -27,10 +27,7 @@ const RESUME_BLOCKING_LOCK_PATHS = Object.freeze([
   '/tmp/kis-trading-lab-vps-order.lock',
   '/tmp/kis-trading-lab-vps-preflight-only-0910.lock',
 ]);
-const ALLOWED_SOURCE_TASK_ROOTS = Object.freeze([
-  '/home/ubuntu/work/personal-hermes-agent/',
-  '/home/ubuntu/.hermes/jobs/worktrees/',
-]);
+const APPROVED_SOURCE_TASK_PATH = '/home/ubuntu/.hermes/jobs/worktrees/hermes-ai-dry-run-pr7-deploy/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
 const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
@@ -313,16 +310,14 @@ function fileSha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-function defaultSourceParityCheck(sourceTaskPath) {
-  if (typeof sourceTaskPath !== 'string' || !path.isAbsolute(sourceTaskPath)) return false;
+function defaultSourceParityCheck() {
   let sourceRealPath;
   let runtimeRealPath;
   try {
-    sourceRealPath = fs.realpathSync(sourceTaskPath);
+    sourceRealPath = fs.realpathSync(APPROVED_SOURCE_TASK_PATH);
     runtimeRealPath = fs.realpathSync(__filename);
   } catch { return false; }
   if (sourceRealPath === runtimeRealPath
-    || !ALLOWED_SOURCE_TASK_ROOTS.some((root) => sourceRealPath.startsWith(root))
     || !fs.statSync(sourceRealPath).isFile()) return false;
   return fileSha256(sourceRealPath) === fileSha256(runtimeRealPath);
 }
@@ -462,7 +457,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       return save({ ...current, state: 'ACTIVE', activated_at: activatedAt.toISOString(), activated_by: safeText(invokedBy), scheduler_registered: false, server_registered: false, tasks });
     } finally { if (release) release(); }
   }
-  async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli', sourceTaskPath } = {}) {
+  async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== RESUME_AFTER_IO_FIX_APPROVAL) throw new Error('exact_resume_approval_required');
     const current = loadStrict();
     if (current.state !== 'PAUSED' || !RESUMABLE_PAUSE_REASONS.has(current.pause_reason)) throw new Error('task_not_resumable');
@@ -472,7 +467,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (sourceParityCheck(sourceTaskPath) !== true) throw new Error('runtime_source_parity_failed');
+      if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
       const { error, stdout } = await execute(buildDiagnosticCommand());
       if (error) throw new Error('quote_transport_diagnosis_process_error');
       const diagnostic = parseQuoteTransportDiagnosticOutput(stdout);
@@ -603,7 +598,7 @@ async function cli(argv = process.argv.slice(2)) {
   const task = createKisAiMarketOpenDryRunTask(); const action = argv[0] || 'status';
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], sourceTaskPath: argv[3], invokedBy: 'hermes_cli' })
+    : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()
     : action === 'start' ? task.start()
     : action === 'stop' ? task.stop()
@@ -615,6 +610,7 @@ if (require.main === module) cli().catch((error) => { process.stderr.write(`${sa
 
 module.exports = {
   ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, KIS_REPO, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
+  APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
   TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, TASKS,
   parseKisAiMarketOpenOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,

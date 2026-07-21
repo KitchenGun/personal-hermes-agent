@@ -92,6 +92,17 @@ function diagnostic() {
   });
 }
 
+function blockedDiagnostic() {
+  const value = JSON.parse(diagnostic());
+  value.status = 'blocked';
+  value.symbols_attempted = 0;
+  value.symbols_succeeded = 0;
+  value.failed_symbol_count = 0;
+  value.transport_error_class = 'unknown_runtime_io_failed';
+  value.results = [];
+  return JSON.stringify(value);
+}
+
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-ai-'));
   const paths = {
@@ -122,6 +133,7 @@ function fixture(options = {}) {
     now: () => clock,
     runtimeHealthCheck: options.runtimeHealthCheck || (async () => true),
     sourceParityCheck: options.sourceParityCheck || (() => true),
+    resumeBlockingLockPaths: options.resumeBlockingLockPaths,
     execFile,
     reportSender: options.reportSender,
     calendarProofResolver: options.calendarProofResolver || (() => calendarProof(true)),
@@ -321,13 +333,42 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
     item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
   }
   fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
-  await assert.rejects(value.task.resumeAfterIoFix({ approval: `${mod.RESUME_AFTER_IO_FIX_APPROVAL} `, sourceTaskPath: __filename }), /exact_resume/);
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: `${mod.RESUME_AFTER_IO_FIX_APPROVAL} ` }), /exact_resume/);
   value.setClock('2026-07-21T00:11:00Z');
-  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL, sourceTaskPath: __filename });
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'ACTIVE'), true);
   assert.equal(new Date(state.tasks[mod.TASKS[1].id].next_run_at).getTime() > new Date('2026-07-21T00:11:00Z').getTime(), true);
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('IO resume remains paused when health, writer lock, parity, or diagnosis fails', async () => {
+  for (const failure of ['health', 'lock', 'parity', 'diagnosis']) {
+    const lockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-resume-lock-'));
+    const blockingLock = path.join(lockRoot, 'writer.lock');
+    let resumePhase = false;
+    const value = await active({
+      runtimeHealthCheck: async () => !(resumePhase && failure === 'health'),
+      sourceParityCheck: () => failure !== 'parity',
+      resumeBlockingLockPaths: [blockingLock],
+      diagnosticOutput: failure === 'diagnosis' ? blockedDiagnostic() : diagnostic(),
+    });
+    const paused = value.task.status();
+    paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+    for (const item of Object.values(paused.tasks)) {
+      item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+    }
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+    if (failure === 'lock') fs.writeFileSync(blockingLock, 'active');
+    resumePhase = true;
+    let rejection = null;
+    try { await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }); }
+    catch (error) { rejection = error; }
+    assert.ok(rejection, `resume should reject on ${failure}`);
+    assert.equal(value.task.status().state, 'PAUSED');
+  }
+  assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/.hermes/jobs/worktrees/hermes-ai-dry-run-pr7-deploy/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
+  assert.equal(mod.defaultSourceParityCheck(), false);
 });
 
 test('state corruption faults and pauses polling without executing child', async () => {
