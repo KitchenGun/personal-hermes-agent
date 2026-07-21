@@ -9,6 +9,7 @@ const path = require('node:path');
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const RESUME_AFTER_IO_FIX_APPROVAL = 'APPROVE_KIS_HERMES_AI_DRY_RUN_RESUME_AFTER_IO_FIX_V1';
 const KIS_REPO = '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
+const KIS_VENV_PYTHON = '/home/ubuntu/.hermes/venvs/kis-trading-lab/bin/python';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const STRATEGY_MANIFEST = 'config/adaptive_ai_dry_run_strategy_v1.json';
 const DEFAULT_CALENDAR_SNAPSHOT_PATH = path.join(KIS_REPO, 'data/market_calendar/krx_market_calendar_snapshot_20260623_v2.json');
@@ -27,7 +28,7 @@ const RESUME_BLOCKING_LOCK_PATHS = Object.freeze([
   '/tmp/kis-trading-lab-vps-order.lock',
   '/tmp/kis-trading-lab-vps-preflight-only-0910.lock',
 ]);
-const APPROVED_SOURCE_TASK_PATH = '/home/ubuntu/.hermes/jobs/worktrees/hermes-ai-dry-run-pr7-deploy/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
+const APPROVED_SOURCE_TASK_PATH = '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
 const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
@@ -52,12 +53,15 @@ const FAILURE_EXCEPTION_TYPES = new Set([
   'OSError', 'RuntimeError', 'ContractError',
 ]);
 const TASKS = Object.freeze([
-  { id: 'kis-ai-market-open-supervisor-v1', schedule: 'weekdays 09:00 KST', minutes: [540] },
-  { id: 'kis-ai-intraday-shadow-validation-v1', schedule: 'weekdays 09:10-14:50 KST every 10m', minutes: Array.from({ length: 35 }, (_, i) => 550 + (i * 10)) },
-  { id: 'kis-ai-post-close-learning-v1', schedule: 'weekdays 15:40 KST', minutes: [940] },
-  { id: 'kis-ai-daily-learning-report-v1', schedule: 'weekdays 16:30 KST', minutes: [990] },
+  { id: 'kis-ai-market-open-supervisor-v1', kind: 'dry_run', schedule: 'weekdays 09:00 KST', minutes: [540] },
+  { id: 'kis-ai-intraday-shadow-validation-v1', kind: 'dry_run', schedule: 'weekdays 09:10-14:50 KST every 10m', minutes: Array.from({ length: 35 }, (_, i) => 550 + (i * 10)) },
+  { id: 'kis-ai-post-close-learning-v1', kind: 'dry_run', schedule: 'weekdays 15:40 KST', minutes: [940] },
+  { id: 'kis-ai-daily-learning-report-v1', kind: 'dry_run', schedule: 'weekdays 16:30 KST', minutes: [990] },
+  { id: 'kis-vps-model-v3-autonomous-pilot-v1', kind: 'order', schedule: 'weekdays 09:15-14:55 KST every 10m and 16:20 KST', minutes: [...Array.from({ length: 35 }, (_, i) => 555 + (i * 10)), 980] },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
+const DRY_RUN_TASKS = Object.freeze(TASKS.filter((task) => task.kind === 'dry_run'));
+const ORDER_TASK = TASKS.find((task) => task.kind === 'order');
 const ACTIVE_STATUSES = new Set(['success', 'no_op', 'waiting', 'report_ready']);
 const ALL_STATUSES = new Set([...ACTIVE_STATUSES, 'blocked']);
 const OUTPUT_KEYS = new Set([
@@ -82,6 +86,18 @@ const BOOLEAN_KEYS = new Set([
 ]);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret)/i;
 const OFFICIAL_SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
+const ORDER_OUTPUT_KEYS = new Set([
+  'task_id', 'status', 'action_type', 'official_trade_date', 'order_api_calls',
+  'vps_live_orders', 'prod_orders', 'reconciliations', 'open_positions', 'daily_entry_count',
+  'artifact_reused', 'artifact_hash', 'shadow_predictions_inserted', 'shadow_duplicates_skipped',
+  'model_v2_changed', 'scheduler_changed', 'retry', 'catch_up', 'backfill', 'fail_closed',
+  'error_class', 'raw_response_persisted', 'secret_exposure',
+]);
+const ORDER_ACTIONS = new Set([
+  'activation_check', 'entry_reconciled', 'exit_reconciled', 'position_held',
+  'no_candidate_no_op', 'entry_window_closed_no_op', 'market_closed_no_op',
+  'waiting_regular_session', 'waiting_post_close', 'shadow_refreshed', 'idempotent_no_op', 'paused',
+]);
 
 function seoulParts(date) {
   const values = new Intl.DateTimeFormat('en-US', {
@@ -242,8 +258,84 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   });
 }
 
-function buildCommand(taskId, { activationPreflight = false } = {}) {
+function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
+  const raw = String(stdout || '');
+  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_order_output');
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new Error('invalid_order_json'); }
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== ORDER_OUTPUT_KEYS.size
+    || [...ORDER_OUTPUT_KEYS].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    throw new Error('invalid_order_output_fields');
+  }
+  if (value.task_id !== expectedTaskId || expectedTaskId !== ORDER_TASK.id
+    || !['success', 'no_op', 'blocked'].includes(value.status)
+    || !ORDER_ACTIONS.has(value.action_type)
+    || typeof value.error_class !== 'string'
+    || !(value.official_trade_date === null || /^\d{4}-\d{2}-\d{2}$/.test(value.official_trade_date))) {
+    throw new Error('invalid_order_output_contract');
+  }
+  const counts = [
+    'order_api_calls', 'vps_live_orders', 'prod_orders', 'reconciliations', 'open_positions',
+    'daily_entry_count', 'shadow_predictions_inserted', 'shadow_duplicates_skipped',
+  ];
+  if (counts.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)
+    || value.order_api_calls > 1 || value.vps_live_orders > 1 || value.prod_orders !== 0
+    || value.reconciliations > 1 || value.open_positions > 1 || value.daily_entry_count > 1) {
+    throw new Error('unsafe_order_count');
+  }
+  const booleans = [
+    'artifact_reused', 'model_v2_changed', 'scheduler_changed', 'retry', 'catch_up', 'backfill',
+    'fail_closed', 'raw_response_persisted', 'secret_exposure',
+  ];
+  if (booleans.some((key) => typeof value[key] !== 'boolean')
+    || value.artifact_reused !== true || value.model_v2_changed !== false
+    || value.scheduler_changed !== false || value.retry !== false || value.catch_up !== false
+    || value.backfill !== false || value.raw_response_persisted !== false || value.secret_exposure !== false) {
+    throw new Error('unsafe_order_output');
+  }
+  const artifactHash = value.artifact_hash;
+  if (!(artifactHash === null || /^[a-f0-9]{64}$/.test(artifactHash))
+    || (value.status !== 'blocked' && artifactHash === null)) throw new Error('invalid_order_artifact_hash');
+  const blocked = value.status === 'blocked';
+  if (value.fail_closed !== blocked
+    || (blocked && (value.action_type !== 'paused' || value.error_class === 'none'))
+    || (!blocked && value.error_class !== 'none')) throw new Error('invalid_order_fail_closed_contract');
+  if (['entry_reconciled', 'exit_reconciled'].includes(value.action_type)) {
+    if (value.status !== 'success' || value.order_api_calls !== 1
+      || value.vps_live_orders !== 1 || value.reconciliations !== 1) throw new Error('invalid_order_execution_contract');
+  } else if (!blocked && (value.order_api_calls !== 0 || value.vps_live_orders !== 0 || value.reconciliations !== 0)) {
+    throw new Error('unexpected_order_execution');
+  }
+  return Object.freeze({
+    status: value.status,
+    failClosed: value.fail_closed,
+    officialTradeDate: value.official_trade_date,
+    actionType: safeText(value.action_type, 60),
+    errorClass: safeText(value.error_class, 80),
+    orderApiCalls: value.order_api_calls,
+    vpsLiveOrders: value.vps_live_orders,
+    reconciliations: value.reconciliations,
+    openPositions: value.open_positions,
+    dailyEntryCount: value.daily_entry_count,
+    artifactHash,
+    shadowPredictionsInserted: value.shadow_predictions_inserted,
+  });
+}
+
+function buildCommand(taskId, { activationPreflight = false, schedulerToken = '', dueKey: invocationDueKey = '' } = {}) {
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
+  if (taskId === ORDER_TASK.id) {
+    const action = activationPreflight ? 'activation-check' : 'run-once';
+    const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
+    if (!activationPreflight) {
+      if (!/^[a-f0-9]{32}$/.test(schedulerToken) || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) {
+        throw new Error('scheduler_attestation_required');
+      }
+      args.push('--scheduler-token', schedulerToken, '--due-key', invocationDueKey);
+    }
+    return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO };
+  }
   const args = ['-m', 'kis_trading_lab', 'ai-market-open-dry-run-once', '--approval', ACTIVATION_APPROVAL, '--task-id', taskId, '--strategy-manifest', STRATEGY_MANIFEST, '--db', VPS_DB_PATH];
   if (activationPreflight) args.push('--activation-preflight');
   return { command: 'python3', args, cwd: KIS_REPO };
@@ -398,13 +490,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let schedulerFaulted = false;
 
   function disabledState() {
-    return { state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0 }])) };
+    return { state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null }])) };
   }
   function loadStrict() {
     try {
       const value = JSON.parse(fs.readFileSync(statePath, 'utf8'));
       if (!value || typeof value !== 'object' || Array.isArray(value) || !value.tasks
-        || TASKS.some((task) => !value.tasks[task.id])) throw new Error('state_contract_invalid');
+        || DRY_RUN_TASKS.some((task) => !value.tasks[task.id])) throw new Error('state_contract_invalid');
+      if (!value.tasks[ORDER_TASK.id]) {
+        value.tasks[ORDER_TASK.id] = {
+          state: 'DISABLED', schedule: ORDER_TASK.schedule, next_run_at: null,
+          last_due_at: null, last_run: null, consecutive_transport_failures: 0,
+          pending_invocation: null, activation_artifact_hash: null,
+        };
+      }
       return value;
     } catch (error) {
       if (error.code === 'ENOENT') return disabledState();
@@ -433,6 +532,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }));
     return save({ ...current, state: 'PAUSED', pause_reason: reason, scheduler_registered: false, server_registered: false, tasks });
   }
+  function pauseOrder(current, reason, lastRun) {
+    const prior = current.tasks[ORDER_TASK.id];
+    return save({
+      ...current,
+      order_pause_reason: reason,
+      tasks: {
+        ...current.tasks,
+        [ORDER_TASK.id]: {
+          ...prior,
+          state: 'PAUSED',
+          pause_reason: reason,
+          next_run_at: null,
+          last_run: lastRun,
+          pending_invocation: null,
+        },
+      },
+    });
+  }
   function execute(command) {
     return new Promise((resolve) => {
       execFile(command.command, command.args, { cwd: command.cwd, env: process.env, timeout: execTimeoutMs, maxBuffer }, (error, stdout) => resolve({ error, stdout }));
@@ -453,7 +570,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const parsed = parseKisAiMarketOpenOutput(stdout, TASKS[0].id, calendarProofResolver);
       if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_preflight') throw new Error('activation_preflight_failed');
       const activatedAt = now();
-      const tasks = Object.fromEntries(TASKS.map((task) => [task.id, { ...(current.tasks[task.id] || {}), state: 'ACTIVE', schedule: task.schedule, next_run_at: nextRunAt(task, activatedAt), last_due_at: current.tasks[task.id]?.last_due_at || null, last_run: task.id === TASKS[0].id ? { status: 'success', action_type: 'activation_preflight', fail_closed: false, invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString() } : current.tasks[task.id]?.last_run || null }]));
+      const tasks = Object.fromEntries(TASKS.map((task) => [task.id, {
+        ...(current.tasks[task.id] || {}),
+        state: task.kind === 'order' ? 'DISABLED' : 'ACTIVE',
+        schedule: task.schedule,
+        next_run_at: task.kind === 'order' ? null : nextRunAt(task, activatedAt),
+        last_due_at: current.tasks[task.id]?.last_due_at || null,
+        last_run: task.id === TASKS[0].id ? { status: 'success', action_type: 'activation_preflight', fail_closed: false, invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString() } : current.tasks[task.id]?.last_run || null,
+      }]));
       return save({ ...current, state: 'ACTIVE', activated_at: activatedAt.toISOString(), activated_by: safeText(invokedBy), scheduler_registered: false, server_registered: false, tasks });
     } finally { if (release) release(); }
   }
@@ -477,9 +601,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const prior = current.tasks[task.id] || {};
         return [task.id, {
           ...prior,
-          state: 'ACTIVE',
+          state: task.kind === 'order' ? 'DISABLED' : 'ACTIVE',
           pause_reason: undefined,
-          next_run_at: nextRunAt(task, resumedAt),
+          next_run_at: task.kind === 'order' ? null : nextRunAt(task, resumedAt),
           consecutive_transport_failures: 0,
         }];
       }));
@@ -499,6 +623,48 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { if (release) release(); }
   }
+  async function enableOrderTask({ confirm = false, invokedBy = 'hermes_cli' } = {}) {
+    if (confirm !== true) throw new Error('order_task_confirmation_required');
+    const current = loadStrict();
+    const prior = current.tasks[ORDER_TASK.id];
+    if (current.state !== 'ACTIVE' || prior.state !== 'DISABLED') throw new Error('order_task_must_be_disabled');
+    let release;
+    try {
+      release = acquireExclusiveLock(runLockPath);
+      assertLegacyPaused();
+      assertNoResumeBlockingLocks();
+      if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
+      const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
+      if (error) throw new Error('order_activation_check_process_error');
+      const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id);
+      if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_check') {
+        throw new Error('order_activation_check_failed');
+      }
+      const activatedAt = now();
+      return save({
+        ...current,
+        order_pause_reason: undefined,
+        order_activated_at: activatedAt.toISOString(),
+        order_activated_by: safeText(invokedBy),
+        tasks: {
+          ...current.tasks,
+          [ORDER_TASK.id]: {
+            ...prior,
+            state: 'ACTIVE',
+            pause_reason: undefined,
+            schedule: ORDER_TASK.schedule,
+            next_run_at: nextRunAt(ORDER_TASK, activatedAt),
+            activation_artifact_hash: parsed.artifactHash,
+            pending_invocation: null,
+            last_run: {
+              status: 'success', action_type: 'activation_check', fail_closed: false,
+              invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
+            },
+          },
+        },
+      });
+    } finally { if (release) release(); }
+  }
   function withRegistration(current) {
     if (current.state !== 'ACTIVE') return current;
     return { ...current, scheduler_registered: Boolean(timer) && schedulerRegistered, server_registered: Boolean(timer) && schedulerRegistered && serverRegistered };
@@ -507,8 +673,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
     const current = loadStrict(); const taskState = current.tasks[taskId]; const task = TASK_BY_ID.get(taskId);
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE') return current;
+    const pauseForTask = (state, reason, lastRun) => (
+      task.kind === 'order' ? pauseOrder(state, reason, lastRun) : pauseAll(state, taskId, reason, lastRun)
+    );
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
-    if (Number.isNaN(dueTime.getTime())) return pauseAll(current, taskId, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
+    if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
     if (!isDue(task, dueTime) || !sameMinute(taskState.next_run_at, dueTime)) {
       const scheduled = new Date(taskState.next_run_at || 0);
       if (scheduled.getTime() < dueTime.getTime()) {
@@ -523,20 +692,61 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
     } catch (error) {
       if (release) release();
-      return pauseAll(current, taskId, safeText(error.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: safeText(error.message, 80), fail_closed: true });
+      return pauseForTask(current, safeText(error.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: safeText(error.message, 80), fail_closed: true });
     }
     const key = dueKey(task, dueTime);
-    const reserved = save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime) } } });
-    const command = buildCommand(taskId);
+    const schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
+    const pendingInvocation = task.kind === 'order' ? {
+      due_key: key,
+      token_hash: crypto.createHash('sha256').update(schedulerToken).digest('hex'),
+      expires_at: new Date(now().getTime() + (5 * 60_000)).toISOString(),
+    } : null;
+    save({ ...current, tasks: { ...current.tasks, [taskId]: {
+      ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime), pending_invocation: pendingInvocation,
+    } } });
+    const command = buildCommand(taskId, { schedulerToken, dueKey: key });
     try {
       const { error, stdout } = await execute(command);
-      if (error && Number(error.code) !== 2) return pauseAll(loadStrict(), taskId, error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
+      if (error && Number(error.code) !== 2) return pauseForTask(loadStrict(), error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
       let parsed;
-      try { parsed = parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver); }
-      catch (parseError) { return pauseAll(loadStrict(), taskId, safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true }); }
+      try {
+        parsed = task.kind === 'order'
+          ? parseKisVpsAutonomousOutput(stdout, taskId)
+          : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver);
+      } catch (parseError) {
+        return pauseForTask(loadStrict(), safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true });
+      }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
-      const lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass, failure_phase: parsed.failurePhase, failure_symbol: parsed.failureSymbol, failure_exception_type: parsed.failureExceptionType, failure_errno: parsed.failureErrno, failure_attempt_number: parsed.failureAttemptNumber };
-      if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseAll(latest, taskId, parsed.errorClass || 'blocked', lastRun);
+      if (task.kind === 'order' && parsed.artifactHash !== latestTask.activation_artifact_hash) {
+        return pauseOrder(latest, 'model_v3_artifact_attestation_mismatch', {
+          invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+          error_class: 'model_v3_artifact_attestation_mismatch', fail_closed: true,
+        });
+      }
+      const lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
+      if (task.kind === 'order') {
+        Object.assign(lastRun, {
+          order_api_calls: parsed.orderApiCalls,
+          vps_live_orders: parsed.vpsLiveOrders,
+          reconciliations: parsed.reconciliations,
+          open_positions: parsed.openPositions,
+          daily_entry_count: parsed.dailyEntryCount,
+          shadow_predictions_inserted: parsed.shadowPredictionsInserted,
+          artifact_hash: parsed.artifactHash,
+        });
+      } else {
+        Object.assign(lastRun, {
+          failure_phase: parsed.failurePhase,
+          failure_symbol: parsed.failureSymbol,
+          failure_exception_type: parsed.failureExceptionType,
+          failure_errno: parsed.failureErrno,
+          failure_attempt_number: parsed.failureAttemptNumber,
+        });
+      }
+      if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseForTask(latest, parsed.errorClass || 'blocked', lastRun);
+      if (task.kind === 'order') {
+        return save({ ...latest, tasks: { ...latest.tasks, [taskId]: { ...latestTask, state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, pending_invocation: null, last_run: lastRun } } });
+      }
       if (parsed.transportDegraded) {
         const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
         lastRun.consecutive_transport_failures = consecutive;
@@ -591,7 +801,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (timer) clearTimer(timer); timer = null;
     const current = loadStrict(); return save({ ...current, scheduler_registered: false, server_registered: false });
   }
-  return { statePath, status, prepareDisabled, activate, resumeAfterIoFix, runOnce, start, stop, tick, buildCommand };
+  return { statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask, runOnce, start, stop, tick, buildCommand };
 }
 
 async function cli(argv = process.argv.slice(2)) {
@@ -599,6 +809,7 @@ async function cli(argv = process.argv.slice(2)) {
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
+    : action === 'enable-order' ? await task.enableOrderTask({ confirm: argv[1] === '--confirm', invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()
     : action === 'start' ? task.start()
     : action === 'stop' ? task.stop()
@@ -609,10 +820,10 @@ async function cli(argv = process.argv.slice(2)) {
 if (require.main === module) cli().catch((error) => { process.stderr.write(`${safeText(error.message, 100)}\n`); process.exitCode = 1; });
 
 module.exports = {
-  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, KIS_REPO, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
+  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, KIS_REPO, KIS_VENV_PYTHON, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
   APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
   TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, TASKS,
-  parseKisAiMarketOpenOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
+  parseKisAiMarketOpenOutput, parseKisVpsAutonomousOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
   nextRunAt, buildCommand, buildDiagnosticCommand, defaultSourceParityCheck, createKisAiMarketOpenDryRunTask,
 };

@@ -59,6 +59,36 @@ function good(taskId, status = 'success', extra = {}) {
   });
 }
 
+function orderGood(status = 'no_op', extra = {}) {
+  const blocked = status === 'blocked';
+  return JSON.stringify({
+    task_id: 'kis-vps-model-v3-autonomous-pilot-v1',
+    status,
+    action_type: blocked ? 'paused' : 'no_candidate_no_op',
+    official_trade_date: '2026-07-21',
+    order_api_calls: 0,
+    vps_live_orders: 0,
+    prod_orders: 0,
+    reconciliations: 0,
+    open_positions: 0,
+    daily_entry_count: 0,
+    artifact_reused: true,
+    artifact_hash: 'a'.repeat(64),
+    shadow_predictions_inserted: 0,
+    shadow_duplicates_skipped: 0,
+    model_v2_changed: false,
+    scheduler_changed: false,
+    retry: false,
+    catch_up: false,
+    backfill: false,
+    fail_closed: blocked,
+    error_class: blocked ? 'safe_block' : 'none',
+    raw_response_persisted: false,
+    secret_exposure: false,
+    ...extra,
+  });
+}
+
 function diagnostic() {
   const occurredAt = '2026-07-21T00:00:00Z';
   return JSON.stringify({
@@ -126,6 +156,10 @@ function fixture(options = {}) {
       callback(null, good(mod.TASKS[0].id, 'success', { action_type: 'activation_preflight', api_calls: 2 }));
       return;
     }
+    if (args.includes('vps-autonomous-order') && args.includes('activation-check')) {
+      callback(null, orderGood('success', { action_type: 'activation_check' }));
+      return;
+    }
     taskExec(command, args, execOptions, callback);
   };
   const task = mod.createKisAiMarketOpenDryRunTask({
@@ -152,7 +186,7 @@ async function active(options = {}) {
   return value;
 }
 
-test('exact activation approval, preflight, and four schedules', async () => {
+test('exact activation approval enables four dry-run schedules and keeps order disabled', async () => {
   const value = fixture();
   value.task.prepareDisabled();
   await assert.rejects(value.task.activate({ approval: 'wrong' }), /exact_activation/);
@@ -162,10 +196,142 @@ test('exact activation approval, preflight, and four schedules', async () => {
     'kis-ai-intraday-shadow-validation-v1',
     'kis-ai-post-close-learning-v1',
     'kis-ai-daily-learning-report-v1',
+    'kis-vps-model-v3-autonomous-pilot-v1',
   ]);
-  assert.equal(Object.keys(state.tasks).length, 4);
+  assert.equal(Object.keys(state.tasks).length, 5);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
   assert.equal(state.tasks[mod.TASKS[0].id].last_run.action_type, 'activation_preflight');
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('order command uses VM venv and exposes no per-run approval', () => {
+  const dueKey = `${mod.TASKS[4].id}:2026-07-22:09:15`;
+  const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '1'.repeat(32), dueKey });
+  assert.equal(command.command, mod.KIS_VENV_PYTHON);
+  assert.equal(command.cwd, mod.KIS_REPO);
+  assert.deepEqual(command.args, [
+    '-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once',
+    '--scheduler-token', '1'.repeat(32), '--due-key', dueKey,
+  ]);
+  assert.equal(command.args.includes('--approval'), false);
+  assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
+});
+
+test('order schedule starts at 09:15, includes 14:55 and post-close refresh, and never catches up', () => {
+  const task = mod.TASKS[4];
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:14:00Z')), '2026-07-21T00:15:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:54:00Z')), '2026-07-21T05:55:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:55:00Z')), '2026-07-21T07:20:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T07:20:00Z')), '2026-07-22T00:15:00.000Z');
+});
+
+test('order output contract allows one reconciled VPS order and rejects unsafe drift', () => {
+  const accepted = orderGood('success', {
+    action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
+    reconciliations: 1, open_positions: 1, daily_entry_count: 1,
+  });
+  const parsed = mod.parseKisVpsAutonomousOutput(accepted);
+  assert.equal(parsed.actionType, 'entry_reconciled');
+  assert.equal(parsed.orderApiCalls, 1);
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'entry_reconciled', order_api_calls: 2, vps_live_orders: 2, reconciliations: 1,
+  })), /unsafe_order_count/);
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    error_class: 'app_secret=value',
+  })), /unsafe_order_output/);
+});
+
+test('explicit enable check activates only the fifth order task without creating a scheduler', async () => {
+  const value = await active();
+  await assert.rejects(value.task.enableOrderTask(), /confirmation/);
+  const state = await value.task.enableOrderTask({ confirm: true });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+  assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+  assert.equal(state.os_cron_used, false);
+});
+
+test('blocked autonomous order pauses only the order task and leaves dry-run tasks active', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked'));
+    else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  value.setClock(due);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+});
+
+test('invalid autonomous output pauses only the order task without retry', async () => {
+  let runCalls = 0;
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      runCalls += 1;
+      callback(null, '{"unsafe":"output"}');
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(runCalls, 1);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('order invocation uses one-time hashed scheduler attestation and clears pending state', async () => {
+  let schedulerToken;
+  let invocationDueKey;
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      schedulerToken = args[args.indexOf('--scheduler-token') + 1];
+      invocationDueKey = args[args.indexOf('--due-key') + 1];
+      callback(null, orderGood());
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  value.setClock(due);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.match(schedulerToken, /^[a-f0-9]{32}$/);
+  assert.equal(invocationDueKey.startsWith(`${mod.TASKS[4].id}:`), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(JSON.stringify(state).includes(schedulerToken), false);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+});
+
+test('artifact hash drift pauses only the order task', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) callback(null, orderGood('no_op', { artifact_hash: 'b'.repeat(64) }));
+    else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  value.setClock(due);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_artifact_attestation_mismatch');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+});
+
+test('legacy four-task state migrates order task as disabled', async () => {
+  const value = await active();
+  const state = value.task.status();
+  delete state.tasks[mod.TASKS[4].id];
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  const migrated = value.task.status();
+  assert.equal(Object.keys(migrated.tasks).length, 5);
+  assert.equal(migrated.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
 test('activation fails closed before ACTIVE when runtime or legacy state is unsafe', async () => {
@@ -337,7 +503,8 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   value.setClock('2026-07-21T00:11:00Z');
   const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
   assert.equal(state.state, 'ACTIVE');
-  assert.equal(Object.values(state.tasks).every((item) => item.state === 'ACTIVE'), true);
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
   assert.equal(new Date(state.tasks[mod.TASKS[1].id].next_run_at).getTime() > new Date('2026-07-21T00:11:00Z').getTime(), true);
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
 });
@@ -367,7 +534,7 @@ test('IO resume remains paused when health, writer lock, parity, or diagnosis fa
     assert.ok(rejection, `resume should reject on ${failure}`);
     assert.equal(value.task.status().state, 'PAUSED');
   }
-  assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/.hermes/jobs/worktrees/hermes-ai-dry-run-pr7-deploy/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
+  assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
   assert.equal(mod.defaultSourceParityCheck(), false);
 });
 
