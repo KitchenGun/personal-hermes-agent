@@ -22,3 +22,12 @@ test('Model v2 API keeps legacy scheduler paused before manual execution', () =>
   assert.match(serverSource, /kisPredictionV2TaskRuntime\.runOnce/);
   assert.match(serverSource, /Model v2 prediction scheduler is active/);
 });
+
+test('AI market-open dry-run registers an in-process status-only scheduler', () => {
+  assert.match(serverSource, /require\('\.\/kis-ai-market-open-dry-run-task'\)/);
+  assert.match(serverSource, /schedulerRegistered: true/);
+  assert.match(serverSource, /serverRegistered: true/);
+  assert.match(serverSource, /\/api\/kis\/ai-market-open-dry-run\/status/);
+  assert.match(serverSource, /kisAiMarketOpenDryRunRuntime\.start\(\)/);
+  assert.doesNotMatch(serverSource, /ai-market-open-dry-run\/activate/);
+});
