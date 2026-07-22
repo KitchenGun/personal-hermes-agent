@@ -279,7 +279,7 @@ test('explicit enable check activates only the fifth order task without creating
 });
 
 test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
-  for (const pauseReason of ['balance_mismatch', 'order_not_fully_filled']) {
+  for (const pauseReason of ['balance_mismatch', 'order_not_fully_filled', 'order_submission_unknown']) {
     const value = await active();
     const paused = value.task.status();
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
