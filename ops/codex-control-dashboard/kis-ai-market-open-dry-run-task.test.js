@@ -160,7 +160,7 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('vps-autonomous-order') && args.includes('activation-check')) {
-      callback(null, orderGood('success', { action_type: 'activation_check' }));
+      callback(null, options.activationCheckOutput || orderGood('success', { action_type: 'activation_check' }));
       return;
     }
     taskExec(command, args, execOptions, callback);
@@ -293,6 +293,29 @@ test('explicit enable check reactivates an order task paused for known reconcili
     assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, undefined);
     assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
   }
+});
+
+test('unresolved ambiguous submission keeps the order task paused', async () => {
+  const value = await active({
+    activationCheckOutput: orderGood('blocked', {
+      action_type: 'paused',
+      error_class: 'pending_order_reconciliation',
+    }),
+  });
+  const paused = value.task.status();
+  paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  paused.tasks[mod.TASKS[4].id].pause_reason = 'order_submission_unknown';
+  paused.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /order_activation_check_failed/,
+  );
+  const after = value.task.status().tasks[mod.TASKS[4].id];
+  assert.equal(after.state, 'PAUSED');
+  assert.equal(after.pause_reason, 'order_submission_unknown');
+  assert.equal(after.next_run_at, null);
 });
 
 test('explicit enable check rejects an order task paused for an unknown reason', async () => {
