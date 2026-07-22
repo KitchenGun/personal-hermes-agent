@@ -73,6 +73,8 @@ function orderGood(status = 'no_op', extra = {}) {
     open_positions: 0,
     daily_entry_count: 0,
     artifact_reused: true,
+    artifact_promoted: false,
+    previous_artifact_hash: null,
     artifact_hash: 'a'.repeat(64),
     shadow_predictions_inserted: 0,
     shadow_duplicates_skipped: 0,
@@ -240,6 +242,25 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     error_class: 'app_secret=value',
   })), /unsafe_order_output/);
+  const promoted = mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+    previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+  }));
+  assert.equal(promoted.artifactPromoted, true);
+  assert.equal(promoted.previousArtifactHash, 'a'.repeat(64));
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 5 })));
+  assert.throws(
+    () => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 6 })),
+    /unsafe_order_count/,
+  );
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+    previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+  })), /artifact_promotion/);
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+    previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'a'.repeat(64),
+  })), /artifact_promotion/);
 });
 
 test('explicit enable check activates only the fifth order task without creating a scheduler', async () => {
@@ -360,6 +381,150 @@ test('artifact hash drift pauses only the order task', async () => {
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
 });
 
+test('declared post-close challenger promotion atomically rotates the order attestation hash', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
+      else callback(null, orderGood('success', {
+        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+        previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+      }));
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const stateBefore = value.task.status();
+  const orderTask = stateBefore.tasks[mod.TASKS[4].id];
+  orderTask.next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
+  value.setClock('2026-07-21T07:20:00.000Z');
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[4].id,
+    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.artifact_promoted, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.previous_artifact_hash, 'a'.repeat(64));
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+});
+
+test('declared challenger promotion outside the post-close slot pauses without rotating attestation', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
+      else callback(null, orderGood('success', {
+        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+        previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+      }));
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const stateBefore = value.task.status();
+  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
+  value.setClock('2026-07-21T00:15:00.000Z');
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[4].id,
+    dueAt: new Date('2026-07-21T00:15:00.000Z'),
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_promotion_outside_post_close_slot');
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 3);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
+});
+
+test('exact operator approval persists the aggressive daily cap in task attestation state', async () => {
+  const value = await active();
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  assert.throws(
+    () => value.task.approveAggressiveDailyEntryCap({ confirm: true, approval: `${mod.DAILY_ENTRY_CAP_5_APPROVAL} ` }),
+    /exact_daily_entry_cap/,
+  );
+
+  const state = value.task.approveAggressiveDailyEntryCap({
+    confirm: true,
+    approval: mod.DAILY_ENTRY_CAP_5_APPROVAL,
+    invokedBy: 'operator',
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 5);
+  assert.equal(
+    state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash,
+    mod.DAILY_ENTRY_CAP_5_APPROVAL_HASH,
+  );
+  assert.equal(JSON.stringify(state).includes(mod.DAILY_ENTRY_CAP_5_APPROVAL), false);
+});
+
+test('order output count is bounded by the task attested cap', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) callback(null, orderGood('no_op', { daily_entry_count: 4 }));
+    else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  value.setClock(due);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'daily_entry_cap_attestation_mismatch');
+});
+
+test('approved cap five is copied into the one-time attestation and accepts count five', async () => {
+  let value;
+  value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      const files = fs.readdirSync(value.paths.orderAttestationDir);
+      assert.equal(files.length, 1);
+      const attestation = JSON.parse(fs.readFileSync(path.join(value.paths.orderAttestationDir, files[0]), 'utf8'));
+      assert.equal(attestation.daily_entry_cap, 5);
+      assert.equal(attestation.daily_entry_cap_approval_hash, mod.DAILY_ENTRY_CAP_5_APPROVAL_HASH);
+      callback(null, orderGood('no_op', { daily_entry_count: 5 }));
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.task.approveAggressiveDailyEntryCap({ confirm: true, approval: mod.DAILY_ENTRY_CAP_5_APPROVAL });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  value.setClock(due);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 5);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 5);
+});
+
+test('post-close promotion with an unattested previous hash pauses without rotation', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
+      else callback(null, orderGood('success', {
+        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+        previous_artifact_hash: 'c'.repeat(64), artifact_hash: 'b'.repeat(64),
+      }));
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const stateBefore = value.task.status();
+  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
+  value.setClock('2026-07-21T07:20:00.000Z');
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[4].id,
+    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_artifact_attestation_mismatch');
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+});
+
 test('legacy four-task state migrates order task as disabled', async () => {
   const value = await active();
   const state = value.task.status();
@@ -473,13 +638,29 @@ test('missed slot is not executed but advances so the next slot runs once', asyn
   assert.equal(calls, 1);
 });
 
-test('filesystem lock and legacy task state prevent child execution', async () => {
+test('active filesystem lock prevents duplicate child execution without overwriting state', async () => {
   let calls = 0;
   const value = await active({ execFile(c, a, o, cb) { calls += 1; cb(null, good(mod.TASKS[0].id)); } });
-  fs.writeFileSync(value.paths.runLockPath, 'other process');
+  const release = mod.acquireExclusiveLock(value.paths.runLockPath);
   value.setClock('2026-07-21T00:00:17Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:17Z') });
-  assert.equal(calls, 0); assert.equal(state.state, 'PAUSED');
+  assert.equal(calls, 0); assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
+  release();
+});
+
+test('stale filesystem lock pauses visibly without deleting the lock', async () => {
+  let calls = 0;
+  const value = await active({ execFile(c, a, o, cb) { calls += 1; cb(null, good(mod.TASKS[0].id)); } });
+  fs.writeFileSync(value.paths.runLockPath, JSON.stringify({ pid: 999999999, created_at: '2020-01-01T00:00:00.000Z' }));
+  value.setClock('2026-07-21T00:00:17Z');
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:17Z') });
+
+  assert.equal(calls, 0);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'scheduler_lock_stale');
+  assert.equal(fs.existsSync(value.paths.runLockPath), true);
   fs.unlinkSync(value.paths.runLockPath);
 });
 
