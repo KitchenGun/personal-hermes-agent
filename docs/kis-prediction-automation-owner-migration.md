@@ -1,5 +1,10 @@
 # KIS Prediction Automation Owner Migration
 
+> Historical migration record. This v1 task is now `PAUSED` and is not a current
+> scheduler. The canonical runtime owner is the Hermes Adaptive KIS manager
+> `kis-ai-market-open-dry-run-v1`; current state must be read from its status
+> endpoint and persisted manager state, not from the dated values below.
+
 ## Status
 
 - migration_date: `2026-06-23`

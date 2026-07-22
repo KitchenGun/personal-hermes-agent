@@ -66,9 +66,10 @@ const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPrediction
   progressSender: sendKisPredictionProgressViaDiscordRelay,
 });
 const kisPredictionV2TaskRuntime = kisPredictionV2ValidationTask.createKisPredictionV2ValidationTask({
-  schedulerRegistered: true,
-  serverRegistered: true,
+  schedulerRegistered: false,
+  serverRegistered: false,
 });
+kisPredictionV2TaskRuntime.enforceDormantOwnership();
 const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarketOpenDryRunTask({
   schedulerRegistered: true,
   serverRegistered: true,
@@ -2370,6 +2371,12 @@ async function apiKisPredictionValidation(req, res) {
     } catch (controlError) {
       assertSharedSecret(req);
     }
+    try {
+      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
+    } catch {
+      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
+      return;
+    }
     if (String(kisPredictionV2TaskRuntime.status().state || '').toUpperCase() === 'ACTIVE') {
       errJson(res, 409, 'Model v2 prediction scheduler is active');
       return;
@@ -2396,6 +2403,12 @@ async function apiKisPredictionV2Validation(req, res) {
     } catch (controlError) {
       assertSharedSecret(req);
     }
+    try {
+      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
+    } catch {
+      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
+      return;
+    }
     const result = kisPredictionV2TaskRuntime.activate({ invokedBy: 'hermes_api' });
     okJson(res, { ok: result.state === 'ACTIVE', ...result });
     return;
@@ -2405,6 +2418,12 @@ async function apiKisPredictionV2Validation(req, res) {
       assertControlAuth(req);
     } catch (controlError) {
       assertSharedSecret(req);
+    }
+    try {
+      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
+    } catch {
+      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
+      return;
     }
     const legacyState = String(kisPredictionTaskRuntime.status().state || '').toUpperCase();
     if (legacyState !== 'PAUSED') {
@@ -2526,11 +2545,6 @@ if (require.main === module) {
         console.error(`supervisor auto-start failed: ${error.message || String(error)}`);
       }
     }
-      try {
-        kisPredictionV2TaskRuntime.start();
-      } catch (error) {
-        console.error(`kis prediction v2 validation scheduler start failed: ${error.message || String(error)}`);
-      }
       try {
         kisAiMarketOpenDryRunRuntime.start();
       } catch (error) {

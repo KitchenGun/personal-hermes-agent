@@ -20,6 +20,18 @@ function writeLegacyState(file, state = 'PAUSED') {
   return file;
 }
 
+function writeAdaptiveState(file, overrides = {}) {
+  fs.writeFileSync(file, `${JSON.stringify({
+    canonical_task_id: 'kis-ai-market-open-dry-run-v1',
+    task_owner: 'hermes',
+    state: 'PAUSED',
+    scheduler_registered: false,
+    server_registered: false,
+    ...overrides,
+  })}\n`, 'utf8');
+  return file;
+}
+
 function output(overrides = {}) {
   const base = {
     status: 'ready', action: 'idempotent_no_op', blocked: false, automation_paused: false, completed: false,
@@ -167,6 +179,66 @@ test('activation requires explicitly paused legacy v1 and keeps registration met
   assert.equal(active.live_execution_enabled, true);
   assert.equal(active.scheduler_registered, false);
   assert.equal(active.server_registered, false);
+});
+
+test('server ownership reconciliation pauses stale active v2 registration', () => {
+  const file = statePath('stale-v2');
+  const task = taskModule.createKisPredictionV2ValidationTask({ statePath: file });
+  task.prepareDisabled();
+  const stale = task.status();
+  fs.writeFileSync(file, `${JSON.stringify({
+    ...stale,
+    state: 'ACTIVE',
+    next_run_at: '2026-07-23T07:10:00.000Z',
+    scheduler_registered: true,
+    server_registered: true,
+  })}\n`, 'utf8');
+
+  const reconciled = task.enforceDormantOwnership();
+  assert.equal(reconciled.state, 'PAUSED');
+  assert.equal(reconciled.pause_reason, 'superseded_by_adaptive_scheduler');
+  assert.equal(reconciled.next_run_at, null);
+  assert.equal(reconciled.scheduler_registered, false);
+  assert.equal(reconciled.server_registered, false);
+});
+
+test('direct v2 CLI mutating actions require the Adaptive scheduler to be dormant', async () => {
+  const adaptiveStatePath = writeAdaptiveState(statePath('adaptive-active'), {
+    state: 'ACTIVE', scheduler_registered: true, server_registered: true,
+  });
+  for (const action of ['activate', 'run-once', 'start']) {
+    await assert.rejects(
+      taskModule.cli([action], { adaptiveStatePath, writeOutput: false }),
+      /adaptive_scheduler_must_be_dormant/,
+    );
+  }
+
+  writeAdaptiveState(adaptiveStatePath);
+  const legacyStatePath = writeLegacyState(statePath('cli-legacy'));
+  const result = await taskModule.cli(['activate'], {
+    adaptiveStatePath,
+    statePath: statePath('cli-state'),
+    legacyStatePath,
+    cutoverLockPath: statePath('cli-cutover.lock'),
+    legacyRunLockPath: statePath('cli-legacy-run.lock'),
+    runLockPath: statePath('cli-v2-run.lock'),
+    writeOutput: false,
+  });
+  assert.equal(result.state, 'ACTIVE');
+});
+
+test('direct v2 CLI fails closed when Adaptive state is missing or invalid', async () => {
+  const missing = statePath('adaptive-missing');
+  await assert.rejects(
+    taskModule.cli(['start'], { adaptiveStatePath: missing, writeOutput: false }),
+    /adaptive_state_unavailable/,
+  );
+
+  const invalid = writeAdaptiveState(statePath('adaptive-invalid'), { task_owner: 'unknown' });
+  await assert.rejects(
+    taskModule.cli(['run-once'], { adaptiveStatePath: invalid, writeOutput: false }),
+    /adaptive_scheduler_must_be_dormant/,
+  );
 });
 
 test('schedule is fixed to Seoul v1 RRULE and start/stop only register while active', () => {

@@ -38,6 +38,8 @@ const POLL_INTERVAL_MS = 60_000;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const TIMEZONE = 'Asia/Seoul';
+const CANONICAL_TASK_ID = 'kis-ai-market-open-dry-run-v1';
+const TASK_OWNER = 'hermes';
 const WATCHLIST_SYMBOLS = Object.freeze(['005930', '000660', '005380']);
 const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'dns_failed', 'connection_failed', 'connection_reset', 'timeout',
@@ -537,13 +539,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let schedulerFaulted = false;
 
   function disabledState() {
-    return { state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, daily_entry_cap: 3, daily_entry_cap_approval_hash: null } : {}) }])) };
+    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, daily_entry_cap: 3, daily_entry_cap_approval_hash: null } : {}) }])) };
   }
   function loadStrict() {
     try {
       const value = JSON.parse(fs.readFileSync(statePath, 'utf8'));
       if (!value || typeof value !== 'object' || Array.isArray(value) || !value.tasks
         || DRY_RUN_TASKS.some((task) => !value.tasks[task.id])) throw new Error('state_contract_invalid');
+      if ((value.canonical_task_id !== undefined && value.canonical_task_id !== CANONICAL_TASK_ID)
+        || (value.task_owner !== undefined && value.task_owner !== TASK_OWNER)) {
+        throw new Error('state_contract_invalid');
+      }
+      value.canonical_task_id = CANONICAL_TASK_ID;
+      value.task_owner = TASK_OWNER;
       if (!value.tasks[ORDER_TASK.id]) {
         value.tasks[ORDER_TASK.id] = {
           state: 'DISABLED', schedule: ORDER_TASK.schedule, next_run_at: null,
@@ -961,6 +969,8 @@ async function cli(argv = process.argv.slice(2)) {
 if (require.main === module) cli().catch((error) => { process.stderr.write(`${safeText(error.message, 100)}\n`); process.exitCode = 1; });
 
 module.exports = {
+  CANONICAL_TASK_ID,
+  TASK_OWNER,
   ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, ORDER_ACTIVATION_APPROVAL,
   DAILY_ENTRY_CAP_5_APPROVAL, DAILY_ENTRY_CAP_5_APPROVAL_HASH,
   KIS_REPO, KIS_VENV_PYTHON, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,

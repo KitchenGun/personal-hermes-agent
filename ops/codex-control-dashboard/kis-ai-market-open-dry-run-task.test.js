@@ -202,6 +202,8 @@ test('exact activation approval enables four dry-run schedules and keeps order d
     'kis-vps-model-v3-autonomous-pilot-v1',
   ]);
   assert.equal(Object.keys(state.tasks).length, 5);
+  assert.equal(state.canonical_task_id, mod.CANONICAL_TASK_ID);
+  assert.equal(state.task_owner, mod.TASK_OWNER);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
   assert.equal(state.tasks[mod.TASKS[0].id].last_run.action_type, 'activation_preflight');
@@ -556,6 +558,30 @@ test('legacy four-task state migrates order task as disabled', async () => {
   const migrated = value.task.status();
   assert.equal(Object.keys(migrated.tasks).length, 5);
   assert.equal(migrated.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('explicit Adaptive ownership metadata conflicts fail closed', async () => {
+  const value = await active();
+  const state = value.task.status();
+  state.canonical_task_id = 'conflicting-task';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  const blocked = value.task.status();
+  assert.equal(blocked.state, 'PAUSED');
+  assert.equal(blocked.pause_reason, 'state_unavailable');
+  assert.equal(blocked.scheduler_faulted, true);
+});
+
+test('missing legacy Adaptive ownership metadata is backfilled', async () => {
+  const value = await active();
+  const state = value.task.status();
+  delete state.canonical_task_id;
+  delete state.task_owner;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  const migrated = value.task.status();
+  assert.equal(migrated.canonical_task_id, mod.CANONICAL_TASK_ID);
+  assert.equal(migrated.task_owner, mod.TASK_OWNER);
 });
 
 test('activation fails closed before ACTIVE when runtime or legacy state is unsafe', async () => {
