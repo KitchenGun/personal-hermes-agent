@@ -42,6 +42,7 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'http_transport_failed', 'response_read_failed',
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set(['runtime_io_failed', ...TRANSIENT_TRANSPORT_ERRORS]);
+const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set(['balance_mismatch', 'order_not_fully_filled']);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
   'database_open', 'database_commit', 'client_initialize', 'quote_request',
@@ -643,7 +644,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (approval !== ORDER_ACTIVATION_APPROVAL) throw new Error('exact_order_activation_approval_required');
     const current = loadStrict();
     const prior = current.tasks[ORDER_TASK.id];
-    if (current.state !== 'ACTIVE' || prior.state !== 'DISABLED') throw new Error('order_task_must_be_disabled');
+    const canEnable = prior.state === 'DISABLED'
+      || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason));
+    if (current.state !== 'ACTIVE' || !canEnable) throw new Error('order_task_must_be_disabled');
     let release;
     try {
       release = acquireExclusiveLock(runLockPath);

@@ -257,6 +257,39 @@ test('explicit enable check activates only the fifth order task without creating
   assert.equal(state.os_cron_used, false);
 });
 
+test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
+  for (const pauseReason of ['balance_mismatch', 'order_not_fully_filled']) {
+    const value = await active();
+    const paused = value.task.status();
+    paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+    paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
+    paused.tasks[mod.TASKS[4].id].next_run_at = null;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+    const state = await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    assert.equal(state.state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, undefined);
+    assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+  }
+});
+
+test('explicit enable check rejects an order task paused for an unknown reason', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  paused.tasks[mod.TASKS[4].id].pause_reason = 'unexpected_order_failure';
+  paused.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /order_task_must_be_disabled/,
+  );
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].pause_reason, 'unexpected_order_failure');
+});
+
 test('blocked autonomous order pauses only the order task and leaves dry-run tasks active', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked'));
