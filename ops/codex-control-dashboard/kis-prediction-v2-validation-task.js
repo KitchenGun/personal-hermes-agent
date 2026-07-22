@@ -19,6 +19,7 @@ const TIMEZONE = 'Asia/Seoul';
 const SCHEDULE_RRULE = 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=16;BYMINUTE=10;BYSECOND=0';
 const DEFAULT_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle-v2.json';
 const LEGACY_TASK_STATE_PATH = '/home/ubuntu/.hermes/state/kis-prediction-validation-cycle.json';
+const ADAPTIVE_TASK_STATE_PATH = '/home/ubuntu/.hermes/state/kis-ai-market-open-dry-run-v1.json';
 const SCHEDULER_CUTOVER_LOCK_PATH = '/tmp/kis-prediction-scheduler-cutover.lock';
 const LEGACY_KIS_RUN_LOCK_PATH = '/tmp/kis-trading-lab-prediction-validation-auto.lock';
 const HERMES_RUN_LOCK_PATH = '/tmp/kis-prediction-validation-cycle-v2-hermes.lock';
@@ -499,6 +500,25 @@ function readPausedLegacyTaskState(legacyStatePath) {
   return parsed;
 }
 
+function readDormantAdaptiveTaskState(adaptiveStatePath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(adaptiveStatePath, 'utf8'));
+  } catch {
+    throw new Error('adaptive_state_unavailable');
+  }
+  const state = String(parsed && parsed.state || '').toUpperCase();
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+    || parsed.canonical_task_id !== 'kis-ai-market-open-dry-run-v1'
+    || parsed.task_owner !== 'hermes'
+    || !new Set(['PAUSED', 'DISABLED']).has(state)
+    || parsed.scheduler_registered !== false
+    || parsed.server_registered !== false) {
+    throw new Error('adaptive_scheduler_must_be_dormant');
+  }
+  return parsed;
+}
+
 function safeLastRun(summary, overrides = {}) {
   const safe = {};
   for (const key of SAFE_OUTPUT_KEYS) {
@@ -543,6 +563,21 @@ function createKisPredictionV2ValidationTask(options = {}) {
 
   function prepareDisabled() {
     return save({ ...status(), state: 'DISABLED', next_run_at: null, last_run: null, scheduler_registered: false, server_registered: false });
+  }
+
+  function enforceDormantOwnership(reason = 'superseded_by_adaptive_scheduler') {
+    const current = status();
+    if (current.state !== 'ACTIVE' && current.scheduler_registered !== true && current.server_registered !== true) {
+      return current;
+    }
+    return save({
+      ...current,
+      state: 'PAUSED',
+      pause_reason: sanitizeText(reason, 80),
+      next_run_at: null,
+      scheduler_registered: false,
+      server_registered: false,
+    });
   }
 
   function activate({ invokedBy = 'hermes' } = {}) {
@@ -733,12 +768,15 @@ function createKisPredictionV2ValidationTask(options = {}) {
       : current;
   }
 
-  return { statePath, status, prepareDisabled, activate, pause, runOnce, start, stop, tick, buildCommand: () => buildCommand(options) };
+  return { statePath, status, prepareDisabled, enforceDormantOwnership, activate, pause, runOnce, start, stop, tick, buildCommand: () => buildCommand(options) };
 }
 
-async function cli(argv = process.argv.slice(2)) {
+async function cli(argv = process.argv.slice(2), options = {}) {
   const action = argv[0] || 'status';
-  const task = createKisPredictionV2ValidationTask();
+  if (new Set(['activate', 'run-once', 'start']).has(action)) {
+    readDormantAdaptiveTaskState(options.adaptiveStatePath || ADAPTIVE_TASK_STATE_PATH);
+  }
+  const task = createKisPredictionV2ValidationTask(options);
   let result;
   if (action === 'prepare-disabled') result = task.prepareDisabled();
   else if (action === 'activate') result = task.activate({ invokedBy: 'hermes_cli' });
@@ -748,7 +786,8 @@ async function cli(argv = process.argv.slice(2)) {
   else if (action === 'stop') result = task.stop();
   else if (action === 'command') result = task.buildCommand();
   else result = task.status();
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (options.writeOutput !== false) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  return result;
 }
 
 if (require.main === module) {
@@ -774,6 +813,7 @@ module.exports = {
   SCHEDULE_RRULE,
   DEFAULT_STATE_PATH,
   LEGACY_TASK_STATE_PATH,
+  ADAPTIVE_TASK_STATE_PATH,
   SCHEDULER_CUTOVER_LOCK_PATH,
   LEGACY_KIS_RUN_LOCK_PATH,
   HERMES_RUN_LOCK_PATH,
@@ -783,5 +823,7 @@ module.exports = {
   mapSummaryToTaskState,
   nextRunAt,
   buildCommand,
+  readDormantAdaptiveTaskState,
   createKisPredictionV2ValidationTask,
+  cli,
 };

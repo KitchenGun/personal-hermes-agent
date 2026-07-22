@@ -1,5 +1,10 @@
 # KIS Prediction V2 Bounded Validation
 
+> Historical rollout record. Model v2 is now `PAUSED` and its scheduler loop is
+> deliberately dormant. The Hermes Adaptive KIS manager
+> `kis-ai-market-open-dry-run-v1` is the only scheduler owner; the v2 status and
+> manual API remain available for audit and explicitly controlled recovery only.
+
 ## Runtime Contract
 
 - canonical task ID: `kis-prediction-validation-cycle-v2`

@@ -7,10 +7,13 @@ const test = require('node:test');
 
 const serverSource = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
 
-test('server registers only the Model v2 prediction scheduler loop', () => {
+test('server keeps legacy prediction schedulers dormant', () => {
   assert.match(serverSource, /require\('\.\/kis-prediction-v2-validation-task'\)/);
-  assert.match(serverSource, /kisPredictionV2TaskRuntime\.start\(\)/);
+  assert.doesNotMatch(serverSource, /kisPredictionV2TaskRuntime\.start\(\)/);
   assert.doesNotMatch(serverSource, /kisPredictionTaskRuntime\.start\(\)/);
+  assert.match(serverSource, /schedulerRegistered: false/);
+  assert.match(serverSource, /serverRegistered: false/);
+  assert.match(serverSource, /kisPredictionV2TaskRuntime\.enforceDormantOwnership\(\)/);
 });
 
 test('Model v2 API keeps legacy scheduler paused before manual execution', () => {
@@ -21,6 +24,8 @@ test('Model v2 API keeps legacy scheduler paused before manual execution', () =>
   assert.match(serverSource, /legacyState !== 'PAUSED'/);
   assert.match(serverSource, /kisPredictionV2TaskRuntime\.runOnce/);
   assert.match(serverSource, /Model v2 prediction scheduler is active/);
+  assert.match(serverSource, /readDormantAdaptiveTaskState/);
+  assert.match(serverSource, /Adaptive KIS scheduler is not explicitly dormant/);
 });
 
 test('AI market-open dry-run registers an in-process status-only scheduler', () => {
