@@ -468,6 +468,10 @@ function atomicWrite(file, value) {
     fs.writeFileSync(fd, `${JSON.stringify(value)}\n`, 'utf8');
     fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
     fs.renameSync(temporary, file);
+    if (process.platform !== 'win32') {
+      const directoryFd = fs.openSync(path.dirname(file), 'r');
+      try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+    }
     if (process.platform !== 'win32') fs.chmodSync(file, 0o600);
   } catch (error) {
     if (fd !== undefined) fs.closeSync(fd);
@@ -706,33 +710,42 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function enableOrderTask({ confirm = false, approval = '', invokedBy = 'hermes_cli' } = {}) {
     if (confirm !== true) throw new Error('order_task_confirmation_required');
     if (approval !== ORDER_ACTIVATION_APPROVAL) throw new Error('exact_order_activation_approval_required');
-    const current = loadStrict();
-    const prior = current.tasks[ORDER_TASK.id];
-    const canEnable = prior.state === 'DISABLED'
-      || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason));
-    if (current.state !== 'ACTIVE' || !canEnable) throw new Error('order_task_must_be_disabled');
     let release;
     try {
       release = acquireExclusiveLock(runLockPath);
+      const current = loadStrict();
+      const prior = current.tasks[ORDER_TASK.id];
+      const canEnable = prior.state === 'DISABLED'
+        || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason));
+      if (current.state !== 'ACTIVE' || !canEnable) throw new Error('order_task_must_be_disabled');
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
       const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
-      if (error) throw new Error('order_activation_check_process_error');
+      if (error && Number(error.code) !== 2) throw new Error('order_activation_check_process_error');
       const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id);
       if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_check') {
-        throw new Error('order_activation_check_failed');
+        throw new Error(`order_activation_check_failed:${parsed.errorClass}`);
+      }
+      if (error) throw new Error('order_activation_check_process_error');
+      const latest = loadStrict();
+      const latestPrior = latest.tasks[ORDER_TASK.id];
+      if (latest.state !== current.state
+        || latestPrior.state !== prior.state
+        || latestPrior.pause_reason !== prior.pause_reason
+        || latestPrior.next_run_at !== prior.next_run_at) {
+        throw new Error('order_activation_state_changed');
       }
       const activatedAt = now();
       return save({
-        ...current,
+        ...latest,
         order_pause_reason: undefined,
         order_activated_at: activatedAt.toISOString(),
         order_activated_by: safeText(invokedBy),
         tasks: {
-          ...current.tasks,
+          ...latest.tasks,
           [ORDER_TASK.id]: {
-            ...prior,
+            ...latestPrior,
             state: 'ACTIVE',
             pause_reason: undefined,
             schedule: ORDER_TASK.schedule,
