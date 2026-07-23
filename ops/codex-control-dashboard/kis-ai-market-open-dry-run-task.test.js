@@ -757,6 +757,33 @@ test('one transient transport no-op stays active, success resets, and consecutiv
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
+test('one transient supervisor read failure stays active and preserves peer schedules', async () => {
+  const value = await active({ execFile(c, a, o, cb) {
+    const taskId = a[a.indexOf('--task-id') + 1];
+    cb(null, good(taskId, 'no_op', {
+      action_type: 'transport_degraded_no_op', error_class: 'http_transport_failed',
+      transport_degraded: true, api_calls: 2,
+      failure_phase: 'open_order_request', failure_symbol: null,
+      failure_exception_type: 'HTTPError', failure_errno: 500,
+      failure_attempt_number: 2,
+    }));
+  } });
+  value.setClock('2026-07-21T00:00:00Z');
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[0].id,
+    dueAt: new Date('2026-07-21T00:00:00Z'),
+  });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.pause_reason, undefined);
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].consecutive_transport_failures, 1);
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
+  assert.notEqual(state.tasks[mod.TASKS[1].id].next_run_at, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
 test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
   const value = await active();
   const paused = value.task.status();

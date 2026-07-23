@@ -53,7 +53,8 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
-  'database_open', 'database_commit', 'client_initialize', 'quote_request',
+  'database_open', 'database_commit', 'client_initialize', 'account_balance_request',
+  'open_order_request', 'quote_request',
   'quote_response_read', 'quote_parse', 'quote_persist', 'hermes_state_write',
 ]);
 const FAILURE_EXCEPTION_TYPES = new Set([
@@ -179,7 +180,7 @@ function validateTaskMeaning(value) {
     return;
   }
   if (value.action_type === 'transport_degraded_no_op') {
-    if (value.task_id !== 'kis-ai-intraday-shadow-validation-v1' || value.status !== 'no_op'
+    if (![TASKS[0].id, TASKS[1].id].includes(value.task_id) || value.status !== 'no_op'
       || value.transport_degraded !== true || value.fail_closed !== false
       || !TRANSIENT_TRANSPORT_ERRORS.has(value.error_class)) throw new Error('invalid_task_result_contract');
     return;
@@ -235,10 +236,20 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     || value.backfill !== false || value.quote_api_calls > 3) throw new Error('unsafe_output');
   const blocked = value.status === 'blocked';
   const degraded = value.action_type === 'transport_degraded_no_op';
+  const degradedFailureEvidenceValid = !degraded || (
+    value.failure_phase !== 'none'
+    && value.failure_exception_type !== 'none'
+    && value.failure_attempt_number >= 1
+    && (
+      (value.task_id === TASKS[0].id
+        && value.failure_symbol === null
+        && ['account_balance_request', 'open_order_request'].includes(value.failure_phase))
+      || (value.task_id === TASKS[1].id && value.failure_symbol !== null)
+    )
+  );
   if (value.fail_closed !== blocked
     || (blocked ? value.error_class === 'none' : (!degraded && value.error_class !== 'none'))
-    || (degraded && (value.failure_phase === 'none' || value.failure_symbol === null
-      || value.failure_exception_type === 'none' || value.failure_attempt_number < 1))
+    || !degradedFailureEvidenceValid
     || (!degraded && value.transport_degraded !== false)) throw new Error('invalid_fail_closed_contract');
   const marketClosed = value.action_type === 'market_closed_no_op';
   if (marketClosed !== (value.official_session_state === 'closed')
