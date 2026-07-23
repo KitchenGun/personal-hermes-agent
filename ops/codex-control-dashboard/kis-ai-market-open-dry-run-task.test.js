@@ -223,6 +223,15 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_HERMES_DUE_KEY, dueKey);
   assert.equal(command.args.includes('--approval'), false);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
+  const postCloseDueKey = `${mod.TASKS[4].id}:2026-07-22:16:20`;
+  const postClose = mod.buildCommand(mod.TASKS[4].id, {
+    schedulerToken: '2'.repeat(32),
+    dueKey: postCloseDueKey,
+  });
+  assert.deepEqual(
+    postClose.args,
+    ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-refresh-shadow'],
+  );
 });
 
 test('order schedule starts at 09:15, includes 14:55 and post-close refresh, and never catches up', () => {
@@ -292,6 +301,7 @@ test('exact enable can arm the existing order task only for the same-day post-cl
     }),
     execFile(command, args, options, callback) {
       autonomousRuns += 1;
+      assert.equal(args.includes('scheduled-refresh-shadow'), true);
       callback(null, orderGood('success', { action_type: 'shadow_refreshed' }));
     },
   });
@@ -317,6 +327,35 @@ test('exact enable can arm the existing order task only for the same-day post-cl
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'shadow_refreshed');
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:15:00.000Z');
+});
+
+test('post-close slot rejects an order result even if a child violates the refresh-only contract', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) {
+      if (args.includes('activation-check')) {
+        callback(null, orderGood('success', { action_type: 'activation_check' }));
+      } else {
+        assert.equal(args.includes('scheduled-refresh-shadow'), true);
+        callback(null, orderGood('success', {
+          action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
+          reconciliations: 1, open_positions: 1, daily_entry_count: 1,
+        }));
+      }
+    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const stateBefore = value.task.status();
+  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[4].id,
+    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'order_action_not_allowed_for_schedule_slot');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
 });
 
 test('post-close arm rejects a stale artifact or an elapsed refresh window', async () => {

@@ -380,7 +380,10 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
 function buildCommand(taskId, { activationPreflight = false, schedulerToken = '', dueKey: invocationDueKey = '' } = {}) {
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
   if (taskId === ORDER_TASK.id) {
-    const action = activationPreflight ? 'activation-check' : 'run-once';
+    const scheduledPostCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:20');
+    const action = activationPreflight
+      ? 'activation-check'
+      : scheduledPostCloseRefresh ? 'scheduled-refresh-shadow' : 'run-once';
     const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
     if (!activationPreflight) {
       if (!/^[a-f0-9]{32}$/.test(schedulerToken) || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) {
@@ -894,12 +897,26 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       } catch (parseError) {
         return pauseForTask(loadStrict(), safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true });
       }
+      const slot = seoulParts(dueTime);
+      const postCloseOrderSlot = task.kind === 'order'
+        && Number(slot.hour) === 16
+        && Number(slot.minute) === 20;
       if (task.kind === 'order' && parsed.artifactPromoted) {
-        const slot = seoulParts(dueTime);
         if (Number(slot.hour) !== 16 || Number(slot.minute) !== 20) {
           return pauseOrder(loadStrict(), 'model_v3_promotion_outside_post_close_slot', {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
             error_class: 'model_v3_promotion_outside_post_close_slot', fail_closed: true,
+          });
+        }
+      }
+      if (task.kind === 'order' && !parsed.failClosed) {
+        const actionAllowed = postCloseOrderSlot
+          ? ['shadow_refreshed', 'market_closed_no_op'].includes(parsed.actionType)
+          : parsed.actionType !== 'shadow_refreshed';
+        if (!actionAllowed) {
+          return pauseOrder(loadStrict(), 'order_action_not_allowed_for_schedule_slot', {
+            invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+            error_class: 'order_action_not_allowed_for_schedule_slot', fail_closed: true,
           });
         }
       }
