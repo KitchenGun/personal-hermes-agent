@@ -160,7 +160,10 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('vps-autonomous-order') && args.includes('activation-check')) {
-      callback(null, options.activationCheckOutput || orderGood('success', { action_type: 'activation_check' }));
+      callback(
+        options.activationCheckError || null,
+        options.activationCheckOutput || orderGood('success', { action_type: 'activation_check' }),
+      );
       return;
     }
     taskExec(command, args, execOptions, callback);
@@ -318,6 +321,45 @@ test('unresolved ambiguous submission keeps the order task paused', async () => 
   assert.equal(after.state, 'PAUSED');
   assert.equal(after.pause_reason, 'order_submission_unknown');
   assert.equal(after.next_run_at, null);
+});
+
+test('explicit enable parses safe exit two output and preserves the exact blocker', async () => {
+  const value = await active({
+    activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
+    activationCheckOutput: orderGood('blocked', {
+      action_type: 'paused',
+      error_class: 'pending_order_reconciliation',
+    }),
+  });
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /order_activation_check_failed:pending_order_reconciliation/,
+  );
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('explicit enable rejects a concurrent state transition instead of overwriting it', async () => {
+  let healthCalls = 0;
+  let value;
+  const runtimeHealthCheck = async () => {
+    healthCalls += 1;
+    if (healthCalls === 2) {
+      const changed = value.task.status();
+      changed.state = 'PAUSED';
+      changed.pause_reason = 'concurrent_pause';
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(changed));
+    }
+    return true;
+  };
+  value = await active({ runtimeHealthCheck });
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /order_activation_state_changed/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
 test('explicit enable check rejects an order task paused for an unknown reason', async () => {
