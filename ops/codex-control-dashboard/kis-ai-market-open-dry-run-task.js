@@ -53,8 +53,8 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
-  'database_open', 'database_commit', 'client_initialize', 'account_balance_request',
-  'open_order_request', 'quote_request',
+  'database_open', 'database_commit', 'client_initialize', 'auth_token_request',
+  'account_balance_request', 'open_orders_read_request', 'quote_request',
   'quote_response_read', 'quote_parse', 'quote_persist', 'hermes_state_write',
 ]);
 const FAILURE_EXCEPTION_TYPES = new Set([
@@ -243,7 +243,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     && (
       (value.task_id === TASKS[0].id
         && value.failure_symbol === null
-        && ['account_balance_request', 'open_order_request'].includes(value.failure_phase))
+        && ['auth_token_request', 'account_balance_request', 'open_orders_read_request'].includes(value.failure_phase))
       || (value.task_id === TASKS[1].id && value.failure_symbol !== null)
     )
   );

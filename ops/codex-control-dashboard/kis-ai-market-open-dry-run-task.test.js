@@ -763,7 +763,7 @@ test('one transient supervisor read failure stays active and preserves peer sche
     cb(null, good(taskId, 'no_op', {
       action_type: 'transport_degraded_no_op', error_class: 'http_transport_failed',
       transport_degraded: true, api_calls: 2,
-      failure_phase: 'open_order_request', failure_symbol: null,
+      failure_phase: 'open_orders_read_request', failure_symbol: null,
       failure_exception_type: 'HTTPError', failure_errno: 500,
       failure_attempt_number: 2,
     }));
@@ -782,6 +782,15 @@ test('one transient supervisor read failure stays active and preserves peer sche
   assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
   assert.notEqual(state.tasks[mod.TASKS[1].id].next_run_at, null);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+
+  value.setClock('2026-07-22T00:00:00Z');
+  const paused = await value.task.runOnce({
+    taskId: mod.TASKS[0].id,
+    dueAt: new Date('2026-07-22T00:00:00Z'),
+  });
+  assert.equal(paused.state, 'PAUSED');
+  assert.equal(paused.pause_reason, 'http_transport_failed');
+  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
 test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
