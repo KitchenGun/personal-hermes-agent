@@ -146,6 +146,22 @@ function nextRunAt(task, from = new Date()) {
   throw new Error('next_schedule_not_found');
 }
 
+function postCloseRefreshAtToday(from = new Date()) {
+  const start = from instanceof Date ? new Date(from.getTime()) : new Date(from);
+  if (Number.isNaN(start.getTime())) throw new Error('post_close_arm_time_invalid');
+  const today = seoulParts(start);
+  const probe = new Date(start.getTime());
+  probe.setUTCSeconds(0, 0);
+  probe.setUTCMinutes(probe.getUTCMinutes() + 1);
+  for (let index = 0; index < (24 * 60); index += 1) {
+    const parts = seoulParts(probe);
+    if (parts.year !== today.year || parts.month !== today.month || parts.day !== today.day) break;
+    if (Number(parts.hour) === 16 && Number(parts.minute) === 20) return probe.toISOString();
+    probe.setUTCMinutes(probe.getUTCMinutes() + 1);
+  }
+  throw new Error('post_close_arm_window_unavailable');
+}
+
 function safeText(value, max = 160) {
   return String(value ?? '').replace(/[\r\n\t]/g, ' ').replace(/[^\x20-\x7e]/g, '').slice(0, max);
 }
@@ -724,10 +740,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
       if (error && Number(error.code) !== 2) throw new Error('order_activation_check_process_error');
       const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id);
-      if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_check') {
+      const activationReady = parsed.status === 'success'
+        && parsed.failClosed === false
+        && parsed.actionType === 'activation_check';
+      const waitingForPostCloseBatch = parsed.status === 'blocked'
+        && parsed.failClosed === true
+        && parsed.actionType === 'paused'
+        && parsed.errorClass === 'model_v3_prediction_batch_incomplete';
+      if (!activationReady && !waitingForPostCloseBatch) {
         throw new Error(`order_activation_check_failed:${parsed.errorClass}`);
       }
-      if (error) throw new Error('order_activation_check_process_error');
+      if ((activationReady && error)
+        || (waitingForPostCloseBatch && (!error || Number(error.code) !== 2))) {
+        throw new Error('order_activation_check_process_error');
+      }
       const latest = loadStrict();
       const latestPrior = latest.tasks[ORDER_TASK.id];
       if (latest.state !== current.state
@@ -737,6 +763,29 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         throw new Error('order_activation_state_changed');
       }
       const activatedAt = now();
+      let scheduledAt = nextRunAt(ORDER_TASK, activatedAt);
+      let activationLastRun = {
+        status: 'success', action_type: 'activation_check', fail_closed: false,
+        invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
+      };
+      if (waitingForPostCloseBatch) {
+        if (parsed.artifactHash === null
+          || (latestPrior.activation_artifact_hash !== null
+            && latestPrior.activation_artifact_hash !== parsed.artifactHash)) {
+          throw new Error('model_v3_artifact_attestation_mismatch');
+        }
+        const parts = seoulParts(activatedAt);
+        const tradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+        let proof;
+        try { proof = calendarProofResolver(tradeDate); }
+        catch { throw new Error('official_calendar_proof_invalid'); }
+        if (!proof || proof.isTradingDay !== true) throw new Error('post_close_arm_requires_trading_day');
+        scheduledAt = postCloseRefreshAtToday(activatedAt);
+        activationLastRun = {
+          status: 'waiting', action_type: 'activation_waiting_post_close', fail_closed: false,
+          error_class: 'none', invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
+        };
+      }
       return save({
         ...latest,
         order_pause_reason: undefined,
@@ -749,13 +798,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             state: 'ACTIVE',
             pause_reason: undefined,
             schedule: ORDER_TASK.schedule,
-            next_run_at: nextRunAt(ORDER_TASK, activatedAt),
+            next_run_at: scheduledAt,
             activation_artifact_hash: parsed.artifactHash,
             pending_invocation: null,
-            last_run: {
-              status: 'success', action_type: 'activation_check', fail_closed: false,
-              invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
-            },
+            last_run: activationLastRun,
           },
         },
       });
