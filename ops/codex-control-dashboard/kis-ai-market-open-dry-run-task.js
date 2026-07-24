@@ -50,6 +50,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'balance_mismatch',
   'order_not_fully_filled',
   'order_submission_unknown',
+  'invalid_order_output_contract',
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',

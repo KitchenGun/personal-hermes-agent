@@ -401,7 +401,12 @@ test('post-close arm rejects a stale artifact or an elapsed refresh window', asy
 });
 
 test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
-  for (const pauseReason of ['balance_mismatch', 'order_not_fully_filled', 'order_submission_unknown']) {
+  for (const pauseReason of [
+    'balance_mismatch',
+    'order_not_fully_filled',
+    'order_submission_unknown',
+    'invalid_order_output_contract',
+  ]) {
     const value = await active();
     const paused = value.task.status();
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
