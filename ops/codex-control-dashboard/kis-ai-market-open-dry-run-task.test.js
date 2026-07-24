@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -87,6 +88,13 @@ function orderGood(status = 'no_op', extra = {}) {
     error_class: blocked ? 'safe_block' : 'none',
     raw_response_persisted: false,
     secret_exposure: false,
+    intraday_mode: null,
+    intraday_model_version: null,
+    decision_provider: mod.INTRADAY_PROVIDER_ATTESTATION.decision_provider,
+    intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+    intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+    intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+    intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
     ...extra,
   });
 }
@@ -221,25 +229,34 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once']);
   assert.equal(command.env.KIS_HERMES_SCHEDULER_TOKEN, '1'.repeat(32));
   assert.equal(command.env.KIS_HERMES_DUE_KEY, dueKey);
+  assert.equal(command.env.KIS_INTRADAY_PROVIDER_ID, 'intraday_v1');
+  assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v1');
+  assert.equal(command.env.KIS_INTRADAY_FEATURE_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash);
+  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v1');
+  assert.equal(command.env.KIS_INTRADAY_POLICY_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash);
+  assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, '3');
   assert.equal(command.args.includes('--approval'), false);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
-  const postCloseDueKey = `${mod.TASKS[4].id}:2026-07-22:16:20`;
-  const postClose = mod.buildCommand(mod.TASKS[4].id, {
+  const horizonDueKey = `${mod.TASKS[4].id}:2026-07-22:14:50`;
+  const horizon = mod.buildCommand(mod.TASKS[4].id, {
     schedulerToken: '2'.repeat(32),
-    dueKey: postCloseDueKey,
+    dueKey: horizonDueKey,
   });
   assert.deepEqual(
-    postClose.args,
-    ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-refresh-shadow'],
+    horizon.args,
+    ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'horizon-exit'],
   );
 });
 
-test('order schedule starts at 09:15, includes 14:55 and post-close refresh, and never catches up', () => {
+test('intraday schedules use only future 10-minute slots plus horizon exit, learning, and report', () => {
+  assert.deepEqual(mod.TASKS[1].minutes, Array.from({ length: 34 }, (_, i) => 550 + (i * 10)));
+  assert.deepEqual(mod.TASKS[2].minutes, [980]);
+  assert.deepEqual(mod.TASKS[3].minutes, [990]);
   const task = mod.TASKS[4];
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:14:00Z')), '2026-07-21T00:15:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:54:00Z')), '2026-07-21T05:55:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:55:00Z')), '2026-07-21T07:20:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T07:20:00Z')), '2026-07-22T00:15:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:44:00Z')), '2026-07-21T05:45:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:45:00Z')), '2026-07-21T05:50:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:50:00Z')), '2026-07-22T00:15:00.000Z');
 });
 
 test('order output contract allows one reconciled VPS order and rejects unsafe drift', () => {
@@ -279,11 +296,14 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   }));
   assert.equal(promoted.artifactPromoted, true);
   assert.equal(promoted.previousArtifactHash, 'a'.repeat(64));
-  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 5 })));
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 3 })));
   assert.throws(
-    () => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 6 })),
+    () => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 4 })),
     /unsafe_order_count/,
   );
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    intraday_feature_hash: '0'.repeat(64),
+  })), /intraday_provider_attestation_mismatch/);
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
     previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
@@ -309,7 +329,38 @@ test('explicit enable check activates only the fifth order task without creating
   assert.equal(state.os_cron_used, false);
 });
 
-test('exact enable can arm the existing order task only for the same-day post-close refresh', async () => {
+test('exact provider cutover migrates the existing active order task without creating a scheduler', async () => {
+  const value = await active();
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const legacy = value.task.status();
+  const legacyOrder = legacy.tasks[mod.TASKS[4].id];
+  for (const key of Object.keys(mod.INTRADAY_PROVIDER_ATTESTATION)) {
+    if (key !== 'daily_entry_cap') delete legacyOrder[key];
+  }
+  legacyOrder.daily_entry_cap = 5;
+  legacyOrder.daily_entry_cap_approval_hash = crypto.createHash('sha256')
+    .update('APPROVE_KIS_VPS_MOCK_DAILY_ENTRY_CAP_5_V1').digest('hex');
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(legacy));
+
+  await assert.rejects(
+    value.task.cutoverIntradayProvider({ confirm: true, approval: 'wrong' }),
+    /exact_provider_cutover_approval_required/,
+  );
+  const state = await value.task.cutoverIntradayProvider({
+    confirm: true,
+    approval: mod.INTRADAY_PROVIDER_CUTOVER_APPROVAL,
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 3);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].decision_provider, 'intraday_v1');
+  assert.equal(state.tasks[mod.TASKS[4].id].schedule, mod.TASKS[4].schedule);
+  assert.equal(Object.keys(state.tasks).length, 5);
+  assert.equal(state.os_cron_used, false);
+});
+
+test.skip('legacy post-close order refresh is retired in favor of the 16:20 learning task', async () => {
   let autonomousRuns = 0;
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
@@ -346,7 +397,7 @@ test('exact enable can arm the existing order task only for the same-day post-cl
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:15:00.000Z');
 });
 
-test('post-close slot rejects an order result even if a child violates the refresh-only contract', async () => {
+test.skip('legacy post-close order refresh contract is retired', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
       if (args.includes('activation-check')) {
@@ -375,7 +426,7 @@ test('post-close slot rejects an order result even if a child violates the refre
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
 });
 
-test('post-close arm rejects a stale artifact or an elapsed refresh window', async () => {
+test.skip('legacy post-close order arming is retired', async () => {
   for (const failure of ['artifact', 'window']) {
     const value = await active({
       activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
@@ -576,7 +627,15 @@ test('order invocation uses one-time hashed scheduler attestation and clears pen
     if (args.includes('vps-autonomous-order')) {
       schedulerToken = options.env.KIS_HERMES_SCHEDULER_TOKEN;
       invocationDueKey = options.env.KIS_HERMES_DUE_KEY;
+      const files = fs.readdirSync(value.paths.orderAttestationDir);
+      const attestation = JSON.parse(fs.readFileSync(path.join(value.paths.orderAttestationDir, files[0]), 'utf8'));
       assert.equal(args.includes(schedulerToken), false);
+      assert.deepEqual(attestation, {
+        due_key: invocationDueKey,
+        token_hash: attestation.token_hash,
+        expires_at: attestation.expires_at,
+        ...mod.INTRADAY_PROVIDER_ATTESTATION,
+      });
       callback(null, orderGood());
     } else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
@@ -606,7 +665,7 @@ test('artifact hash drift pauses only the order task', async () => {
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
 });
 
-test('declared post-close challenger promotion atomically rotates the order attestation hash', async () => {
+test.skip('legacy order-task post-close promotion is retired', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
       if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
@@ -635,7 +694,7 @@ test('declared post-close challenger promotion atomically rotates the order atte
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
 });
 
-test('declared challenger promotion outside the post-close slot pauses without rotating attestation', async () => {
+test.skip('legacy order-task post-close promotion guard is retired', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
       if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
@@ -663,7 +722,7 @@ test('declared challenger promotion outside the post-close slot pauses without r
   assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
 });
 
-test('exact operator approval persists the aggressive daily cap in task attestation state', async () => {
+test.skip('legacy daily cap five approval is retired', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   assert.throws(
@@ -685,7 +744,7 @@ test('exact operator approval persists the aggressive daily cap in task attestat
   assert.equal(JSON.stringify(state).includes(mod.DAILY_ENTRY_CAP_5_APPROVAL), false);
 });
 
-test('order output count is bounded by the task attested cap', async () => {
+test('order output count above the fixed daily cap fails closed', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) callback(null, orderGood('no_op', { daily_entry_count: 4 }));
     else callback(null, good(args[args.indexOf('--task-id') + 1]));
@@ -697,10 +756,10 @@ test('order output count is bounded by the task attested cap', async () => {
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'daily_entry_cap_attestation_mismatch');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'unsafe_order_count');
 });
 
-test('approved cap five is copied into the one-time attestation and accepts count five', async () => {
+test.skip('legacy daily cap five attestation is retired', async () => {
   let value;
   value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
@@ -724,7 +783,7 @@ test('approved cap five is copied into the one-time attestation and accepts coun
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 5);
 });
 
-test('post-close promotion with an unattested previous hash pauses without rotation', async () => {
+test.skip('legacy post-close promotion attestation is retired', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
       if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
@@ -794,11 +853,11 @@ test('activation fails closed before ACTIVE when runtime or legacy state is unsa
   assert.equal(legacy.task.status().state, 'DISABLED');
 });
 
-test('next runs skip catch-up and retain 14:40/14:50 monitor slots', () => {
+test('next runs skip catch-up and stop intraday inference after 14:40', () => {
   const intraday = mod.TASKS[1];
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-20T23:55:00Z')), '2026-07-21T00:10:00.000Z');
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:30:00Z')), '2026-07-21T05:40:00.000Z');
-  assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:40:00Z')), '2026-07-21T05:50:00.000Z');
+  assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:40:00Z')), '2026-07-22T00:10:00.000Z');
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:51:00Z')), '2026-07-22T00:10:00.000Z');
 });
 
