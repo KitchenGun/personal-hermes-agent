@@ -184,16 +184,18 @@ function validateReportList(value, emptyValues, itemPattern, maxItems) {
   }
 }
 
-function validateReportMessage(value) {
+function validateReportMessage(value, officialTradeDate, decisions) {
   const reportMessage = String(value || '');
   const lines = reportMessage.split('\n');
+  const decisionMatch = /^AI 검증: 판단 (\d+)건 \/ 모델 변경 0회$/.exec(lines[5] || '');
   if (reportMessage.length > 600 || lines.length !== 8
     || lines[0] !== '[KIS VPS 모의투자 일일 결과]'
-    || !/^기준일: \d{4}-\d{2}-\d{2}$/.test(lines[1])
+    || lines[1] !== `기준일: ${officialTradeDate}`
     || !lines[2].startsWith('오늘 체결: ')
     || !lines[3].startsWith('현재 보유: ')
     || !lines[4].startsWith('오늘 실현손익: ')
-    || !/^AI 검증: 판단 \d+건 \/ 학습 \d+회 \/ 모델 변경 0회$/.test(lines[5])
+    || decisionMatch === null
+    || Number(decisionMatch[1]) !== decisions
     || !/^운영 상태: (?:정상|확인 필요 [1-9]\d*건)$/.test(lines[6])
     || lines[7] !== '실전계좌: 주문 없음') throw new Error('invalid_report_message');
   validateReportList(lines[2].slice('오늘 체결: '.length), new Set(['없음', '확인 불가 (주문 원장 없음)']), VPS_FILL_ITEM_RE, 10);
@@ -306,7 +308,9 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   }
   validateTaskMeaning(value);
   let reportMessage = null;
-  if (value.status === 'report_ready') reportMessage = validateReportMessage(value.report_message);
+  if (value.status === 'report_ready') {
+    reportMessage = validateReportMessage(value.report_message, value.official_trade_date, value.decisions);
+  }
   else if (value.report_message !== null) throw new Error('unexpected_report_message');
   return Object.freeze({
     status: value.status, failClosed: value.fail_closed, reportMessage,
