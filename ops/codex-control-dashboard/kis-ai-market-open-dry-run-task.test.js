@@ -250,6 +250,23 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   const parsed = mod.parseKisVpsAutonomousOutput(accepted);
   assert.equal(parsed.actionType, 'entry_reconciled');
   assert.equal(parsed.orderApiCalls, 1);
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    action_type: 'ai_position_held', open_positions: 1,
+  })));
+  for (const actionType of [
+    'ai_exit_reconciled',
+    'risk_stop_exit_reconciled',
+    'take_profit_exit_reconciled',
+    'horizon_exit_reconciled',
+  ]) {
+    const exit = mod.parseKisVpsAutonomousOutput(orderGood('success', {
+      action_type: actionType, order_api_calls: 1, vps_live_orders: 1, reconciliations: 1,
+    }));
+    assert.equal(exit.actionType, actionType);
+  }
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'ai_exit_reconciled',
+  })), /invalid_order_execution_contract/);
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
     action_type: 'entry_reconciled', order_api_calls: 2, vps_live_orders: 2, reconciliations: 1,
   })), /unsafe_order_count/);
