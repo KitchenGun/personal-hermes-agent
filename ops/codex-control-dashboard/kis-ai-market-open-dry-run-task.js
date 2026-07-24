@@ -9,8 +9,20 @@ const path = require('node:path');
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const RESUME_AFTER_IO_FIX_APPROVAL = 'APPROVE_KIS_HERMES_AI_DRY_RUN_RESUME_AFTER_IO_FIX_V1';
 const ORDER_ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_VPS_AUTONOMOUS_PILOT_V1';
-const DAILY_ENTRY_CAP_5_APPROVAL = 'APPROVE_KIS_VPS_MOCK_DAILY_ENTRY_CAP_5_V1';
-const DAILY_ENTRY_CAP_5_APPROVAL_HASH = crypto.createHash('sha256').update(DAILY_ENTRY_CAP_5_APPROVAL).digest('hex');
+const INTRADAY_PROVIDER_CUTOVER_APPROVAL = 'APPROVE_KIS_INTRADAY_AI_PROVIDER_CUTOVER_V1';
+const LEGACY_DAILY_ENTRY_CAP_5_APPROVAL_HASH = crypto.createHash('sha256')
+  .update('APPROVE_KIS_VPS_MOCK_DAILY_ENTRY_CAP_5_V1').digest('hex');
+const INTRADAY_PROVIDER_ID = 'intraday_v1';
+const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v1';
+const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v1';
+const INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
+  decision_provider: INTRADAY_PROVIDER_ID,
+  intraday_feature_version: INTRADAY_FEATURE_VERSION,
+  intraday_policy_version: INTRADAY_POLICY_VERSION,
+  intraday_feature_hash: crypto.createHash('sha256').update(INTRADAY_FEATURE_VERSION).digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update(INTRADAY_POLICY_VERSION).digest('hex'),
+  daily_entry_cap: 3,
+});
 const KIS_REPO = '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
 const KIS_VENV_PYTHON = '/home/ubuntu/.hermes/venvs/kis-trading-lab/bin/python';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
@@ -80,10 +92,10 @@ const FAILURE_EXCEPTION_TYPES = new Set([
 ]);
 const TASKS = Object.freeze([
   { id: 'kis-ai-market-open-supervisor-v1', kind: 'dry_run', schedule: 'weekdays 09:00 KST', minutes: [540] },
-  { id: 'kis-ai-intraday-shadow-validation-v1', kind: 'dry_run', schedule: 'weekdays 09:10-14:50 KST every 10m', minutes: Array.from({ length: 35 }, (_, i) => 550 + (i * 10)) },
-  { id: 'kis-ai-post-close-learning-v1', kind: 'dry_run', schedule: 'weekdays 15:40 KST', minutes: [940] },
+  { id: 'kis-ai-intraday-shadow-validation-v1', kind: 'dry_run', schedule: 'weekdays 09:10-14:40 KST every 10m', minutes: Array.from({ length: 34 }, (_, i) => 550 + (i * 10)) },
+  { id: 'kis-ai-post-close-learning-v1', kind: 'dry_run', schedule: 'weekdays 16:20 KST', minutes: [980] },
   { id: 'kis-ai-daily-learning-report-v1', kind: 'dry_run', schedule: 'weekdays 16:30 KST', minutes: [990] },
-  { id: 'kis-vps-model-v3-autonomous-pilot-v1', kind: 'order', schedule: 'weekdays 09:15-14:55 KST every 10m and 16:20 KST', minutes: [...Array.from({ length: 35 }, (_, i) => 555 + (i * 10)), 980] },
+  { id: 'kis-vps-model-v3-autonomous-pilot-v1', kind: 'order', schedule: 'weekdays 09:15-14:45 KST every 10m and 14:50 KST horizon exit', minutes: [...Array.from({ length: 34 }, (_, i) => 555 + (i * 10)), 890] },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
 const TASK_ALERT_LABELS = new Map([
@@ -130,6 +142,9 @@ const ORDER_OUTPUT_KEYS = new Set([
   'shadow_predictions_inserted', 'shadow_duplicates_skipped',
   'model_v2_changed', 'scheduler_changed', 'retry', 'catch_up', 'backfill', 'fail_closed',
   'error_class', 'raw_response_persisted', 'secret_exposure',
+  'intraday_mode', 'intraday_model_version',
+  'decision_provider', 'intraday_feature_version', 'intraday_policy_version',
+  'intraday_feature_hash', 'intraday_policy_hash',
 ]);
 const ORDER_EXECUTION_ACTIONS = new Set([
   'entry_reconciled', 'exit_reconciled', 'ai_exit_reconciled',
@@ -141,6 +156,15 @@ const ORDER_ACTIONS = new Set([
   'waiting_regular_session', 'waiting_post_close', 'shadow_refreshed', 'idempotent_no_op', 'paused',
   ...ORDER_EXECUTION_ACTIONS,
 ]);
+
+function hasIntradayProviderAttestation(value) {
+  return Boolean(value)
+    && value.decision_provider === INTRADAY_PROVIDER_ATTESTATION.decision_provider
+    && value.intraday_feature_version === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
+    && value.intraday_policy_version === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
+    && value.intraday_feature_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash
+    && value.intraday_policy_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
+}
 
 function seoulParts(date) {
   const values = new Intl.DateTimeFormat('en-US', {
@@ -370,7 +394,8 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
   ];
   if (counts.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)
     || value.order_api_calls > 1 || value.vps_live_orders > 1 || value.prod_orders !== 0
-    || value.reconciliations > 1 || value.open_positions > 1 || value.daily_entry_count > 5) {
+    || value.reconciliations > 1 || value.open_positions > 1
+    || value.daily_entry_count > INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap) {
     throw new Error('unsafe_order_count');
   }
   const booleans = [
@@ -382,6 +407,12 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
     || value.scheduler_changed !== false || value.retry !== false || value.catch_up !== false
     || value.backfill !== false || value.raw_response_persisted !== false || value.secret_exposure !== false) {
     throw new Error('unsafe_order_output');
+  }
+  if (!hasIntradayProviderAttestation(value)) throw new Error('intraday_provider_attestation_mismatch');
+  if (!(value.intraday_mode === null || ['hybrid_bootstrap', 'ml_champion'].includes(value.intraday_mode))
+    || !(value.intraday_model_version === null
+      || /^intraday_(?:hybrid_v1|ml_[a-z0-9_]+)$/.test(value.intraday_model_version))) {
+    throw new Error('intraday_model_contract_invalid');
   }
   const artifactHash = value.artifact_hash;
   const previousArtifactHash = value.previous_artifact_hash;
@@ -423,6 +454,8 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
     artifactPromoted: value.artifact_promoted,
     previousArtifactHash,
     artifactHash,
+    intradayMode: value.intraday_mode,
+    intradayModelVersion: value.intraday_model_version,
     shadowPredictionsInserted: value.shadow_predictions_inserted,
   });
 }
@@ -430,10 +463,10 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
 function buildCommand(taskId, { activationPreflight = false, schedulerToken = '', dueKey: invocationDueKey = '' } = {}) {
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
   if (taskId === ORDER_TASK.id) {
-    const scheduledPostCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:20');
+    const scheduledHorizonExit = !activationPreflight && invocationDueKey.endsWith(':14:50');
     const action = activationPreflight
       ? 'activation-check'
-      : scheduledPostCloseRefresh ? 'scheduled-refresh-shadow' : 'run-once';
+      : scheduledHorizonExit ? 'horizon-exit' : 'run-once';
     const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
     if (!activationPreflight) {
       if (!/^[a-f0-9]{32}$/.test(schedulerToken) || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) {
@@ -447,6 +480,12 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
       env: activationPreflight ? {} : {
         KIS_HERMES_SCHEDULER_TOKEN: schedulerToken,
         KIS_HERMES_DUE_KEY: invocationDueKey,
+        KIS_INTRADAY_PROVIDER_ID: INTRADAY_PROVIDER_ATTESTATION.decision_provider,
+        KIS_INTRADAY_FEATURE_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+        KIS_INTRADAY_FEATURE_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+        KIS_INTRADAY_POLICY_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+        KIS_INTRADAY_POLICY_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+        KIS_INTRADAY_DAILY_ENTRY_CAP: String(INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap),
       },
     };
   }
@@ -625,7 +664,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let stateFaultNotificationPromise = null;
 
   function disabledState() {
-    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, daily_entry_cap: 3, daily_entry_cap_approval_hash: null } : {}) }])) };
+    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
   }
   function loadStrict() {
     try {
@@ -643,15 +682,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           state: 'DISABLED', schedule: ORDER_TASK.schedule, next_run_at: null,
           last_due_at: null, last_run: null, consecutive_transport_failures: 0,
           pending_invocation: null, activation_artifact_hash: null,
-          daily_entry_cap: 3, daily_entry_cap_approval_hash: null,
+          daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap,
+          daily_entry_cap_approval_hash: null,
+          ...INTRADAY_PROVIDER_ATTESTATION,
         };
       }
       const orderTask = value.tasks[ORDER_TASK.id];
-      if (orderTask.daily_entry_cap === undefined) orderTask.daily_entry_cap = 3;
-      if (orderTask.daily_entry_cap_approval_hash === undefined) orderTask.daily_entry_cap_approval_hash = null;
-      if (![3, 5].includes(orderTask.daily_entry_cap)
-        || (orderTask.daily_entry_cap === 5 && orderTask.daily_entry_cap_approval_hash !== DAILY_ENTRY_CAP_5_APPROVAL_HASH)
-        || (orderTask.daily_entry_cap === 3 && orderTask.daily_entry_cap_approval_hash !== null)) {
+      const providerFieldsPresent = Object.keys(INTRADAY_PROVIDER_ATTESTATION)
+        .filter((key) => key !== 'daily_entry_cap')
+        .some((key) => orderTask[key] !== undefined);
+      const validIntraday = orderTask.daily_entry_cap === INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap
+        && orderTask.daily_entry_cap_approval_hash == null
+        && hasIntradayProviderAttestation(orderTask);
+      const validLegacy = !providerFieldsPresent && (
+        (orderTask.daily_entry_cap === 3 && orderTask.daily_entry_cap_approval_hash == null)
+        || (orderTask.daily_entry_cap === 5
+          && orderTask.daily_entry_cap_approval_hash === LEGACY_DAILY_ENTRY_CAP_5_APPROVAL_HASH)
+      );
+      if (!validIntraday && !validLegacy) {
         throw new Error('state_contract_invalid');
       }
       return value;
@@ -923,15 +971,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const activationReady = parsed.status === 'success'
         && parsed.failClosed === false
         && parsed.actionType === 'activation_check';
-      const waitingForPostCloseBatch = parsed.status === 'blocked'
-        && parsed.failClosed === true
-        && parsed.actionType === 'paused'
-        && parsed.errorClass === 'model_v3_prediction_batch_incomplete';
-      if (!activationReady && !waitingForPostCloseBatch) {
+      if (!activationReady) {
         throw new Error(`order_activation_check_failed:${parsed.errorClass}`);
       }
-      if ((activationReady && error)
-        || (waitingForPostCloseBatch && (!error || Number(error.code) !== 2))) {
+      if (error) {
         throw new Error('order_activation_check_process_error');
       }
       const latest = loadStrict();
@@ -948,24 +991,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         status: 'success', action_type: 'activation_check', fail_closed: false,
         invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
       };
-      if (waitingForPostCloseBatch) {
-        if (parsed.artifactHash === null
-          || (latestPrior.activation_artifact_hash !== null
-            && latestPrior.activation_artifact_hash !== parsed.artifactHash)) {
-          throw new Error('model_v3_artifact_attestation_mismatch');
-        }
-        const parts = seoulParts(activatedAt);
-        const tradeDate = `${parts.year}-${parts.month}-${parts.day}`;
-        let proof;
-        try { proof = calendarProofResolver(tradeDate); }
-        catch { throw new Error('official_calendar_proof_invalid'); }
-        if (!proof || proof.isTradingDay !== true) throw new Error('post_close_arm_requires_trading_day');
-        scheduledAt = postCloseRefreshAtToday(activatedAt);
-        activationLastRun = {
-          status: 'waiting', action_type: 'activation_waiting_post_close', fail_closed: false,
-          error_class: 'none', invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
-        };
-      }
       return save({
         ...latest,
         order_pause_reason: undefined,
@@ -987,27 +1012,62 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { if (release) release(); }
   }
-  function approveAggressiveDailyEntryCap({ confirm = false, approval = '', invokedBy = 'hermes_cli' } = {}) {
-    if (confirm !== true) throw new Error('daily_entry_cap_confirmation_required');
-    if (approval !== DAILY_ENTRY_CAP_5_APPROVAL) throw new Error('exact_daily_entry_cap_approval_required');
+  async function cutoverIntradayProvider({ confirm = false, approval = '', invokedBy = 'hermes_cli' } = {}) {
+    if (confirm !== true) throw new Error('provider_cutover_confirmation_required');
+    if (approval !== INTRADAY_PROVIDER_CUTOVER_APPROVAL) {
+      throw new Error('exact_provider_cutover_approval_required');
+    }
     let release;
     try {
       release = acquireExclusiveLock(runLockPath);
       const current = loadStrict();
       const prior = current.tasks[ORDER_TASK.id];
-      if (current.state !== 'ACTIVE' || prior.state !== 'ACTIVE') throw new Error('order_task_must_be_active');
+      if (current.state !== 'ACTIVE' || prior.state !== 'ACTIVE') {
+        throw new Error('active_order_task_required');
+      }
+      if (prior.pending_invocation !== null) throw new Error('order_invocation_pending');
+      assertLegacyPaused();
+      assertNoResumeBlockingLocks();
+      if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
+      if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
+      const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
+      if (error) throw new Error('provider_cutover_preflight_process_error');
+      const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id);
+      if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_check') {
+        throw new Error(`provider_cutover_preflight_failed:${parsed.errorClass}`);
+      }
+      if (prior.activation_artifact_hash !== null
+        && parsed.artifactHash !== prior.activation_artifact_hash) {
+        throw new Error('provider_cutover_artifact_mismatch');
+      }
+      const latest = loadStrict();
+      const latestOrder = latest.tasks[ORDER_TASK.id];
+      if (latest.state !== current.state
+        || latestOrder.state !== prior.state
+        || latestOrder.pending_invocation !== null
+        || latestOrder.next_run_at !== prior.next_run_at) {
+        throw new Error('provider_cutover_state_changed');
+      }
+      const cutoverAt = now();
+      const tasks = Object.fromEntries(TASKS.map((task) => {
+        const item = latest.tasks[task.id];
+        return [task.id, {
+          ...item,
+          schedule: task.schedule,
+          next_run_at: item.state === 'ACTIVE' ? nextRunAt(task, cutoverAt) : null,
+          ...(task.kind === 'order' ? {
+            activation_artifact_hash: parsed.artifactHash,
+            daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap,
+            daily_entry_cap_approval_hash: null,
+            ...INTRADAY_PROVIDER_ATTESTATION,
+          } : {}),
+        }];
+      }));
       return save({
-        ...current,
-        tasks: {
-          ...current.tasks,
-          [ORDER_TASK.id]: {
-            ...prior,
-            daily_entry_cap: 5,
-            daily_entry_cap_approval_hash: DAILY_ENTRY_CAP_5_APPROVAL_HASH,
-            daily_entry_cap_approved_at: now().toISOString(),
-            daily_entry_cap_approved_by: safeText(invokedBy),
-          },
-        },
+        ...latest,
+        provider_cutover_at: cutoverAt.toISOString(),
+        provider_cutover_by: safeText(invokedBy),
+        tasks,
       });
     } finally { if (release) release(); }
   }
@@ -1072,7 +1132,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       token_hash: crypto.createHash('sha256').update(schedulerToken).digest('hex'),
       expires_at: new Date(now().getTime() + (5 * 60_000)).toISOString(),
       daily_entry_cap: taskState.daily_entry_cap,
-      daily_entry_cap_approval_hash: taskState.daily_entry_cap_approval_hash,
+      ...INTRADAY_PROVIDER_ATTESTATION,
     } : null;
     let attestationPath = null;
     try {
@@ -1095,9 +1155,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         return pauseForTask(loadStrict(), safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true });
       }
       const slot = seoulParts(dueTime);
-      const postCloseOrderSlot = task.kind === 'order'
-        && Number(slot.hour) === 16
-        && Number(slot.minute) === 20;
+      const horizonExitOrderSlot = task.kind === 'order'
+        && Number(slot.hour) === 14
+        && Number(slot.minute) === 50;
       if (task.kind === 'order' && parsed.artifactPromoted) {
         if (Number(slot.hour) !== 16 || Number(slot.minute) !== 20) {
           return pauseForTask(loadStrict(), 'model_v3_promotion_outside_post_close_slot', {
@@ -1107,9 +1167,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       if (task.kind === 'order' && !parsed.failClosed) {
-        const actionAllowed = postCloseOrderSlot
-          ? ['shadow_refreshed', 'market_closed_no_op'].includes(parsed.actionType)
-          : parsed.actionType !== 'shadow_refreshed';
+        const actionAllowed = horizonExitOrderSlot
+          ? ['horizon_exit_reconciled', 'market_closed_no_op', 'position_held'].includes(parsed.actionType)
+          : !['shadow_refreshed', 'horizon_exit_reconciled'].includes(parsed.actionType);
         if (!actionAllowed) {
           return pauseForTask(loadStrict(), 'order_action_not_allowed_for_schedule_slot', {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
@@ -1227,7 +1287,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (timer) clearTimer(timer); timer = null;
     const current = loadStrict(); return save({ ...current, scheduler_registered: false, server_registered: false });
   }
-  return { statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask, approveAggressiveDailyEntryCap, runOnce, start, stop, tick, buildCommand };
+  return { statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask, cutoverIntradayProvider, runOnce, start, stop, tick, buildCommand };
 }
 
 function attestationFileForDueKey(value, directory = ORDER_ATTESTATION_DIR) {
@@ -1242,7 +1302,7 @@ async function cli(argv = process.argv.slice(2)) {
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'enable-order' ? await task.enableOrderTask({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
-    : action === 'approve-daily-cap-5' ? task.approveAggressiveDailyEntryCap({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
+    : action === 'cutover-intraday-provider' ? await task.cutoverIntradayProvider({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()
     : action === 'start' ? task.start()
     : action === 'stop' ? task.stop()
@@ -1255,8 +1315,8 @@ if (require.main === module) cli().catch((error) => { process.stderr.write(`${sa
 module.exports = {
   CANONICAL_TASK_ID,
   TASK_OWNER,
-  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, ORDER_ACTIVATION_APPROVAL,
-  DAILY_ENTRY_CAP_5_APPROVAL, DAILY_ENTRY_CAP_5_APPROVAL_HASH,
+  ACTIVATION_APPROVAL, RESUME_AFTER_IO_FIX_APPROVAL, ORDER_ACTIVATION_APPROVAL, INTRADAY_PROVIDER_CUTOVER_APPROVAL,
+  INTRADAY_PROVIDER_ID, INTRADAY_FEATURE_VERSION, INTRADAY_POLICY_VERSION, INTRADAY_PROVIDER_ATTESTATION,
   KIS_REPO, KIS_VENV_PYTHON, VPS_DB_PATH, STRATEGY_MANIFEST, DEFAULT_STATE_PATH, DEFAULT_CALENDAR_SNAPSHOT_PATH,
   ORDER_ATTESTATION_DIR,
   APPROVED_SOURCE_TASK_PATH,
