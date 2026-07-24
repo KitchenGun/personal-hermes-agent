@@ -106,10 +106,15 @@ const ORDER_OUTPUT_KEYS = new Set([
   'model_v2_changed', 'scheduler_changed', 'retry', 'catch_up', 'backfill', 'fail_closed',
   'error_class', 'raw_response_persisted', 'secret_exposure',
 ]);
+const ORDER_EXECUTION_ACTIONS = new Set([
+  'entry_reconciled', 'exit_reconciled', 'ai_exit_reconciled',
+  'risk_stop_exit_reconciled', 'take_profit_exit_reconciled', 'horizon_exit_reconciled',
+]);
 const ORDER_ACTIONS = new Set([
-  'activation_check', 'entry_reconciled', 'exit_reconciled', 'position_held',
+  'activation_check', 'position_held', 'ai_position_held',
   'no_candidate_no_op', 'entry_window_closed_no_op', 'market_closed_no_op',
   'waiting_regular_session', 'waiting_post_close', 'shadow_refreshed', 'idempotent_no_op', 'paused',
+  ...ORDER_EXECUTION_ACTIONS,
 ]);
 
 function seoulParts(date) {
@@ -353,7 +358,7 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
   if (value.fail_closed !== blocked
     || (blocked && (value.action_type !== 'paused' || value.error_class === 'none'))
     || (!blocked && value.error_class !== 'none')) throw new Error('invalid_order_fail_closed_contract');
-  if (['entry_reconciled', 'exit_reconciled'].includes(value.action_type)) {
+  if (ORDER_EXECUTION_ACTIONS.has(value.action_type)) {
     if (value.status !== 'success' || value.order_api_calls !== 1
       || value.vps_live_orders !== 1 || value.reconciliations !== 1) throw new Error('invalid_order_execution_contract');
   } else if (!blocked && (value.order_api_calls !== 0 || value.vps_live_orders !== 0 || value.reconciliations !== 0)) {
