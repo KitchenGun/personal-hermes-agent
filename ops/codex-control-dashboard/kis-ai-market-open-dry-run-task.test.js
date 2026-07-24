@@ -501,10 +501,14 @@ test('explicit enable check rejects an order task paused for an unknown reason',
 });
 
 test('blocked autonomous order pauses only the order task and leaves dry-run tasks active', async () => {
-  const value = await active({ execFile(command, args, options, callback) {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked'));
     else callback(null, good(args[args.indexOf('--task-id') + 1]));
-  } });
+    },
+  });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   value.setClock(due);
@@ -513,6 +517,17 @@ test('blocked autonomous order pauses only the order task and leaves dry-run tas
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].targetChannelId, mod.REPORT_TARGET_CHANNEL_ID);
+  assert.equal(sent[0].deliveryLayer, 'hermes_ai_market_open_error');
+  assert.match(sent[0].content, /^\[KIS 자동운영 보호 중단\]/);
+  assert.match(sent[0].content, /작업: Model v3 VPS 모의투자/);
+  assert.match(sent[0].content, /원인: safe_block/);
+  assert.match(sent[0].content, /자동 재시도: 없음/);
+  assert.match(sent[0].content, /신규 주문: 중단/);
+  assert.equal(state.last_error_notification.succeeded, true);
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(sent.length, 1);
 });
 
 test('invalid autonomous output pauses only the order task without retry', async () => {
@@ -531,6 +546,27 @@ test('invalid autonomous output pauses only the order task without retry', async
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('blocked dry-run attempts one alert and preserves the original pause when delivery fails', async () => {
+  let runs = 0; let sends = 0;
+  const value = await active({
+    reportSender: async () => { sends += 1; throw new Error('private delivery detail'); },
+    execFile(command, args, options, callback) {
+      runs += 1;
+      callback(Object.assign(new Error('blocked'), { code: 2 }), good(args[args.indexOf('--task-id') + 1], 'blocked'));
+    },
+  });
+  const due = value.task.status().tasks[mod.TASKS[0].id].next_run_at;
+  value.setClock(due);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
+  assert.equal(runs, 1); assert.equal(sends, 1);
+  assert.equal(state.state, 'PAUSED'); assert.equal(state.pause_reason, 'safe_block');
+  assert.equal(state.last_error_notification.attempted, true);
+  assert.equal(state.last_error_notification.succeeded, false);
+  assert.equal(state.last_error_notification.retry, false);
+  await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
+  assert.equal(runs, 1); assert.equal(sends, 1);
 });
 
 test('order invocation uses one-time hashed scheduler attestation and clears pending state', async () => {
@@ -816,6 +852,15 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   }), mod.TASKS[1].id, trading), /task_result/);
 });
 
+test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
+  assert.equal(mod.sanitizeErrorClass('daily_entry_cap_attestation_mismatch'), 'daily_entry_cap_attestation_mismatch');
+  assert.equal(mod.sanitizeErrorClass('app_secret=value'), 'sanitized_runtime_error');
+  assert.equal(mod.sanitizeErrorClass('Bearer abc.def.ghi'), 'sanitized_runtime_error');
+  assert.equal(mod.sanitizeErrorClass('sk-proj-fixturetoken1234567890'), 'sanitized_runtime_error');
+  assert.equal(mod.sanitizeErrorClass('openai_api_key_fixturetoken1234567890'), 'sanitized_runtime_error');
+  assert.equal(mod.sanitizeErrorClass('HTTP 500 from private endpoint'), 'sanitized_runtime_error');
+});
+
 test('quote diagnosis parser requires sanitized exact three-of-three success', () => {
   assert.deepEqual(mod.parseQuoteTransportDiagnosticOutput(diagnostic()), {
     passed: true, symbolsAttempted: 3, symbolsSucceeded: 3, errorClass: 'none',
@@ -1005,17 +1050,73 @@ test('IO resume remains paused when health, writer lock, parity, or diagnosis fa
 });
 
 test('state corruption faults and pauses polling without executing child', async () => {
-  let calls = 0; const callbacks = [];
+  let calls = 0; const callbacks = []; const sent = [];
   const value = await active({
     schedulerRegistered: true, serverRegistered: true,
     setTimer(fn) { callbacks.push(fn); return { unref() {} }; }, clearTimer() {},
     execFile(c, a, o, cb) { calls += 1; cb(null, good(mod.TASKS[0].id)); },
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
   });
   value.task.start();
   fs.writeFileSync(value.paths.statePath, '{');
   const result = await value.task.tick();
   assert.equal(result.state, 'PAUSED'); assert.equal(result.scheduler_faulted, true);
   assert.equal(calls, 0); assert.equal(callbacks.length, 1);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].content, /원인: scheduler_state_fault/);
+});
+
+test('status and direct runOnce share one persistent state-fault notification claim', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  fs.writeFileSync(value.paths.statePath, '{');
+  assert.equal(value.task.status().pause_reason, 'state_unavailable');
+  await new Promise((resolve) => setImmediate(resolve));
+  const direct = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date() });
+  assert.equal(direct.pause_reason, 'state_unavailable');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].deliveryLayer, 'hermes_ai_market_open_error');
+  assert.match(sent[0].content, /scheduler_state_fault/);
+});
+
+test('independent task instances acquire one exclusive state-fault notification claim', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  const peer = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths,
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  fs.writeFileSync(value.paths.statePath, '{');
+  assert.equal(value.task.status().pause_reason, 'state_unavailable');
+  assert.equal(peer.status().pause_reason, 'state_unavailable');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(sent.length, 1);
+});
+
+test('state-fault claim I/O failure remains fail-closed without an unhandled alert promise', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  fs.writeFileSync(value.paths.statePath, '{');
+  const originalWrite = fs.writeFileSync;
+  fs.writeFileSync = (target, ...args) => {
+    if (typeof target === 'number') throw new Error('claim write failed');
+    return originalWrite(target, ...args);
+  };
+  try {
+    assert.equal(value.task.status().pause_reason, 'state_unavailable');
+    await new Promise((resolve) => setImmediate(resolve));
+    const direct = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date() });
+    assert.equal(direct.pause_reason, 'state_unavailable');
+    assert.equal(sent.length, 0);
+  } finally {
+    fs.writeFileSync = originalWrite;
+  }
 });
 
 const report = '[KIS VPS 모의투자 일일 결과]\n기준일: 2026-07-21\n오늘 체결: 매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주\n현재 보유: 삼성전자(005930) 2주\n오늘 실현손익: +1,000원 (현금 증감 기준)\nAI 검증: 판단 3건 / 모델 변경 0회\n운영 상태: 정상\n실전계좌: 주문 없음';
@@ -1052,7 +1153,8 @@ test('daily report rejects unapproved symbols, price details, and mismatched fac
     const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:29Z') });
     assert.equal(state.state, 'PAUSED');
     assert.equal(state.pause_reason, 'invalid_report_message');
-    assert.equal(sends, 0);
+    assert.equal(sends, 1);
+    assert.equal(state.last_error_notification.succeeded, true);
   }
 });
 
@@ -1089,4 +1191,6 @@ test('report failure pauses all tasks and never retries the KIS cycle', async ()
   value.setClock('2026-07-21T07:30:00Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:00Z') });
   assert.equal(sends, 1); assert.equal(runs, 1); assert.equal(state.state, 'PAUSED');
+  assert.equal(state.last_error_notification.attempted, false);
+  assert.equal(state.last_error_notification.succeeded, false);
 });
