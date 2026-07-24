@@ -1018,7 +1018,7 @@ test('state corruption faults and pauses polling without executing child', async
   assert.equal(calls, 0); assert.equal(callbacks.length, 1);
 });
 
-const report = '[KIS Adaptive AI Dry-Run]\ndata: sessions 4 / decisions 3\nmodels: fixed_rule_v1 baseline / candidates 2\nsimulation: orders 0 / fills and positions 0\nlearning: runs 1 / champion changes 0\nquality: incidents 0 / drift reviews 0\noutcomes: no filled samples; cost and MFE/MAE not applicable\nactual orders: none';
+const report = '[KIS VPS 모의투자 일일 결과]\n기준일: 2026-07-21\n오늘 체결: 매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주\n현재 보유: 삼성전자(005930) 2주\n오늘 실현손익: +1,000원 (현금 증감 기준)\nAI 검증: 판단 3건 / 학습 1회 / 모델 변경 0회\n운영 상태: 정상\n실전계좌: 주문 없음';
 
 test('daily report uses existing sender exactly once and stores status only', async () => {
   const sent = [];
@@ -1029,8 +1029,29 @@ test('daily report uses existing sender exactly once and stores status only', as
   value.setClock('2026-07-21T07:30:29Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:29Z') });
   assert.equal(sent.length, 1); assert.equal(sent[0].targetChannelId, mod.REPORT_TARGET_CHANNEL_ID);
+  assert.equal(sent[0].content, report);
   assert.equal(state.tasks[mod.TASKS[3].id].last_run.status, 'report_sent');
-  assert.equal(JSON.stringify(state).includes('session runs'), false);
+  assert.equal(JSON.stringify(state).includes('삼성전자'), false);
+});
+
+test('daily report rejects unapproved symbols and price details before delivery', async () => {
+  for (const unsafeReport of (
+    [
+      report.replace('삼성전자(005930)', '미승인종목(999999)'),
+      report.replace('2주', '2주 @ 70,000원'),
+    ]
+  )) {
+    let sends = 0;
+    const value = await active({
+      reportSender: async () => { sends += 1; return { discord_sent: true }; },
+      execFile(c, a, o, cb) { cb(null, good(mod.TASKS[3].id, 'report_ready', { action_type: 'daily_learning_report', report_message: unsafeReport })); },
+    });
+    value.setClock('2026-07-21T07:30:29Z');
+    const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:29Z') });
+    assert.equal(state.state, 'PAUSED');
+    assert.equal(state.pause_reason, 'invalid_report_message');
+    assert.equal(sends, 0);
+  }
 });
 
 test('report failure pauses all tasks and never retries the KIS cycle', async () => {
