@@ -99,6 +99,10 @@ const BOOLEAN_KEYS = new Set([
 ]);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret)/i;
 const OFFICIAL_SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
+const VPS_SYMBOL_LABEL = '(?:삼성전자\\(005930\\)|SK하이닉스\\(000660\\)|현대차\\(005380\\))';
+const VPS_FILL_ITEM_RE = new RegExp(`^(?:매수|매도) ${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
+const VPS_HOLDING_ITEM_RE = new RegExp(`^${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
+const VPS_REALIZED_PNL_RE = /^(?:0원 \(매도 체결 없음\)|계산 불가 \(체결 근거 부족\)|(?:추정 )?[+-]\d{1,3}(?:,\d{3})*원 \((?:현금 증감 기준|체결가 기준, 비용 제외)\))$/;
 const ORDER_OUTPUT_KEYS = new Set([
   'task_id', 'status', 'action_type', 'official_trade_date', 'order_api_calls',
   'vps_live_orders', 'prod_orders', 'reconciliations', 'open_positions', 'daily_entry_count',
@@ -172,18 +176,31 @@ function safeText(value, max = 160) {
   return String(value ?? '').replace(/[\r\n\t]/g, ' ').replace(/[^\x20-\x7e]/g, '').slice(0, max);
 }
 
-function validateReportMessage(value) {
+function validateReportList(value, emptyValues, itemPattern, maxItems) {
+  if (emptyValues.has(value)) return;
+  const items = value.split('; ');
+  if (items.length === 0 || items.length > maxItems || items.some((item) => !itemPattern.test(item))) {
+    throw new Error('invalid_report_message');
+  }
+}
+
+function validateReportMessage(value, officialTradeDate, decisions) {
   const reportMessage = String(value || '');
   const lines = reportMessage.split('\n');
+  const decisionMatch = /^AI 검증: 판단 (\d+)건 \/ 모델 변경 0회$/.exec(lines[5] || '');
   if (reportMessage.length > 600 || lines.length !== 8
-    || lines[0] !== '[KIS Adaptive AI Dry-Run]'
-    || !/^data: sessions \d+ \/ decisions \d+$/.test(lines[1])
-    || !/^models: fixed_rule_v1 baseline \/ candidates \d+$/.test(lines[2])
-    || !/^simulation: orders \d+ \/ fills and positions \d+$/.test(lines[3])
-    || !/^learning: runs \d+ \/ champion changes 0$/.test(lines[4])
-    || !/^quality: incidents \d+ \/ drift reviews \d+$/.test(lines[5])
-    || lines[6] !== 'outcomes: no filled samples; cost and MFE/MAE not applicable'
-    || lines[7] !== 'actual orders: none') throw new Error('invalid_report_message');
+    || lines[0] !== '[KIS VPS 모의투자 일일 결과]'
+    || lines[1] !== `기준일: ${officialTradeDate}`
+    || !lines[2].startsWith('오늘 체결: ')
+    || !lines[3].startsWith('현재 보유: ')
+    || !lines[4].startsWith('오늘 실현손익: ')
+    || decisionMatch === null
+    || Number(decisionMatch[1]) !== decisions
+    || !/^운영 상태: (?:정상|확인 필요 [1-9]\d*건)$/.test(lines[6])
+    || lines[7] !== '실전계좌: 주문 없음') throw new Error('invalid_report_message');
+  validateReportList(lines[2].slice('오늘 체결: '.length), new Set(['없음', '확인 불가 (주문 원장 없음)']), VPS_FILL_ITEM_RE, 10);
+  validateReportList(lines[3].slice('현재 보유: '.length), new Set(['없음', '확인 불가']), VPS_HOLDING_ITEM_RE, 3);
+  if (!VPS_REALIZED_PNL_RE.test(lines[4].slice('오늘 실현손익: '.length))) throw new Error('invalid_report_message');
   return reportMessage;
 }
 
@@ -291,7 +308,9 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   }
   validateTaskMeaning(value);
   let reportMessage = null;
-  if (value.status === 'report_ready') reportMessage = validateReportMessage(value.report_message);
+  if (value.status === 'report_ready') {
+    reportMessage = validateReportMessage(value.report_message, value.official_trade_date, value.decisions);
+  }
   else if (value.report_message !== null) throw new Error('unexpected_report_message');
   return Object.freeze({
     status: value.status, failClosed: value.fail_closed, reportMessage,
