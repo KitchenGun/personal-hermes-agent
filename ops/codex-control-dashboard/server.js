@@ -7,6 +7,9 @@ const kisReportDelivery = require('./kis-report-delivery-adapter');
 const kisPredictionValidationTask = require('./kis-prediction-validation-task');
 const kisPredictionV2ValidationTask = require('./kis-prediction-v2-validation-task');
 const kisAiMarketOpenDryRunTask = require('./kis-ai-market-open-dry-run-task');
+const kisLlmVerdictExecutor = require('./kis-llm-verdict-executor');
+const kisEmergencyStopExecutor = require('./kis-emergency-stop-executor');
+const { createDiscordInteractionReplayGuard } = require('./discord-interaction-replay-guard');
 const discordRelay = require('./discord-relay');
 const { planCapabilities, renderCapabilitySection } = require('./capability-planner');
 
@@ -16,6 +19,7 @@ const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const HERMES_BIN = process.env.HERMES_BIN || 'hermes';
 const HERMES_EXEC_MODE = process.env.HERMES_EXEC_MODE || 'native';
+const KIS_LLM_VERDICT_DIR = '/home/ubuntu/.hermes/state/kis-ai-verdicts';
 const QUEUE_EXECUTION_PROFILE = cleanProfile(process.env.QUEUE_EXECUTION_PROFILE || 'default', 'default');
 const QUEUE_SPAWNABLE_PROFILES = new Set(
   String(process.env.QUEUE_SPAWNABLE_PROFILES || `${QUEUE_EXECUTION_PROFILE},kk_job`)
@@ -59,6 +63,10 @@ const DISCORD_ALLOWED_USER_IDS = new Set(
     .map((value) => value.trim())
     .filter(Boolean),
 );
+const KIS_DISCORD_CHANNEL_ID = String(
+  process.env.KIS_DISCORD_CHANNEL_ID || '1512691418605420634',
+).trim();
+const DISCORD_INTERACTION_REPLAY_STATE_PATH = '/home/ubuntu/.hermes/state/discord-interaction-replay-v1.json';
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
@@ -74,6 +82,12 @@ const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarket
   schedulerRegistered: true,
   serverRegistered: true,
   reportSender: sendKisReportViaDiscordRelay,
+  llmExecutor: kisLlmVerdictExecutor.createHermesLlmVerdictExecutor({
+    hermesBin: process.env.HERMES_KIS_LLM_BIN || '/home/ubuntu/.local/bin/hermes',
+    execMode: HERMES_EXEC_MODE === 'direct' || process.platform !== 'win32' ? 'direct' : 'wsl',
+  }),
+  emergencyStopExecutor: (options) => kisEmergencyStopExecutor.execute(options),
+  verdictDir: KIS_LLM_VERDICT_DIR,
 });
 
 if (!CONTROL_SHARED_SECRET) {
@@ -113,6 +127,9 @@ const supervisor = {
 
 const summaryCache = new Map();
 let loadBoardStateForTest = null;
+const discordInteractionReplayGuard = createDiscordInteractionReplayGuard({
+  statePath: DISCORD_INTERACTION_REPLAY_STATE_PATH,
+});
 
 function okJson(res, value) {
   const body = JSON.stringify(value);
@@ -1454,7 +1471,7 @@ function verifyDiscordRequest(req, rawBody) {
   if (!DISCORD_PUBLIC_KEY) return true;
   const signature = String(req.headers['x-signature-ed25519'] || '');
   const timestamp = String(req.headers['x-signature-timestamp'] || '');
-  if (!/^[0-9a-f]{128}$/i.test(signature) || !timestamp) return false;
+  if (!/^[0-9a-f]{128}$/i.test(signature) || !discordInteractionReplayGuard.isFresh(timestamp)) return false;
   const rawKey = Buffer.from(DISCORD_PUBLIC_KEY, 'hex');
   if (rawKey.length !== 32) return false;
   const publicKey = crypto.createPublicKey({
@@ -1476,7 +1493,26 @@ function discordUserId(interaction) {
 
 function assertDiscordAllowed(userId) {
   if (DISCORD_ALLOWED_USER_IDS.size && !DISCORD_ALLOWED_USER_IDS.has(userId)) {
-    throw new Error('discord user is not allowed to create tasks');
+    throw new Error('discord user is not allowed');
+  }
+}
+
+function assertKisEmergencyStopOperator(userId, allowedUserIds = DISCORD_ALLOWED_USER_IDS) {
+  if (!(allowedUserIds instanceof Set) || allowedUserIds.size === 0) {
+    throw new Error('discord operator allowlist is required');
+  }
+  if (!allowedUserIds.has(String(userId || ''))) {
+    throw new Error('discord user is not allowed');
+  }
+}
+
+function isKisEmergencyStopInteraction(interaction) {
+  return interaction?.data?.name === 'kis-stop';
+}
+
+function assertKisEmergencyStopChannel(interaction) {
+  if (!KIS_DISCORD_CHANNEL_ID || String(interaction?.channel_id || '') !== KIS_DISCORD_CHANNEL_ID) {
+    throw new Error('discord channel is not allowed');
   }
 }
 
@@ -1556,6 +1592,40 @@ async function processDiscordInteraction(interaction) {
   } catch (error) {
     pushSupervisorLog('error', `discord task failed: ${error.message || String(error)}`);
     await sendDiscordFollowup(interaction, `Task failed: ${error.message || String(error)}`).catch(() => {});
+  }
+}
+
+function emergencyStopMessage(result) {
+  if (result.status === 'success' && result.reconciliation_passed) {
+    return [
+      '[KIS 보호 중단]',
+      '상태: persistent PAUSED',
+      `미체결 매수 취소: ${result.open_buys_cancelled}건`,
+      `보유 청산: ${result.positions_liquidated}건`,
+      'broker reconciliation: 완료',
+    ].join('\n');
+  }
+  return [
+    '[KIS 보호 중단]',
+    '상태: 차단',
+    `원인: ${result.error_class}`,
+    '자동 재시도: 없음',
+  ].join('\n');
+}
+
+async function processKisEmergencyStopInteraction(interaction) {
+  try {
+    assertKisEmergencyStopOperator(discordUserId(interaction));
+    assertKisEmergencyStopChannel(interaction);
+    const result = await kisEmergencyStopExecutor.execute();
+    await sendDiscordFollowup(interaction, emergencyStopMessage(result));
+  } catch (error) {
+    const errorClass = sanitizeErrorClass(error.message || String(error)) || 'error';
+    pushSupervisorLog('error', `KIS emergency stop blocked: ${errorClass}`);
+    await sendDiscordFollowup(
+      interaction,
+      ['[KIS 보호 중단]', '상태: 차단', `원인: ${errorClass}`, '자동 재시도: 없음'].join('\n'),
+    ).catch(() => {});
   }
 }
 
@@ -2264,6 +2334,10 @@ async function apiDiscord(req, res) {
     if (interaction.type === 2) {
       try {
         assertDiscordAllowed(discordUserId(interaction));
+        if (isKisEmergencyStopInteraction(interaction)) {
+          assertKisEmergencyStopOperator(discordUserId(interaction));
+          assertKisEmergencyStopChannel(interaction);
+        }
       } catch (error) {
         okJson(res, {
           type: 4,
@@ -2275,7 +2349,22 @@ async function apiDiscord(req, res) {
         });
         return;
       }
-      processDiscordInteraction(interaction).catch(() => {});
+      if (!discordInteractionReplayGuard.claim(interaction.id)) {
+        okJson(res, {
+          type: 4,
+          data: {
+            flags: 64,
+            content: 'Duplicate or invalid interaction rejected.',
+            allowed_mentions: { parse: [] },
+          },
+        });
+        return;
+      }
+      if (isKisEmergencyStopInteraction(interaction)) {
+        processKisEmergencyStopInteraction(interaction).catch(() => {});
+      } else {
+        processDiscordInteraction(interaction).catch(() => {});
+      }
       okJson(res, {
         type: 5,
         data: {
@@ -2310,6 +2399,7 @@ async function sendKisReportViaDiscordRelay(message) {
     targetChannelId,
     content: message.content,
     deliveryLayer: message.deliveryLayer,
+    idempotencyKey: message.idempotencyKey,
   });
 }
 
@@ -2574,5 +2664,7 @@ module.exports = {
     kisPredictionTaskRuntime,
     kisAiMarketOpenDryRunTask,
     kisAiMarketOpenDryRunRuntime,
+    kisLlmVerdictExecutor,
+    assertKisEmergencyStopOperator,
   },
 };

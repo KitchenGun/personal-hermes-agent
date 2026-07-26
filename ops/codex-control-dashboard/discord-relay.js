@@ -199,12 +199,44 @@ async function sendDiscordRelayMessage(message = {}) {
   const targetChannelId = String(message.targetChannelId || '').trim();
   if (!targetChannelId) throw new Error('target channel id is required');
   if (!TOKEN) throw new Error('DISCORD_BOT_TOKEN is required');
+  const claim = claimDeliveryKey(message.idempotencyKey);
+  if (claim.duplicate) {
+    return {
+      discord_sent: true,
+      duplicate_suppressed: true,
+      target_channel_id: targetChannelId,
+      delivery_layer: message.deliveryLayer || 'discord_relay',
+    };
+  }
   await sendDiscordMessage(targetChannelId, message.content);
   return {
     discord_sent: true,
     target_channel_id: targetChannelId,
     delivery_layer: message.deliveryLayer || 'discord_relay',
   };
+}
+
+function claimDeliveryKey(idempotencyKey, stateFile = STATE_FILE) {
+  const value = String(idempotencyKey || '').trim();
+  if (!value) return { claimed: false, duplicate: false };
+  const digest = require('node:crypto').createHash('sha256').update(value).digest('hex');
+  const directory = `${stateFile}.delivery-claims`;
+  const claimPath = path.join(directory, `${digest}.json`);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  let fd;
+  try {
+    fd = fs.openSync(claimPath, 'wx', 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify({ key_hash: digest, claimed_at: new Date().toISOString() })}\n`, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    return { claimed: true, duplicate: false, keyHash: digest };
+  } catch (error) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    if (error.code === 'EEXIST') return { claimed: false, duplicate: true, keyHash: digest };
+    throw error;
+  }
 }
 
 function send(op, d = null) {
@@ -1040,6 +1072,7 @@ module.exports = {
     isActiveState,
     statusPollDelayMs,
     fetchWithTimeout,
+    claimDeliveryKey,
     shouldHandle,
     shouldSendQueueOnlyNotice,
     intervals: {

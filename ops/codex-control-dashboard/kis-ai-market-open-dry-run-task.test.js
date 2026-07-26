@@ -95,6 +95,14 @@ function orderGood(status = 'no_op', extra = {}) {
     intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
     intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
     intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+    order_symbol: null,
+    order_side: null,
+    requested_quantity: 0,
+    filled_quantity: 0,
+    unfilled_quantity: 0,
+    lifecycle_status: null,
+    decision_reason_codes: [],
+    notification_idempotency_key: null,
     ...extra,
   });
 }
@@ -143,6 +151,111 @@ function blockedDiagnostic() {
   return JSON.stringify(value);
 }
 
+function aiVerdict(packet, decisions = []) {
+  return { slot_id: packet.slot_id, model_id: mod.LLM_MODEL_ID, prompt_hash: packet.prompt_hash, decisions };
+}
+
+function safetyOutput(status = 'success', extra = {}) {
+  return JSON.stringify({
+    task_id: 'kis-vps-safety-monitor-v1', status, action_type: 'safety_monitor',
+    execution_owner: 'vps',
+    process_lock: 'clear', kill_state: 'clear', open_order_status: 'clear',
+    reconciliation_status: 'clear', account_risk_status: 'clear', order_api_calls: 0,
+    vps_live_orders: 0, prod_orders: 0, retry: false, catch_up: false,
+    fail_closed: status === 'blocked', error_class: status === 'blocked' ? 'safe_block' : 'none', ...extra,
+  });
+}
+
+function weeklyUniverseOutput(status = 'success', extra = {}) {
+  const blocked = status === 'blocked';
+  const values = {
+    status,
+    action_type: 'weekly_universe_refresh',
+    iso_week: '2026-W31',
+    selected_count: blocked ? 0 : 50,
+    exit_only_count: 0,
+    api_calls: 3,
+    official_downloads: 2,
+    db_written: !blocked,
+    artifact_changed: false,
+    live_candidates_changed: false,
+    raw_response_persisted: false,
+    prod_db_touched: false,
+    order_attempted: false,
+    fail_closed: blocked,
+    error_class: blocked ? 'weekly_universe_not_ready' : 'none',
+    ...extra,
+  };
+  return Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n');
+}
+
+function cutoverOutput(status = 'INELIGIBLE', extra = {}) {
+  const blocked = status === 'blocked';
+  return JSON.stringify({
+    task_id: 'kis-vps-to-prod-cutover-v1',
+    status,
+    action_type: status === 'success' ? 'cutover_activated' : status === 'CUTOVER_PENDING' ? 'cutover_pending' : status === 'INELIGIBLE' ? 'cutover_ineligible' : 'cutover_check',
+    activation_performed: status === 'success',
+    execution_owner_before: 'vps',
+    execution_owner_after: status === 'success' ? 'prod' : 'vps',
+    distinct_vps_days: status === 'INELIGIBLE' ? 1 : 20,
+    reconciled_round_trips: status === 'INELIGIBLE' ? 1 : 30,
+    unresolved_major_incidents: 0,
+    vps_flat: true,
+    open_orders: 0,
+    db_integrity_ok: true,
+    active_scheduler_count: 1,
+    blocked_issue_count: status === 'INELIGIBLE' ? 2 : 0,
+    prod_db_touched: status === 'success',
+    prod_orders: 0,
+    vps_live_orders: 0,
+    order_api_calls: 0,
+    retry: false,
+    fail_closed: blocked,
+    error_class: blocked ? 'cutover_check_failed' : status === 'INELIGIBLE' ? 'blocked:insufficient_distinct_vps_days' : 'none',
+    ...extra,
+  });
+}
+
+function decisionContext(slotId, candidates = ['005930']) {
+  return JSON.stringify({
+    task_id: 'kis-llm-decision-context-v1',
+    status: 'success',
+    slot_id: slotId,
+    model_id: mod.LLM_MODEL_ID,
+    official_trade_date: '2026-07-21',
+    candidates: candidates.map((symbol) => ({
+      symbol,
+      role: 'eligible_entry',
+      ml_action: 'ENTER',
+      confidence_bucket: 'high',
+      prob_up: 0.7,
+      prob_flat: 0.2,
+      prob_down: 0.1,
+      expected_net_return: 0.01,
+      risk_overlay: 'ALLOW',
+      data_quality: 'PASS',
+    })),
+    holdings: [],
+    account_aggregate: { available_cash: 1000000, account_equity: 1000000 },
+    risk_aggregate: {
+      open_positions: 0,
+      open_orders: 0,
+      daily_entry_submit_count: 0,
+      active_daily_entry_cap: 3,
+      max_positions: 3,
+      max_symbol_equity_pct: 50,
+      planned_position_loss_pct: 1,
+      daily_loss_limit_pct: 3,
+    },
+    event_metadata: [],
+    fail_closed: false,
+    error_class: 'none',
+    raw_response_persisted: false,
+    secret_exposure: false,
+  });
+}
+
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-ai-'));
   const paths = {
@@ -152,15 +265,33 @@ function fixture(options = {}) {
     legacyV1RunLockPath: path.join(root, 'v1.lock'),
     legacyV2RunLockPath: path.join(root, 'v2.lock'),
     runLockPath: path.join(root, 'ai.lock'),
+    schedulerOwnerLockPath: path.join(root, 'scheduler-owner.lock'),
     orderAttestationDir: path.join(root, 'attestations'),
+    verdictDir: path.join(root, 'verdicts'),
   };
   fs.writeFileSync(paths.legacyV1StatePath, JSON.stringify({ state: 'PAUSED', next_run_at: null }));
   fs.writeFileSync(paths.legacyV2StatePath, JSON.stringify({ state: 'PAUSED', next_run_at: null }));
   let clock = new Date('2026-07-20T23:59:00Z');
   const taskExec = options.execFile || ((c, a, o, cb) => cb(null, good(a[a.indexOf('--task-id') + 1])));
   const execFile = (command, args, execOptions, callback) => {
+    if (args.includes('safety-monitor')) {
+      callback(null, options.safetyOutput || safetyOutput());
+      return;
+    }
+    if (args.includes('decision-context')) {
+      callback(null, options.decisionContextOutput || decisionContext(execOptions.env.KIS_HERMES_DUE_KEY));
+      return;
+    }
     if (args.includes('ai-quote-transport-diagnose-once')) {
       callback(null, options.diagnosticOutput || diagnostic());
+      return;
+    }
+    if (args.includes('model-v3-run') && args.includes('weekly-universe')) {
+      callback(options.weeklyUniverseError || null, options.weeklyUniverseOutput || weeklyUniverseOutput());
+      return;
+    }
+    if (args.includes('vps-autonomous-order') && args.includes('scheduled-cutover')) {
+      callback(options.cutoverError || null, options.cutoverOutput || cutoverOutput());
       return;
     }
     if (args.includes('--activation-preflight')) {
@@ -185,10 +316,13 @@ function fixture(options = {}) {
     execFile,
     reportSender: options.reportSender,
     calendarProofResolver: options.calendarProofResolver || (() => calendarProof(true)),
+    llmExecutor: options.llmExecutor || (async ({ packet }) => aiVerdict(packet)),
+    emergencyStopExecutor: options.emergencyStopExecutor,
     schedulerRegistered: options.schedulerRegistered,
     serverRegistered: options.serverRegistered,
     setTimer: options.setTimer,
     clearTimer: options.clearTimer,
+    enforceSchedulerOwnership: options.enforceSchedulerOwnership ?? false,
   });
   return { root, paths, task, setClock(value) { clock = new Date(value); }, rawExec: taskExec };
 }
@@ -222,7 +356,7 @@ test('exact activation approval enables four dry-run schedules and keeps order d
 });
 
 test('order command uses VM venv and exposes no per-run approval', () => {
-  const dueKey = `${mod.TASKS[4].id}:2026-07-22:09:15`;
+  const dueKey = `${mod.TASKS[4].id}:2026-07-22:09:10`;
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '1'.repeat(32), dueKey });
   assert.equal(command.command, mod.KIS_VENV_PYTHON);
   assert.equal(command.cwd, mod.KIS_REPO);
@@ -237,26 +371,167 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, '3');
   assert.equal(command.args.includes('--approval'), false);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
-  const horizonDueKey = `${mod.TASKS[4].id}:2026-07-22:14:50`;
-  const horizon = mod.buildCommand(mod.TASKS[4].id, {
+  const finalDueKey = `${mod.TASKS[4].id}:2026-07-22:14:40`;
+  const finalSlot = mod.buildCommand(mod.TASKS[4].id, {
     schedulerToken: '2'.repeat(32),
-    dueKey: horizonDueKey,
+    dueKey: finalDueKey,
   });
   assert.deepEqual(
-    horizon.args,
-    ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'horizon-exit'],
+    finalSlot.args,
+    ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once'],
   );
 });
 
-test('intraday schedules use only future 10-minute slots plus horizon exit, learning, and report', () => {
+test('intraday decision and order schedules align on future 10-minute slots', () => {
   assert.deepEqual(mod.TASKS[1].minutes, Array.from({ length: 34 }, (_, i) => 550 + (i * 10)));
   assert.deepEqual(mod.TASKS[2].minutes, [980]);
   assert.deepEqual(mod.TASKS[3].minutes, [990]);
   const task = mod.TASKS[4];
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:14:00Z')), '2026-07-21T00:15:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:44:00Z')), '2026-07-21T05:45:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:45:00Z')), '2026-07-21T05:50:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:50:00Z')), '2026-07-22T00:15:00.000Z');
+  assert.deepEqual(task.minutes, [...mod.TASKS[1].minutes, 881, 882, 980]);
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:09:00Z')), '2026-07-21T00:10:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:39:00Z')), '2026-07-21T05:40:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:40:00Z')), '2026-07-21T05:41:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:42:00Z')), '2026-07-21T07:20:00.000Z');
+});
+
+test('post-close cutover check reuses the existing order task and never invokes an LLM', async () => {
+  let llmCalls = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
+    cutoverOutput: cutoverOutput('INELIGIBLE'),
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = value.task.status();
+  const due = '2026-07-21T07:20:00.000Z';
+  state.tasks[mod.TASKS[4].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+
+  assert.equal(llmCalls, 0);
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'cutover_ineligible');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.distinct_vps_days, 1);
+  assert.equal(Object.keys(after.tasks).length, 5);
+});
+
+test('cutover command is attested and exposes scheduler count but no order approval', () => {
+  const dueKey = `${mod.TASKS[4].id}:2026-07-21:16:20`;
+  const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '3'.repeat(32), dueKey });
+  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-cutover']);
+  assert.equal(command.env.KIS_ACTIVE_SCHEDULER_COUNT, '1');
+  assert.equal(command.args.includes('--approval'), false);
+  const parsed = mod.parseCutoverOutput(cutoverOutput('CUTOVER_PENDING'));
+  assert.equal(parsed.actionType, 'cutover_pending');
+  assert.equal(parsed.activationPerformed, false);
+  assert.throws(
+    () => mod.parseCutoverOutput(cutoverOutput('success', { execution_owner_before: 'disabled' })),
+    /invalid_cutover_output/,
+  );
+  assert.throws(
+    () => mod.parseCutoverOutput(cutoverOutput('CUTOVER_PENDING', { prod_db_touched: true })),
+    /invalid_cutover_output/,
+  );
+  for (const unsafe of [
+    { vps_flat: false }, { open_orders: 1 }, { db_integrity_ok: false },
+    { unresolved_major_incidents: 1 }, { blocked_issue_count: 1 },
+    { distinct_vps_days: 19 }, { reconciled_round_trips: 29 },
+  ]) {
+    assert.throws(() => mod.parseCutoverOutput(cutoverOutput('success', unsafe)), /invalid_cutover_output/);
+  }
+});
+
+test('weekly universe refresh reuses the Friday post-close task and strict KIS action', () => {
+  const friday = new Date('2026-07-31T07:20:00Z');
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[2], friday), true);
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[2], new Date('2026-07-30T07:20:00Z')), false);
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[1], friday), false);
+  const command = mod.buildWeeklyUniverseCommand();
+  assert.equal(command.command, mod.KIS_VENV_PYTHON);
+  assert.equal(command.cwd, mod.KIS_REPO);
+  assert.deepEqual(command.args, [
+    '-m', 'kis_trading_lab', 'model-v3-run',
+    '--approval', 'APPROVE_KIS_MODEL_V3_30D_RESEARCH_API_VPS_V1',
+    '--action', 'weekly-universe', '--db', mod.VPS_DB_PATH,
+  ]);
+  const parsed = mod.parseWeeklyUniverseOutput(weeklyUniverseOutput());
+  assert.equal(parsed.selectedCount, 50);
+  assert.equal(parsed.apiCalls, 3);
+  assert.equal(parsed.failClosed, false);
+});
+
+test('Friday post-close records weekly future universe without adding a scheduler', async () => {
+  const calls = [];
+  const value = await active({
+    execFile(command, args, options, callback) {
+      calls.push([...args]);
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  const due = '2026-07-31T07:20:00.000Z';
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+  const result = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_status, 'success');
+  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_selected_count, 50);
+  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_db_written, true);
+  assert.equal(calls.length, 1);
+  assert.equal(result.scheduler_registered, false);
+});
+
+test('weekly future-universe block does not change the frozen active model owner', async () => {
+  const value = await active({ weeklyUniverseOutput: weeklyUniverseOutput('blocked') });
+  const due = '2026-07-31T07:20:00.000Z';
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+  const result = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(result.state, 'ACTIVE');
+  assert.equal(result.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_fail_closed, true);
+  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_error_class, 'weekly_universe_not_ready');
+});
+
+test('14:41 risk-off slot reuses the order task without a new LLM decision', async () => {
+  let llmCalls = 0;
+  let orderCalls = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
+    execFile(command, args, options, callback) {
+      if (args.includes('vps-autonomous-order')) {
+        orderCalls += 1;
+        callback(null, orderGood('success', {
+          action_type: 'horizon_exit_reconciled',
+          order_api_calls: 1, vps_live_orders: 1, reconciliations: 1,
+          order_symbol: '005930', order_side: 'sell', requested_quantity: 1,
+          filled_quantity: 1, unfilled_quantity: 0, lifecycle_status: 'liquidated',
+          decision_reason_codes: ['RISK_REDUCTION'], notification_idempotency_key: 'f'.repeat(64),
+        }));
+      } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T05:41:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T05:41:00.000Z');
+
+  const after = await value.task.runOnce({
+    taskId: mod.TASKS[4].id,
+    dueAt: new Date('2026-07-21T05:41:00.000Z'),
+  });
+
+  assert.equal(llmCalls, 0);
+  assert.equal(orderCalls, 1);
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'horizon_exit_reconciled');
 });
 
 test('order output contract allows one reconciled VPS order and rejects unsafe drift', () => {
@@ -884,6 +1159,66 @@ test('server polling survives DISABLED state and adopts later CLI activation', a
   assert.equal(value.task.status().state, 'ACTIVE');
 });
 
+test('scheduler ownership lock permits exactly one live scheduler process', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-scheduler-owner-'));
+  const lockPath = path.join(root, 'owner.lock');
+  const release = mod.acquireSchedulerOwnershipLock(lockPath);
+  assert.throws(() => mod.acquireSchedulerOwnershipLock(lockPath), /scheduler_owner_lock_active/);
+  release();
+  const releaseAfter = mod.acquireSchedulerOwnershipLock(lockPath);
+  releaseAfter();
+});
+
+test('scheduler poll is aligned to the next minute boundary', () => {
+  const delays = [];
+  const value = fixture({
+    schedulerRegistered: true,
+    serverRegistered: true,
+    setTimer(_fn, delay) { delays.push(delay); return { unref() {} }; },
+    clearTimer() {},
+  });
+  value.task.prepareDisabled();
+  value.setClock('2026-07-21T00:00:30.000Z');
+  value.task.start();
+  assert.equal(delays[0], 30_000);
+  value.task.stop();
+});
+
+test('production ownership blocks direct tick and runOnce until scheduler start owns the lock', async () => {
+  const value = fixture({ enforceSchedulerOwnership: true, setTimer() { return { unref() {} }; }, clearTimer() {} });
+  value.task.prepareDisabled();
+  await value.task.activate({ approval: mod.ACTIVATION_APPROVAL });
+  await assert.rejects(value.task.tick(), /scheduler_owner_required/);
+  await assert.rejects(
+    value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:00Z') }),
+    /scheduler_owner_required/,
+  );
+  value.task.start();
+  await assert.doesNotReject(value.task.tick());
+  value.task.stop();
+});
+
+test('14:30 and later entry output is rejected even when KIS reports success', async () => {
+  const value = await active({
+    execFile(command, args, options, callback) {
+      callback(null, orderGood('success', {
+        action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
+        reconciliations: 1, open_positions: 1, daily_entry_count: 1,
+      }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = new Date('2026-07-21T05:40:00Z');
+  const state = value.task.status();
+  state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: due });
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(after.tasks[mod.TASKS[4].id].pause_reason, 'entry_after_cutoff_blocked');
+});
+
 test('strict command and output contract reject drift and unsafe fields', () => {
   const command = mod.buildCommand(mod.TASKS[1].id);
   assert.equal(command.command, 'python3'); assert.equal(command.cwd, mod.KIS_REPO);
@@ -1252,4 +1587,157 @@ test('report failure pauses all tasks and never retries the KIS cycle', async ()
   assert.equal(sends, 1); assert.equal(runs, 1); assert.equal(state.state, 'PAUSED');
   assert.equal(state.last_error_notification.attempted, false);
   assert.equal(state.last_error_notification.succeeded, false);
+});
+
+test('AI verdict packet and response enforce the fixed model and decision contract', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const context = mod.parseDecisionContextOutput(decisionContext(slotId, ['005930', '000660']), slotId);
+  const packet = mod.buildSanitizedAiPacket({ slotId, context });
+  assert.equal(packet.model_id, 'gpt-5.6-terra');
+  assert.equal(packet.candidates.length, 2);
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [{
+    symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
+    reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
+  }]), packet));
+  assert.throws(() => mod.parseAiVerdict({ ...aiVerdict(packet), model_id: 'fallback' }, packet), /invalid_ai_verdict/);
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
+    symbol: '005930', action: 'HOLD', target_weight_pct: 1, confidence_bucket: 'high', reason_codes: ['NO_EDGE'],
+  }]), packet), /invalid_ai_verdict/);
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
+    symbol: '005380', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+  }]), packet), /invalid_ai_verdict/);
+});
+
+test('AI packet accepts bounded six-digit symbols outside the legacy three-symbol watchlist', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const context = mod.parseDecisionContextOutput(decisionContext(slotId, ['035720', '247540']), slotId);
+  const packet = mod.buildSanitizedAiPacket({ slotId, context });
+  assert.deepEqual(packet.candidates.map((item) => item.symbol), ['035720', '247540']);
+});
+
+test('order lifecycle notification is once-only and delivery failure never retries the order', async () => {
+  const sent = [];
+  let orderRuns = 0;
+  const notificationKey = 'c'.repeat(64);
+  const output = orderGood('success', {
+    action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
+    reconciliations: 1, open_positions: 1, daily_entry_count: 1,
+    order_symbol: '035720', order_side: 'buy', requested_quantity: 3,
+    filled_quantity: 3, unfilled_quantity: 0, lifecycle_status: 'filled',
+    decision_reason_codes: ['MOMENTUM_CONFIRMATION'],
+    notification_idempotency_key: notificationKey,
+  });
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: false }; },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, output); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_succeeded, false);
+  assert.equal(sent[0].idempotencyKey, notificationKey);
+  assert.match(sent[0].content, /매수 035720 3주/);
+  value.setClock('2026-07-21T00:20:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:20:00Z') });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_duplicate_suppressed, true);
+  assert.equal(sent.length, 1);
+  assert.equal(orderRuns, 2);
+});
+
+test('intraday AI verdict is bounded, passed by path only, and deleted after KIS completes', async () => {
+  let seenPath = null;
+  const value = await active({ execFile(command, args, options, callback) {
+    seenPath = options.env.KIS_LLM_VERDICT_PATH;
+    assert.ok(seenPath);
+    assert.equal(args.includes(seenPath), false);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(seenPath).mode & 0o777, 0o600);
+    const verdict = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+    assert.equal(verdict.model_id, mod.LLM_MODEL_ID);
+    assert.match(options.env.KIS_LLM_PROMPT_HASH, /^[a-f0-9]{64}$/);
+    callback(null, orderGood());
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(fs.existsSync(seenPath), false);
+});
+
+test('mismatched AI verdict blocks before KIS execution without fallback', async () => {
+  let calls = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => ({ ...aiVerdict(packet), prompt_hash: '0'.repeat(64) }),
+    execFile(command, args, options, callback) { calls += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(calls, 0);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'invalid_ai_verdict');
+});
+
+test('one-minute safety monitor uses the existing manager, never calls LLM, and pauses on blocked status', async () => {
+  let llmCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    safetyOutput: safetyOutput('blocked', { process_lock: 'active' }),
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const state = await value.task.tick();
+  assert.equal(llmCalls, 0);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'safe_block');
+  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+});
+
+test('MDD safety block performs one automatic risk-off reconciliation before persistent pause', async () => {
+  let emergencyCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'prod', account_risk_status: 'active', error_class: 'mdd_liquidation_required',
+    }),
+    emergencyStopExecutor: async ({ automaticRiskOff }) => {
+      emergencyCalls += 1;
+      assert.equal(automaticRiskOff, true);
+      return {
+        status: 'success', execution_owner: 'prod', positions_liquidated: 2,
+        reconciliation_passed: true, error_class: 'persistent_stop_active',
+      };
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const state = await value.task.tick();
+  assert.equal(emergencyCalls, 1);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'mdd_liquidation_required');
+  assert.equal(state.last_safety_monitor, undefined);
+  assert.equal(state.tasks[mod.TASKS[0].id].last_run.emergency_reconciliation_passed, true);
+});
+
+test('failed automatic risk-off is not retried and records sanitized blocker', async () => {
+  let emergencyCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      kill_state: 'active', error_class: 'kill_switch_liquidation_required',
+    }),
+    emergencyStopExecutor: async () => {
+      emergencyCalls += 1;
+      return {
+        status: 'blocked', execution_owner: 'vps', positions_liquidated: 0,
+        reconciliation_passed: false, error_class: 'open_buy_cancel_unconfirmed',
+      };
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const state = await value.task.tick();
+  assert.equal(emergencyCalls, 1);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'emergency_open_buy_cancel_unconfirmed');
 });
