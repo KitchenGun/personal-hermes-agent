@@ -75,6 +75,19 @@ function testFetchTimeoutExport() {
   assert.equal(relay.__test.intervals.stateFetchTimeout, 10000);
 }
 
+function testDeliveryClaimPersistsAcrossRepeatedCalls() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'discord-relay-claim-'));
+  const stateFile = path.join(dir, 'state.json');
+  const first = relay.__test.claimDeliveryKey('lifecycle:key:1', stateFile);
+  const duplicate = relay.__test.claimDeliveryKey('lifecycle:key:1', stateFile);
+  const different = relay.__test.claimDeliveryKey('lifecycle:key:2', stateFile);
+
+  assert.equal(first.claimed, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(different.claimed, true);
+  assert.notEqual(first.keyHash, different.keyHash);
+}
+
 function testAdaptivePollingState() {
   assert.equal(typeof relay.__test.isActiveState, 'function');
   assert.equal(relay.__test.isActiveState({ summary: { running: 1 }, tasks: [] }, { tasks: {} }), true);
@@ -93,4 +106,5 @@ testPrunesOnlyOldTerminalTasks();
 testSavePrunesBeforeAtomicWrite();
 testAdaptivePollingState();
 testFetchTimeoutExport();
+testDeliveryClaimPersistsAcrossRepeatedCalls();
 console.log('discord relay prune tests passed');
