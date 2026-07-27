@@ -73,7 +73,12 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields',
+  'account_risk_evidence_missing',
   ...TRANSIENT_TRANSPORT_ERRORS,
+]);
+const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
+  'database_file_io_failed',
+  'account_risk_evidence_missing',
 ]);
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'balance_mismatch',
@@ -1521,7 +1526,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
       if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
-      if (current.pause_reason === 'database_file_io_failed') {
+      if (PREFLIGHT_RESUMABLE_PAUSE_REASONS.has(current.pause_reason)) {
         const preflightRun = await execute(buildCommand(TASKS[0].id, { activationPreflight: true }));
         if (preflightRun.error?.killed) throw new Error('timeout');
         if (preflightRun.error && Number(preflightRun.error.code) !== 2) {
