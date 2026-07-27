@@ -275,7 +275,7 @@ function fixture(options = {}) {
   const taskExec = options.execFile || ((c, a, o, cb) => cb(null, good(a[a.indexOf('--task-id') + 1])));
   const execFile = (command, args, execOptions, callback) => {
     if (args.includes('safety-monitor')) {
-      callback(null, options.safetyOutput || safetyOutput());
+      callback(options.safetyError || null, options.safetyOutput || safetyOutput());
       return;
     }
     if (args.includes('decision-context')) {
@@ -1693,6 +1693,22 @@ test('one-minute safety monitor uses the existing manager, never calls LLM, and 
   assert.equal(state.state, 'PAUSED');
   assert.equal(state.pause_reason, 'safe_block');
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+});
+
+test('safety monitor preserves a sanitized blocker returned with fail-closed exit code 2', async () => {
+  const error = Object.assign(new Error('Command failed'), { code: 2, killed: false });
+  const value = await active({
+    schedulerRegistered: true,
+    safetyError: error,
+    safetyOutput: safetyOutput('blocked', {
+      account_risk_status: 'active', error_class: 'account_risk_status_active',
+    }),
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const state = await value.task.tick();
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'account_risk_status_active');
+  assert.equal(state.pause_reason === 'process_error', false);
 });
 
 test('MDD safety block performs one automatic risk-off reconciliation before persistent pause', async () => {

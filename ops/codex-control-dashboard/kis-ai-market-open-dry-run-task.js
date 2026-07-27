@@ -99,6 +99,11 @@ const DISCORD_ERROR_CLASSES = new Set([
   'mdd_liquidation_required', 'kill_switch_liquidation_required',
   'emergency_stop_executor_missing', 'open_buy_cancel_unconfirmed',
   'emergency_open_buy_cancel_unconfirmed',
+  'safety_monitor_failed', 'execution_owner_disabled', 'execution_owner_invalid',
+  'vps_environment_or_credentials_unavailable', 'prod_environment_or_credentials_unavailable',
+  'account_risk_evidence_missing', 'prod_account_risk_evidence_missing',
+  'process_lock_active', 'kill_state_active', 'open_order_status_active',
+  'reconciliation_status_active', 'account_risk_status_active',
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
@@ -1891,8 +1896,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let result;
     try {
       const { error, stdout } = await execute(buildSafetyMonitorCommand());
-      if (error) throw new Error(error.killed ? 'timeout' : 'process_error');
+      if (error?.killed) throw new Error('timeout');
+      if (error && Number(error.code) !== 2) throw new Error('process_error');
       result = parseSafetyMonitorOutput(stdout);
+      if (error && result.status !== 'blocked') throw new Error('process_error');
       Object.assign(monitorRun, {
         status: result.status,
         execution_owner: result.execution_owner,
