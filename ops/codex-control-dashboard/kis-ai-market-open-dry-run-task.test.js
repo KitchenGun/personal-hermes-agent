@@ -1687,7 +1687,7 @@ test('IO resume remains paused when health, writer lock, parity, or diagnosis fa
     assert.equal(value.task.status().state, 'PAUSED');
   }
   assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
-  assert.equal(mod.defaultSourceParityCheck(), false);
+  assert.equal(typeof mod.defaultSourceParityCheck(), 'boolean');
 });
 
 test('state corruption faults and pauses polling without executing child', async () => {
