@@ -72,7 +72,8 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'http_transport_failed', 'response_read_failed',
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
-  'runtime_io_failed', 'process_error', 'database_file_io_failed', ...TRANSIENT_TRANSPORT_ERRORS,
+  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields',
+  ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'balance_mismatch',

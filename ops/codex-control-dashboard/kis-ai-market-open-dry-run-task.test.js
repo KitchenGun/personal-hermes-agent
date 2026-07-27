@@ -1456,6 +1456,21 @@ test('exact IO resume recovers a process error only after the safety monitor is 
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'invalid_output_fields';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
 test('IO resume preserves pause when the safety monitor remains blocked', async () => {
   const value = await active({
     safetyOutput: safetyOutput('blocked', {
