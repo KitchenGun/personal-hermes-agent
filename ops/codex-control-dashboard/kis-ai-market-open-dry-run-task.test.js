@@ -295,7 +295,11 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('--activation-preflight')) {
-      callback(null, good(mod.TASKS[0].id, 'success', { action_type: 'activation_preflight', api_calls: 2 }));
+      callback(
+        options.activationPreflightError || null,
+        options.activationPreflightOutput
+          || good(mod.TASKS[0].id, 'success', { action_type: 'activation_preflight', api_calls: 2 }),
+      );
       return;
     }
     if (args.includes('vps-autonomous-order') && args.includes('activation-check')) {
@@ -1442,6 +1446,39 @@ test('IO resume preserves pause when the safety monitor remains blocked', async 
   await assert.rejects(
     value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
     /open_order_status_active/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
+});
+
+test('database IO recovery requires the existing activation preflight before resume', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'database_file_io_failed';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
+test('database IO recovery remains paused when the activation preflight fails closed', async () => {
+  const options = {};
+  const value = await active(options);
+  options.activationPreflightError = Object.assign(new Error('blocked'), { code: 2, killed: false });
+  options.activationPreflightOutput = good(mod.TASKS[0].id, 'blocked', {
+    action_type: 'paused', error_class: 'database_file_io_failed',
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'database_file_io_failed';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /database_file_io_failed/,
   );
   assert.equal(value.task.status().state, 'PAUSED');
 });
