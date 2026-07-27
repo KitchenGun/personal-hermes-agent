@@ -81,6 +81,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'order_submission_unknown',
   'invalid_order_output_contract',
   'model_v3_artifact_attestation_mismatch',
+  'hermes_scheduler_attestation_unavailable',
 ]);
 const DISCORD_ERROR_CLASSES = new Set([
   'blocked', 'safe_block', 'due_time_invalid', 'timeout', 'process_error',
@@ -1581,8 +1582,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (error) {
         throw new Error('order_activation_check_process_error');
       }
-      if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch') {
+      if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch'
+        || prior.pause_reason === 'hermes_scheduler_attestation_unavailable') {
         if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
+      }
+      if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch') {
         if (prior.activation_artifact_hash === null
           || parsed.artifactHash !== prior.activation_artifact_hash) {
           throw new Error('artifact_recovery_hash_changed');
@@ -1742,8 +1746,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const key = dueKey(task, dueTime);
     const postCloseCutover = isPostCloseCutoverSlot(task, dueTime);
     const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, dueTime) && !postCloseCutover;
-    const schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
-    const pendingInvocation = task.kind === 'order' ? {
+    let schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
+    let pendingInvocation = task.kind === 'order' ? {
       due_key: key,
       token_hash: crypto.createHash('sha256').update(schedulerToken).digest('hex'),
       expires_at: new Date(now().getTime() + (5 * 60_000)).toISOString(),
@@ -1766,6 +1770,28 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           const verdict = await createAiVerdictFile(taskId, key, dueTime, schedulerToken);
           verdictPath = verdict?.path || null;
           promptHash = verdict?.promptHash || '';
+
+          const contextState = loadStrict();
+          const contextTask = contextState.tasks[taskId];
+          if (contextState.state !== 'ACTIVE' || contextTask.state !== 'ACTIVE'
+            || contextTask.last_due_at !== key
+            || JSON.stringify(contextTask.pending_invocation) !== JSON.stringify(pendingInvocation)
+            || contextTask.activation_artifact_hash !== taskState.activation_artifact_hash
+            || contextTask.daily_entry_cap_approval_hash !== taskState.daily_entry_cap_approval_hash
+            || Object.keys(INTRADAY_PROVIDER_ATTESTATION)
+              .some((keyName) => contextTask[keyName] !== taskState[keyName])) {
+            throw new Error('scheduler_attestation_state_changed');
+          }
+          schedulerToken = crypto.randomBytes(16).toString('hex');
+          pendingInvocation = {
+            ...pendingInvocation,
+            token_hash: crypto.createHash('sha256').update(schedulerToken).digest('hex'),
+            expires_at: new Date(now().getTime() + (5 * 60_000)).toISOString(),
+          };
+          save({ ...contextState, tasks: { ...contextState.tasks, [taskId]: {
+            ...contextTask, pending_invocation: pendingInvocation,
+          } } });
+          atomicWrite(attestationPath, pendingInvocation);
         }
         catch (error) {
           return pauseForTask(loadStrict(), safeText(error.message, 80), {
