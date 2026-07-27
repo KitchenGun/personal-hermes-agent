@@ -1414,6 +1414,38 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
 });
 
+test('exact IO resume recovers a process error only after the safety monitor is clear', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'process_error';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
+test('IO resume preserves pause when the safety monitor remains blocked', async () => {
+  const value = await active({
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'active', error_class: 'open_order_status_active',
+    }),
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'process_error';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /open_order_status_active/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
+});
+
 test('IO resume remains paused when health, writer lock, parity, or diagnosis fails', async () => {
   for (const failure of ['health', 'lock', 'parity', 'diagnosis']) {
     const lockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-resume-lock-'));
