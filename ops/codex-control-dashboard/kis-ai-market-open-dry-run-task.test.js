@@ -33,6 +33,13 @@ function good(taskId, status = 'success', extra = {}) {
         intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
       }
     : {};
+  const postClose = taskId === mod.TASKS[2].id && status === 'success' && actionType === 'post_close_learning'
+    ? {
+        intraday_outcomes_inserted: 0,
+        intraday_labeled_rows: 0,
+        intraday_official_dates: 0,
+      }
+    : {};
   return JSON.stringify({
     task_id: taskId,
     status,
@@ -69,6 +76,7 @@ function good(taskId, status = 'success', extra = {}) {
     transport_degraded: false,
     report_message: null,
     ...intraday,
+    ...postClose,
     ...extra,
   });
 }
@@ -557,6 +565,49 @@ test('14:41 risk-off slot reuses the order task without a new LLM decision', asy
   assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'horizon_exit_reconciled');
 });
 
+test('14:40 horizon slot accepts only zero-position non-order no-op outcomes', async () => {
+  for (const actionType of ['no_candidate_no_op', 'entry_window_closed_no_op']) {
+    const value = await active({
+      execFile(command, args, options, callback) {
+        callback(null, orderGood('no_op', { action_type: actionType }));
+      },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    const due = new Date('2026-07-21T05:40:00Z');
+    const state = value.task.status();
+    state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+
+    const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: due });
+    assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+    assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, actionType);
+  }
+});
+
+test('14:40 horizon slot rejects either no-op outcome that reports an open position', async () => {
+  for (const actionType of ['no_candidate_no_op', 'entry_window_closed_no_op']) {
+    const value = await active({
+      execFile(command, args, options, callback) {
+        callback(null, orderGood('no_op', {
+          action_type: actionType,
+          open_positions: 1,
+        }));
+      },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    const due = new Date('2026-07-21T05:40:00Z');
+    const state = value.task.status();
+    state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+
+    const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: due });
+    assert.equal(after.tasks[mod.TASKS[4].id].state, 'PAUSED');
+    assert.equal(after.tasks[mod.TASKS[4].id].pause_reason, 'order_action_not_allowed_for_schedule_slot');
+  }
+});
+
 test('order output contract allows one reconciled VPS order and rejects unsafe drift', () => {
   const accepted = orderGood('success', {
     action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
@@ -585,6 +636,9 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
     action_type: 'entry_reconciled', order_api_calls: 2, vps_live_orders: 2, reconciliations: 1,
   })), /unsafe_order_count/);
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    action_type: 'no_candidate_no_op', order_api_calls: 1, vps_live_orders: 1, reconciliations: 1,
+  })), /unexpected_order_execution/);
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     error_class: 'app_secret=value',
   })), /unsafe_order_output/);
@@ -1327,6 +1381,16 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   }), mod.TASKS[1].id, trading), /intraday_output_contract/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'success', {
     intraday_decisions: 3,
+  }), mod.TASKS[0].id, trading), /fields/);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id), mod.TASKS[2].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id, 'success', {
+    intraday_outcomes_inserted: -1,
+  }), mod.TASKS[2].id, trading), /count/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id, 'success', {
+    intraday_labeled_rows: Number.MAX_SAFE_INTEGER + 1,
+  }), mod.TASKS[2].id, trading), /count/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'success', {
+    intraday_outcomes_inserted: 0,
   }), mod.TASKS[0].id, trading), /fields/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { unknown: 1 }), mod.TASKS[1].id, trading), /fields/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { fail_closed: undefined }), mod.TASKS[1].id, trading), /fields|boolean/);
