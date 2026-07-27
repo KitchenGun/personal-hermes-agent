@@ -292,6 +292,9 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('decision-context')) {
+      if (typeof options.onDecisionContext === 'function') {
+        options.onDecisionContext({ command, args, execOptions });
+      }
       callback(null, options.decisionContextOutput || decisionContext(execOptions.env.KIS_HERMES_DUE_KEY));
       return;
     }
@@ -518,8 +521,10 @@ test('weekly future-universe block does not change the frozen active model owner
 
 test('14:41 risk-off slot reuses the order task without a new LLM decision', async () => {
   let llmCalls = 0;
+  let contextCalls = 0;
   let orderCalls = 0;
   const value = await active({
+    onDecisionContext() { contextCalls += 1; },
     llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
     execFile(command, args, options, callback) {
       if (args.includes('vps-autonomous-order')) {
@@ -546,6 +551,7 @@ test('14:41 risk-off slot reuses the order task without a new LLM decision', asy
   });
 
   assert.equal(llmCalls, 0);
+  assert.equal(contextCalls, 0);
   assert.equal(orderCalls, 1);
   assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'horizon_exit_reconciled');
@@ -750,6 +756,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'order_submission_unknown',
     'invalid_order_output_contract',
     'model_v3_artifact_attestation_mismatch',
+    'hermes_scheduler_attestation_unavailable',
   ]) {
     const value = await active();
     const paused = value.task.status();
@@ -789,23 +796,28 @@ test('artifact mismatch recovery refuses to rotate the attested artifact', async
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
 });
 
-test('artifact mismatch recovery requires runtime source parity', async () => {
-  const value = await active({ sourceParityCheck: () => false });
-  const paused = value.task.status();
-  paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
-  paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_artifact_attestation_mismatch';
-  paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
-  paused.tasks[mod.TASKS[4].id].next_run_at = null;
-  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+test('attestation contract recovery requires runtime source parity', async () => {
+  for (const pauseReason of [
+    'model_v3_artifact_attestation_mismatch',
+    'hermes_scheduler_attestation_unavailable',
+  ]) {
+    const value = await active({ sourceParityCheck: () => false });
+    const paused = value.task.status();
+    paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+    paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
+    paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
+    paused.tasks[mod.TASKS[4].id].next_run_at = null;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
 
-  await assert.rejects(
-    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
-    /runtime_source_parity_failed/,
-  );
-  const after = value.task.status().tasks[mod.TASKS[4].id];
-  assert.equal(after.state, 'PAUSED');
-  assert.equal(after.pause_reason, 'model_v3_artifact_attestation_mismatch');
-  assert.equal(after.next_run_at, null);
+    await assert.rejects(
+      value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+      /runtime_source_parity_failed/,
+    );
+    const after = value.task.status().tasks[mod.TASKS[4].id];
+    assert.equal(after.state, 'PAUSED');
+    assert.equal(after.pause_reason, pauseReason);
+    assert.equal(after.next_run_at, null);
+  }
 });
 
 test('unresolved ambiguous submission keeps the order task paused', async () => {
@@ -1819,21 +1831,124 @@ test('order lifecycle notification is once-only and delivery failure never retri
 
 test('intraday AI verdict is bounded, passed by path only, and deleted after KIS completes', async () => {
   let seenPath = null;
-  const value = await active({ execFile(command, args, options, callback) {
-    seenPath = options.env.KIS_LLM_VERDICT_PATH;
-    assert.ok(seenPath);
-    assert.equal(args.includes(seenPath), false);
-    if (process.platform !== 'win32') assert.equal(fs.statSync(seenPath).mode & 0o777, 0o600);
-    const verdict = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
-    assert.equal(verdict.model_id, mod.LLM_MODEL_ID);
-    assert.match(options.env.KIS_LLM_PROMPT_HASH, /^[a-f0-9]{64}$/);
-    callback(null, orderGood());
-  } });
+  let contextToken = null;
+  let contextDueKey = null;
+  let contextAttestation = null;
+  let executionToken = null;
+  const value = await active({
+    onDecisionContext({ execOptions }) {
+      contextToken = execOptions.env.KIS_HERMES_SCHEDULER_TOKEN;
+      const dueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      contextDueKey = dueKey;
+      const file = path.join(
+        value.paths.orderAttestationDir,
+        `${crypto.createHash('sha256').update(dueKey).digest('hex')}.json`,
+      );
+      contextAttestation = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(contextAttestation.token_hash, crypto.createHash('sha256').update(contextToken).digest('hex'));
+      fs.unlinkSync(file);
+    },
+    execFile(command, args, options, callback) {
+      executionToken = options.env.KIS_HERMES_SCHEDULER_TOKEN;
+      assert.notEqual(executionToken, contextToken);
+      const dueKey = options.env.KIS_HERMES_DUE_KEY;
+      assert.equal(dueKey, contextDueKey);
+      const attestationFile = path.join(
+        value.paths.orderAttestationDir,
+        `${crypto.createHash('sha256').update(dueKey).digest('hex')}.json`,
+      );
+      const attestation = JSON.parse(fs.readFileSync(attestationFile, 'utf8'));
+      assert.equal(attestation.token_hash, crypto.createHash('sha256').update(executionToken).digest('hex'));
+      for (const key of [
+        'due_key', 'daily_entry_cap', 'decision_provider', 'intraday_feature_version',
+        'intraday_policy_version', 'intraday_feature_hash', 'intraday_policy_hash',
+      ]) assert.equal(attestation[key], contextAttestation[key]);
+      const pending = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'))
+        .tasks[mod.TASKS[4].id].pending_invocation;
+      assert.deepEqual(pending, attestation);
+      seenPath = options.env.KIS_LLM_VERDICT_PATH;
+      assert.ok(seenPath);
+      assert.equal(args.includes(seenPath), false);
+      if (process.platform !== 'win32') assert.equal(fs.statSync(seenPath).mode & 0o777, 0o600);
+      const verdict = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+      assert.equal(verdict.model_id, mod.LLM_MODEL_ID);
+      assert.match(options.env.KIS_LLM_PROMPT_HASH, /^[a-f0-9]{64}$/);
+      callback(null, orderGood());
+    },
+  });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   value.setClock('2026-07-21T00:10:00Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(fs.existsSync(seenPath), false);
+});
+
+test('empty decision context still rotates the consumed attestation before no-op execution', async () => {
+  let contextToken = null;
+  let executionToken = null;
+  let llmCalls = 0;
+  const value = await active({
+    decisionContextOutput: decisionContext(
+      `${mod.TASKS[4].id}:2026-07-21:09:10`,
+      [],
+    ),
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    onDecisionContext({ execOptions }) {
+      contextToken = execOptions.env.KIS_HERMES_SCHEDULER_TOKEN;
+      const dueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      const file = path.join(
+        value.paths.orderAttestationDir,
+        `${crypto.createHash('sha256').update(dueKey).digest('hex')}.json`,
+      );
+      fs.unlinkSync(file);
+    },
+    execFile(command, args, options, callback) {
+      executionToken = options.env.KIS_HERMES_SCHEDULER_TOKEN;
+      assert.notEqual(executionToken, contextToken);
+      assert.equal(options.env.KIS_LLM_VERDICT_PATH, undefined);
+      callback(null, orderGood('no_op', { action_type: 'no_candidate_no_op' }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(llmCalls, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'no_candidate_no_op');
+});
+
+test('decision context state drift blocks before issuing an execution attestation', async () => {
+  const mutations = [
+    { stateInvalid: false, apply(task) { task.activation_artifact_hash = 'b'.repeat(64); } },
+    { stateInvalid: true, apply(task) { task.intraday_policy_hash = 'b'.repeat(64); } },
+    { stateInvalid: true, apply(task) { task.daily_entry_cap_approval_hash = 'c'.repeat(64); } },
+  ];
+  for (const mutation of mutations) {
+    let orderRuns = 0;
+    const value = await active({
+      onDecisionContext() {
+        const state = value.task.status();
+        mutation.apply(state.tasks[mod.TASKS[4].id]);
+        fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+      },
+      execFile(command, args, options, callback) {
+        orderRuns += 1;
+        callback(null, orderGood());
+      },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    value.setClock('2026-07-21T00:10:00Z');
+    const run = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+    if (mutation.stateInvalid) {
+      await assert.rejects(run, /state_unavailable/);
+      assert.equal(orderRuns, 0);
+      continue;
+    }
+    const state = await run;
+    assert.equal(orderRuns, 0);
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+    assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'scheduler_attestation_state_changed');
+  }
 });
 
 test('mismatched AI verdict blocks before KIS execution without fallback', async () => {
@@ -1849,6 +1964,9 @@ test('mismatched AI verdict blocks before KIS execution without fallback', async
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'invalid_ai_verdict');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.deepEqual(fs.readdirSync(value.paths.orderAttestationDir), []);
+  assert.equal(fs.existsSync(value.paths.verdictDir), false);
 });
 
 test('one-minute safety monitor uses the existing manager, never calls LLM, and pauses on blocked status', async () => {
