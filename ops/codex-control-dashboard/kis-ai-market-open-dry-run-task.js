@@ -165,6 +165,13 @@ const INTRADAY_OUTPUT_KEYS = new Set([
   'intraday_feature_version', 'intraday_policy_version',
   'intraday_feature_hash', 'intraday_policy_hash',
 ]);
+const POST_CLOSE_OUTPUT_KEYS = new Set([
+  ...OUTPUT_KEYS,
+  'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
+]);
+const POST_CLOSE_COUNT_KEYS = [
+  'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
+];
 const COUNT_KEYS = new Set([
   'api_calls', 'quote_api_calls', 'decisions', 'simulated_orders', 'simulated_positions',
   'experience_rows', 'incidents', 'outbox_rows', 'order_api_calls', 'vps_live_orders', 'prod_orders',
@@ -356,7 +363,13 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('invalid_sanitized_json');
   const hasIntradayResult = value.task_id === TASKS[1].id
     && value.status === 'success' && value.action_type === 'intraday_shadow';
-  const expectedOutputKeys = hasIntradayResult ? INTRADAY_OUTPUT_KEYS : OUTPUT_KEYS;
+  const hasPostCloseResult = value.task_id === POST_CLOSE_TASK.id
+    && value.status === 'success' && value.action_type === 'post_close_learning';
+  const expectedOutputKeys = hasIntradayResult
+    ? INTRADAY_OUTPUT_KEYS
+    : hasPostCloseResult
+    ? POST_CLOSE_OUTPUT_KEYS
+    : OUTPUT_KEYS;
   if (Object.keys(value).length !== expectedOutputKeys.size
     || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
     throw new Error('invalid_output_fields');
@@ -366,6 +379,10 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   if (!(value.official_trade_date === null || /^\d{4}-\d{2}-\d{2}$/.test(value.official_trade_date))) throw new Error('invalid_output_trade_date');
   if (!['regular_session', 'closed', 'unknown'].includes(value.official_session_state)) throw new Error('invalid_official_session_state');
   if ([...COUNT_KEYS].some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)) throw new Error('invalid_output_count');
+  if (hasPostCloseResult
+    && POST_CLOSE_COUNT_KEYS.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)) {
+    throw new Error('invalid_output_count');
+  }
   if ([...BOOLEAN_KEYS].some((key) => typeof value[key] !== 'boolean')) throw new Error('invalid_output_boolean');
   if (!FAILURE_PHASES.has(value.failure_phase)
     || !(value.failure_symbol === null || LEGACY_WATCHLIST_SYMBOLS.includes(value.failure_symbol))
@@ -1856,8 +1873,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       if (task.kind === 'order' && !postCloseCutover && !parsed.failClosed) {
+        const safeNoPositionHorizonNoOp = ['no_candidate_no_op', 'entry_window_closed_no_op']
+          .includes(parsed.actionType)
+          && parsed.openPositions === 0
+          && parsed.orderApiCalls === 0
+          && parsed.vpsLiveOrders === 0
+          && parsed.reconciliations === 0;
         const actionAllowed = horizonExitOrderSlot
           ? ['horizon_exit_reconciled', 'market_closed_no_op', 'position_held'].includes(parsed.actionType)
+            || safeNoPositionHorizonNoOp
           : !['shadow_refreshed', 'horizon_exit_reconciled'].includes(parsed.actionType);
         if (!actionAllowed) {
           return pauseForTask(loadStrict(), 'order_action_not_allowed_for_schedule_slot', {
