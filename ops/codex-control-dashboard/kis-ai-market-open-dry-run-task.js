@@ -1537,8 +1537,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           TASKS[0].id,
           calendarProofResolver,
         );
-        if (preflight.status !== 'success' || preflight.failClosed || preflight.actionType !== 'activation_preflight') {
-          throw new Error(preflight.errorClass || 'database_recovery_preflight_failed');
+        const freshPreflight = preflight.status === 'success'
+          && preflight.failClosed === false
+          && preflight.actionType === 'activation_preflight';
+        const sameDayPreflightAlreadyCompleted = current.pause_reason === 'account_risk_evidence_missing'
+          && preflight.status === 'no_op'
+          && preflight.failClosed === false
+          && preflight.actionType === 'idempotent_no_op';
+        if (!freshPreflight && !sameDayPreflightAlreadyCompleted) {
+          const fallback = current.pause_reason === 'account_risk_evidence_missing'
+            ? 'account_risk_recovery_preflight_failed'
+            : 'database_recovery_preflight_failed';
+          throw new Error(preflight.errorClass && preflight.errorClass !== 'none'
+            ? preflight.errorClass
+            : fallback);
         }
       }
       const { error, stdout } = await execute(buildDiagnosticCommand());

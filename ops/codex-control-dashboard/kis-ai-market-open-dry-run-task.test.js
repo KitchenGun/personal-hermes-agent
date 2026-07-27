@@ -1712,8 +1712,12 @@ test('database IO recovery requires the existing activation preflight before res
 
 test('account-risk evidence recovery requires activation preflight and clear safety state', async () => {
   let activationPreflights = 0;
-  const value = await active({
+  const options = {
     onActivationPreflight() { activationPreflights += 1; },
+  };
+  const value = await active(options);
+  options.activationPreflightOutput = good(mod.TASKS[0].id, 'no_op', {
+    action_type: 'idempotent_no_op',
   });
   const paused = value.task.status();
   paused.state = 'PAUSED'; paused.pause_reason = 'account_risk_evidence_missing';
@@ -1729,6 +1733,26 @@ test('account-risk evidence recovery requires activation preflight and clear saf
   assert.equal(state.resume_reason, 'io_fix_verified');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('database recovery does not accept an idempotent activation preflight', async () => {
+  const options = {};
+  const value = await active(options);
+  options.activationPreflightOutput = good(mod.TASKS[0].id, 'no_op', {
+    action_type: 'idempotent_no_op',
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'database_file_io_failed';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /database_recovery_preflight_failed/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
 });
 
 test('database IO recovery remains paused when the activation preflight fails closed', async () => {
