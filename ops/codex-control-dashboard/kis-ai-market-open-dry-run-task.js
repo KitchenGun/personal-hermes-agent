@@ -71,7 +71,7 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'dns_failed', 'connection_failed', 'connection_reset', 'timeout',
   'http_transport_failed', 'response_read_failed',
 ]);
-const RESUMABLE_PAUSE_REASONS = new Set(['runtime_io_failed', ...TRANSIENT_TRANSPORT_ERRORS]);
+const RESUMABLE_PAUSE_REASONS = new Set(['runtime_io_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS]);
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'balance_mismatch',
   'order_not_fully_filled',
@@ -1476,6 +1476,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (error) throw new Error('quote_transport_diagnosis_process_error');
       const diagnostic = parseQuoteTransportDiagnosticOutput(stdout);
       if (!diagnostic.passed || diagnostic.symbolsSucceeded !== 3) throw new Error('quote_transport_diagnosis_failed');
+      const safetyRun = await execute(buildSafetyMonitorCommand());
+      if (safetyRun.error?.killed) throw new Error('timeout');
+      if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
+      const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+      if (safety.status !== 'success') throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
       const tasks = Object.fromEntries(TASKS.map((task) => {
         const prior = current.tasks[task.id] || {};
