@@ -71,7 +71,9 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'dns_failed', 'connection_failed', 'connection_reset', 'timeout',
   'http_transport_failed', 'response_read_failed',
 ]);
-const RESUMABLE_PAUSE_REASONS = new Set(['runtime_io_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS]);
+const RESUMABLE_PAUSE_REASONS = new Set([
+  'runtime_io_failed', 'process_error', 'database_file_io_failed', ...TRANSIENT_TRANSPORT_ERRORS,
+]);
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'balance_mismatch',
   'order_not_fully_filled',
@@ -103,7 +105,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'vps_environment_or_credentials_unavailable', 'prod_environment_or_credentials_unavailable',
   'account_risk_evidence_missing', 'prod_account_risk_evidence_missing',
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
-  'reconciliation_status_active', 'account_risk_status_active',
+  'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
@@ -1472,6 +1474,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
       if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
+      if (current.pause_reason === 'database_file_io_failed') {
+        const preflightRun = await execute(buildCommand(TASKS[0].id, { activationPreflight: true }));
+        if (preflightRun.error?.killed) throw new Error('timeout');
+        if (preflightRun.error && Number(preflightRun.error.code) !== 2) {
+          throw new Error('database_recovery_preflight_process_error');
+        }
+        const preflight = parseKisAiMarketOpenOutput(
+          preflightRun.stdout,
+          TASKS[0].id,
+          calendarProofResolver,
+        );
+        if (preflight.status !== 'success' || preflight.failClosed || preflight.actionType !== 'activation_preflight') {
+          throw new Error(preflight.errorClass || 'database_recovery_preflight_failed');
+        }
+      }
       const { error, stdout } = await execute(buildDiagnosticCommand());
       if (error) throw new Error('quote_transport_diagnosis_process_error');
       const diagnostic = parseQuoteTransportDiagnosticOutput(stdout);
