@@ -156,6 +156,12 @@ const OUTPUT_KEYS = new Set([
   'failure_phase', 'failure_symbol', 'failure_exception_type', 'failure_errno',
   'failure_attempt_number', 'transport_degraded',
 ]);
+const INTRADAY_OUTPUT_KEYS = new Set([
+  ...OUTPUT_KEYS,
+  'intraday_decisions', 'intraday_mode', 'intraday_model_version',
+  'intraday_feature_version', 'intraday_policy_version',
+  'intraday_feature_hash', 'intraday_policy_hash',
+]);
 const COUNT_KEYS = new Set([
   'api_calls', 'quote_api_calls', 'decisions', 'simulated_orders', 'simulated_positions',
   'experience_rows', 'incidents', 'outbox_rows', 'order_api_calls', 'vps_live_orders', 'prod_orders',
@@ -345,7 +351,13 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   let value;
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_sanitized_json'); }
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('invalid_sanitized_json');
-  if (Object.keys(value).length !== OUTPUT_KEYS.size || [...OUTPUT_KEYS].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) throw new Error('invalid_output_fields');
+  const hasIntradayResult = value.task_id === TASKS[1].id
+    && value.status === 'success' && value.action_type === 'intraday_shadow';
+  const expectedOutputKeys = hasIntradayResult ? INTRADAY_OUTPUT_KEYS : OUTPUT_KEYS;
+  if (Object.keys(value).length !== expectedOutputKeys.size
+    || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    throw new Error('invalid_output_fields');
+  }
   if (value.task_id !== expectedTaskId || !TASK_BY_ID.has(value.task_id)) throw new Error('invalid_output_task_id');
   if (!ALL_STATUSES.has(value.status) || typeof value.action_type !== 'string' || typeof value.error_class !== 'string') throw new Error('invalid_output_status');
   if (!(value.official_trade_date === null || /^\d{4}-\d{2}-\d{2}$/.test(value.official_trade_date))) throw new Error('invalid_output_trade_date');
@@ -396,6 +408,22 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
       || proof.isTradingDay !== !marketClosed) throw new Error('official_calendar_proof_invalid');
   }
   validateTaskMeaning(value);
+  if (hasIntradayResult) {
+    const expectedFeatureHash = INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash;
+    const expectedPolicyHash = INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
+    const hybridMode = value.intraday_mode === 'hybrid_bootstrap'
+      && value.intraday_model_version === 'intraday_hybrid_v1';
+    const championMode = value.intraday_mode === 'ml_champion'
+      && /^intraday_ml_(?:logistic|hist_gradient)_[a-f0-9]{12}$/.test(String(value.intraday_model_version || ''));
+    if (value.intraday_decisions !== LEGACY_WATCHLIST_SYMBOLS.length
+      || (!hybridMode && !championMode)
+      || value.intraday_feature_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
+      || value.intraday_policy_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
+      || value.intraday_feature_hash !== expectedFeatureHash
+      || value.intraday_policy_hash !== expectedPolicyHash) {
+      throw new Error('invalid_intraday_output_contract');
+    }
+  }
   let reportMessage = null;
   if (value.status === 'report_ready') {
     reportMessage = validateReportMessage(value.report_message, value.official_trade_date, value.decisions);
