@@ -314,8 +314,11 @@ function fixture(options = {}) {
       callback(options.weeklyUniverseError || null, options.weeklyUniverseOutput || weeklyUniverseOutput());
       return;
     }
-    if (args.includes('vps-autonomous-order') && args.includes('scheduled-cutover')) {
-      callback(options.cutoverError || null, options.cutoverOutput || cutoverOutput());
+    if (args.includes('vps-autonomous-order') && args.includes('scheduled-refresh-shadow')) {
+      callback(options.shadowRefreshError || null, options.shadowRefreshOutput || orderGood('success', {
+        action_type: 'shadow_refreshed', previous_artifact_hash: 'a'.repeat(64),
+        artifact_hash: 'a'.repeat(64), shadow_predictions_inserted: 3,
+      }));
       return;
     }
     if (args.includes('--activation-preflight')) {
@@ -422,11 +425,10 @@ test('intraday decision and order schedules align on future 10-minute slots', ()
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:42:00Z')), '2026-07-21T07:20:00.000Z');
 });
 
-test('post-close cutover check reuses the existing order task and never invokes an LLM', async () => {
+test('post-close shadow refresh reuses the existing order task and never invokes an LLM', async () => {
   let llmCalls = 0;
   const value = await active({
     llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
-    cutoverOutput: cutoverOutput('INELIGIBLE'),
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const state = value.task.status();
@@ -440,17 +442,54 @@ test('post-close cutover check reuses the existing order task and never invokes 
   assert.equal(llmCalls, 0);
   assert.equal(after.state, 'ACTIVE');
   assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'cutover_ineligible');
-  assert.equal(after.tasks[mod.TASKS[4].id].last_run.distinct_vps_days, 1);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'shadow_refreshed');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.shadow_predictions_inserted, 3);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.order_api_calls, 0);
   assert.equal(Object.keys(after.tasks).length, 5);
 });
 
-test('cutover command is attested and exposes scheduler count but no order approval', () => {
+test('post-close refresh command is attested and exposes no order approval', () => {
   const dueKey = `${mod.TASKS[4].id}:2026-07-21:16:20`;
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '3'.repeat(32), dueKey });
-  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-cutover']);
-  assert.equal(command.env.KIS_ACTIVE_SCHEDULER_COUNT, '1');
+  assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-refresh-shadow']);
+  assert.equal(command.env.KIS_ACTIVE_SCHEDULER_COUNT, undefined);
   assert.equal(command.args.includes('--approval'), false);
+});
+
+test('post-close market-closed no-op accepts only the current artifact attestation', async () => {
+  for (const [artifactHash, expectedState] of [
+    ['a'.repeat(64), 'ACTIVE'],
+    ['b'.repeat(64), 'PAUSED'],
+  ]) {
+    const value = await active({
+      shadowRefreshOutput: orderGood('no_op', {
+        action_type: 'market_closed_no_op',
+        previous_artifact_hash: null,
+        artifact_hash: artifactHash,
+      }),
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    const before = value.task.status();
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+    value.setClock('2026-07-21T07:20:00.000Z');
+
+    const state = await value.task.runOnce({
+      taskId: mod.TASKS[4].id,
+      dueAt: new Date('2026-07-21T07:20:00.000Z'),
+    });
+
+    assert.equal(state.tasks[mod.TASKS[4].id].state, expectedState);
+    if (expectedState === 'PAUSED') {
+      assert.equal(
+        state.tasks[mod.TASKS[4].id].pause_reason,
+        'model_v3_artifact_attestation_mismatch',
+      );
+    }
+  }
+});
+
+test('cutover parser remains fail-closed while automatic cutover is unscheduled', () => {
   const parsed = mod.parseCutoverOutput(cutoverOutput('CUTOVER_PENDING'));
   assert.equal(parsed.actionType, 'cutover_pending');
   assert.equal(parsed.activationPerformed, false);
@@ -712,7 +751,7 @@ test('exact provider cutover migrates the existing active order task without cre
   assert.equal(state.os_cron_used, false);
 });
 
-test.skip('legacy post-close order refresh is retired in favor of the 16:20 learning task', async () => {
+test.skip('post-close activation waiting mode remains retired', async () => {
   let autonomousRuns = 0;
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
@@ -749,20 +788,13 @@ test.skip('legacy post-close order refresh is retired in favor of the 16:20 lear
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:15:00.000Z');
 });
 
-test.skip('legacy post-close order refresh contract is retired', async () => {
-  const value = await active({ execFile(command, args, options, callback) {
-    if (args.includes('vps-autonomous-order')) {
-      if (args.includes('activation-check')) {
-        callback(null, orderGood('success', { action_type: 'activation_check' }));
-      } else {
-        assert.equal(args.includes('scheduled-refresh-shadow'), true);
-        callback(null, orderGood('success', {
-          action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
-          reconciliations: 1, open_positions: 1, daily_entry_count: 1,
-        }));
-      }
-    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
-  } });
+test('post-close refresh rejects order execution output', async () => {
+  const value = await active({
+    shadowRefreshOutput: orderGood('success', {
+      action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1,
+      reconciliations: 1, open_positions: 1, daily_entry_count: 1,
+    }),
+  });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const stateBefore = value.task.status();
   stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
@@ -774,11 +806,45 @@ test.skip('legacy post-close order refresh contract is retired', async () => {
   });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'order_action_not_allowed_for_schedule_slot');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'entry_after_cutoff_blocked');
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
 });
 
-test.skip('legacy post-close order arming is retired', async () => {
+test('post-close refresh rejects artifact promotion and hash drift', async () => {
+  for (const scenario of ['promotion', 'drift']) {
+    const extra = scenario === 'promotion'
+      ? {
+        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
+        previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+        shadow_predictions_inserted: 3,
+      }
+      : {
+        action_type: 'shadow_refreshed', previous_artifact_hash: 'b'.repeat(64),
+        artifact_hash: 'b'.repeat(64), shadow_predictions_inserted: 3,
+      };
+    const value = await active({ shadowRefreshOutput: orderGood('success', extra) });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    const before = value.task.status();
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+    value.setClock('2026-07-21T07:20:00.000Z');
+
+    const state = await value.task.runOnce({
+      taskId: mod.TASKS[4].id,
+      dueAt: new Date('2026-07-21T07:20:00.000Z'),
+    });
+
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+    assert.equal(
+      state.tasks[mod.TASKS[4].id].pause_reason,
+      scenario === 'promotion'
+        ? 'model_v3_post_close_promotion_forbidden'
+        : 'model_v3_artifact_attestation_mismatch',
+    );
+  }
+});
+
+test.skip('post-close activation waiting artifact guard remains retired', async () => {
   for (const failure of ['artifact', 'window']) {
     const value = await active({
       activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),

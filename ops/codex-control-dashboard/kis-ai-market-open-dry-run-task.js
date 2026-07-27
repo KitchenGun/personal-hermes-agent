@@ -771,7 +771,7 @@ function buildSafetyMonitorCommand() {
   return { command: KIS_VENV_PYTHON, args: ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'safety-monitor'], cwd: KIS_REPO };
 }
 
-function isPostCloseCutoverSlot(task, value) {
+function isPostCloseRefreshSlot(task, value) {
   if (task.id !== ORDER_TASK.id) return false;
   const parts = seoulParts(value);
   return Number(parts.hour) === 16 && Number(parts.minute) === 20;
@@ -936,8 +936,8 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
   if (verdictPath && !/^[a-f0-9]{64}$/.test(promptHash)) throw new Error('invalid_ai_verdict');
   if (taskId === ORDER_TASK.id) {
-    const postCloseCutover = !activationPreflight && invocationDueKey.endsWith(':16:20');
-    const action = activationPreflight ? 'activation-check' : postCloseCutover ? 'scheduled-cutover' : 'run-once';
+    const postCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:20');
+    const action = activationPreflight ? 'activation-check' : postCloseRefresh ? 'scheduled-refresh-shadow' : 'run-once';
     const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
     if (!activationPreflight) {
       if (!/^[a-f0-9]{32}$/.test(schedulerToken) || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) {
@@ -957,7 +957,6 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
         KIS_INTRADAY_POLICY_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
         KIS_INTRADAY_POLICY_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
         KIS_INTRADAY_DAILY_ENTRY_CAP: String(INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap),
-        ...(postCloseCutover ? { KIS_ACTIVE_SCHEDULER_COUNT: '1' } : {}),
         ...(verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath, KIS_LLM_PROMPT_HASH: promptHash } : {}),
       },
     };
@@ -1761,8 +1760,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE'
       || !sameMinute(taskState.next_run_at, dueTime)) return current;
     const key = dueKey(task, dueTime);
-    const postCloseCutover = isPostCloseCutoverSlot(task, dueTime);
-    const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, dueTime) && !postCloseCutover;
+    const postCloseRefresh = isPostCloseRefreshSlot(task, dueTime);
+    const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, dueTime) && !postCloseRefresh;
     let schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
     let pendingInvocation = task.kind === 'order' ? {
       due_key: key,
@@ -1843,9 +1842,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (error && Number(error.code) !== 2) return pauseForTask(loadStrict(), error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
       let parsed;
       try {
-        parsed = postCloseCutover
-          ? parseCutoverOutput(stdout)
-          : task.kind === 'order'
+        parsed = task.kind === 'order'
           ? parseKisVpsAutonomousOutput(stdout, taskId)
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver);
       } catch (parseError) {
@@ -1864,22 +1861,27 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           error_class: 'entry_after_cutoff_blocked', fail_closed: true,
         });
       }
-      if (task.kind === 'order' && !postCloseCutover && parsed.artifactPromoted) {
-        if (Number(slot.hour) !== 16 || Number(slot.minute) !== 20) {
-          return pauseForTask(loadStrict(), 'model_v3_promotion_outside_post_close_slot', {
-            invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
-            error_class: 'model_v3_promotion_outside_post_close_slot', fail_closed: true,
-          });
-        }
+      if (task.kind === 'order' && parsed.artifactPromoted) {
+        const reason = postCloseRefresh
+          ? 'model_v3_post_close_promotion_forbidden'
+          : 'model_v3_promotion_outside_post_close_slot';
+        return pauseForTask(loadStrict(), reason, {
+          invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+          error_class: reason, fail_closed: true,
+        });
       }
-      if (task.kind === 'order' && !postCloseCutover && !parsed.failClosed) {
+      const postCloseMarketClosedNoOp = postCloseRefresh
+        && parsed.actionType === 'market_closed_no_op';
+      if (task.kind === 'order' && !parsed.failClosed) {
         const safeNoPositionHorizonNoOp = ['no_candidate_no_op', 'entry_window_closed_no_op']
           .includes(parsed.actionType)
           && parsed.openPositions === 0
           && parsed.orderApiCalls === 0
           && parsed.vpsLiveOrders === 0
           && parsed.reconciliations === 0;
-        const actionAllowed = horizonExitOrderSlot
+        const actionAllowed = postCloseRefresh
+          ? ['shadow_refreshed', 'market_closed_no_op'].includes(parsed.actionType)
+          : horizonExitOrderSlot
           ? ['horizon_exit_reconciled', 'market_closed_no_op', 'position_held'].includes(parsed.actionType)
             || safeNoPositionHorizonNoOp
           : !['shadow_refreshed', 'horizon_exit_reconciled'].includes(parsed.actionType);
@@ -1891,7 +1893,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
-      if (task.kind === 'order' && !postCloseCutover && parsed.dailyEntryCount > latestTask.daily_entry_cap) {
+      if (task.kind === 'order' && parsed.dailyEntryCount > latestTask.daily_entry_cap) {
         return pauseForTask(latest, 'daily_entry_cap_attestation_mismatch', {
           invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
           error_class: 'daily_entry_cap_attestation_mismatch', fail_closed: true,
@@ -1900,9 +1902,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const blockedBeforeArtifactLoad = task.kind === 'order'
         && parsed.status === 'blocked' && parsed.artifactHash === null
         && parsed.previousArtifactHash === null && parsed.artifactPromoted === false;
-      const artifactAttestationValid = task.kind !== 'order' || postCloseCutover || blockedBeforeArtifactLoad
-        || (parsed.artifactPromoted
-          ? parsed.previousArtifactHash === latestTask.activation_artifact_hash
+      const artifactAttestationValid = task.kind !== 'order' || blockedBeforeArtifactLoad
+        || (postCloseRefresh
+          ? parsed.artifactPromoted === false
+            && parsed.artifactHash === latestTask.activation_artifact_hash
+            && (postCloseMarketClosedNoOp
+              ? parsed.previousArtifactHash === null && parsed.shadowPredictionsInserted === 0
+              : parsed.previousArtifactHash === latestTask.activation_artifact_hash)
           : parsed.artifactHash === latestTask.activation_artifact_hash);
       if (!artifactAttestationValid) {
         return pauseForTask(latest, 'model_v3_artifact_attestation_mismatch', {
@@ -1926,19 +1932,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         });
       }
       if (task.kind === 'order') {
-        Object.assign(lastRun, postCloseCutover ? {
-          activation_performed: parsed.activationPerformed,
-          execution_owner_before: parsed.executionOwnerBefore,
-          execution_owner_after: parsed.executionOwnerAfter,
-          distinct_vps_days: parsed.distinctVpsDays,
-          reconciled_round_trips: parsed.reconciledRoundTrips,
-          unresolved_major_incidents: parsed.unresolvedMajorIncidents,
-          vps_flat: parsed.vpsFlat,
-          open_orders: parsed.openOrders,
-          db_integrity_ok: parsed.dbIntegrityOk,
-          blocked_issue_count: parsed.blockedIssueCount,
-          prod_db_touched: parsed.prodDbTouched,
-        } : {
+        Object.assign(lastRun, {
           order_api_calls: parsed.orderApiCalls,
           vps_live_orders: parsed.vpsLiveOrders,
           reconciliations: parsed.reconciliations,
@@ -1949,10 +1943,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           previous_artifact_hash: parsed.previousArtifactHash,
           artifact_hash: parsed.artifactHash,
         });
-        if (!postCloseCutover) {
-          const lifecycleDelivery = await notifyOrderLifecycle(latest, parsed, lastRun);
-          lastRun = lifecycleDelivery.lastRun;
-        }
+        const lifecycleDelivery = await notifyOrderLifecycle(latest, parsed, lastRun);
+        lastRun = lifecycleDelivery.lastRun;
       } else {
         Object.assign(lastRun, {
           failure_phase: parsed.failurePhase,
@@ -1972,7 +1964,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           pause_reason: undefined,
           consecutive_transport_failures: 0,
           pending_invocation: null,
-          activation_artifact_hash: (!postCloseCutover && parsed.artifactPromoted) ? parsed.artifactHash : postNotificationTask.activation_artifact_hash,
+          activation_artifact_hash: postNotificationTask.activation_artifact_hash,
           last_run: lastRun,
         } } });
       }
@@ -2140,7 +2132,7 @@ module.exports = {
   TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES, TASKS,
   parseKisAiMarketOpenOutput, parseKisVpsAutonomousOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
   parseAiVerdict, parseDecisionContextOutput, parseSafetyMonitorOutput, buildSanitizedAiPacket,
-  parseCutoverOutput, isPostCloseCutoverSlot,
+  parseCutoverOutput, isPostCloseRefreshSlot,
   buildOrderLifecycleMessage, sanitizeErrorClass,
   nextRunAt, isWeeklyUniverseRefreshDue, buildCommand, buildDecisionContextCommand, buildDiagnosticCommand,
   buildSafetyMonitorCommand, buildWeeklyUniverseCommand, parseWeeklyUniverseOutput,
