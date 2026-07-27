@@ -80,6 +80,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'order_not_fully_filled',
   'order_submission_unknown',
   'invalid_order_output_contract',
+  'model_v3_artifact_attestation_mismatch',
 ]);
 const DISCORD_ERROR_CLASSES = new Set([
   'blocked', 'safe_block', 'due_time_invalid', 'timeout', 'process_error',
@@ -1580,6 +1581,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (error) {
         throw new Error('order_activation_check_process_error');
       }
+      if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch') {
+        if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
+        if (prior.activation_artifact_hash === null
+          || parsed.artifactHash !== prior.activation_artifact_hash) {
+          throw new Error('artifact_recovery_hash_changed');
+        }
+      }
       const latest = loadStrict();
       const latestPrior = latest.tasks[ORDER_TASK.id];
       if (latest.state !== current.state
@@ -1839,7 +1847,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           error_class: 'daily_entry_cap_attestation_mismatch', fail_closed: true,
         });
       }
-      const artifactAttestationValid = task.kind !== 'order' || postCloseCutover
+      const blockedBeforeArtifactLoad = task.kind === 'order'
+        && parsed.status === 'blocked' && parsed.artifactHash === null
+        && parsed.previousArtifactHash === null && parsed.artifactPromoted === false;
+      const artifactAttestationValid = task.kind !== 'order' || postCloseCutover || blockedBeforeArtifactLoad
         || (parsed.artifactPromoted
           ? parsed.previousArtifactHash === latestTask.activation_artifact_hash
           : parsed.artifactHash === latestTask.activation_artifact_hash);
