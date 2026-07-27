@@ -21,10 +21,22 @@ function good(taskId, status = 'success', extra = {}) {
     [mod.TASKS[3].id]: 'daily_learning_report',
   }[taskId];
   const blocked = status === 'blocked';
+  const actionType = blocked ? 'paused' : (extra.action_type || defaultAction);
+  const intraday = taskId === mod.TASKS[1].id && status === 'success' && actionType === 'intraday_shadow'
+    ? {
+        intraday_decisions: 3,
+        intraday_mode: 'hybrid_bootstrap',
+        intraday_model_version: 'intraday_hybrid_v1',
+        intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+        intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+        intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+        intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+      }
+    : {};
   return JSON.stringify({
     task_id: taskId,
     status,
-    action_type: blocked ? 'paused' : defaultAction,
+    action_type: actionType,
     official_trade_date: blocked ? null : '2026-07-21',
     official_session_state: blocked ? 'unknown' : 'regular_session',
     official_calendar_verified: !blocked,
@@ -56,6 +68,7 @@ function good(taskId, status = 'success', extra = {}) {
     failure_attempt_number: 0,
     transport_degraded: false,
     report_message: null,
+    ...intraday,
     ...extra,
   });
 }
@@ -1229,6 +1242,18 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.equal(command.args.includes('--activation-preflight'), false);
   const trading = () => calendarProof(true);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    intraday_decisions: 2,
+  }), mod.TASKS[1].id, trading), /intraday_output_contract/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    intraday_feature_hash: 'b'.repeat(64),
+  }), mod.TASKS[1].id, trading), /intraday_output_contract/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'success', {
+    intraday_decisions: 3,
+  }), mod.TASKS[0].id, trading), /fields/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { unknown: 1 }), mod.TASKS[1].id, trading), /fields/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { fail_closed: undefined }), mod.TASKS[1].id, trading), /fields|boolean/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', { report_message: 'app_secret=x' }), mod.TASKS[1].id, trading), /unsafe/);
