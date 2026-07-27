@@ -322,6 +322,9 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('--activation-preflight')) {
+      if (typeof options.onActivationPreflight === 'function') {
+        options.onActivationPreflight({ command, args, execOptions });
+      }
       callback(
         options.activationPreflightError || null,
         options.activationPreflightOutput
@@ -1705,6 +1708,27 @@ test('database IO recovery requires the existing activation preflight before res
   const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
+test('account-risk evidence recovery requires activation preflight and clear safety state', async () => {
+  let activationPreflights = 0;
+  const value = await active({
+    onActivationPreflight() { activationPreflights += 1; },
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'account_risk_evidence_missing';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(activationPreflights, 2);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
 test('database IO recovery remains paused when the activation preflight fails closed', async () => {
