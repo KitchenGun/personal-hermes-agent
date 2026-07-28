@@ -1197,7 +1197,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (contextRun.error && Number(contextRun.error.code) !== 2) throw new Error('decision_context_process_error');
     const context = parseDecisionContextOutput(contextRun.stdout, slotId);
     if (context.blocked) throw new Error(context.errorClass);
-    if (context.candidates.length === 0) return null;
+    if (context.candidates.length === 0) {
+      return Object.freeze({
+        path: null,
+        promptHash: '',
+        candidateCount: 0,
+        llmInvoked: false,
+        verdictStatus: 'skipped_no_candidates',
+      });
+    }
     const packet = buildSanitizedAiPacket({ slotId, context });
     let timeout;
     const timed = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('llm_response_timeout')), LLM_RESPONSE_TIMEOUT_MS); });
@@ -1216,7 +1224,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
     fs.chmodSync(file, 0o600);
-    return Object.freeze({ path: file, promptHash: packet.prompt_hash });
+    return Object.freeze({
+      path: file,
+      promptHash: packet.prompt_hash,
+      candidateCount: context.candidates.length,
+      llmInvoked: true,
+      verdictStatus: 'validated',
+    });
   }
 
   function disabledState() {
@@ -1793,6 +1807,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let attestationPath = null;
     let verdictPath = null;
     let promptHash = '';
+    let decisionContextCandidateCount = 0;
+    let llmInvoked = false;
+    let llmVerdictStatus = requiresAiVerdict ? 'pending' : 'not_required';
     try {
       save({ ...current, tasks: { ...current.tasks, [taskId]: {
         ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime), pending_invocation: pendingInvocation,
@@ -1806,6 +1823,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           const verdict = await createAiVerdictFile(taskId, key, dueTime, schedulerToken);
           verdictPath = verdict?.path || null;
           promptHash = verdict?.promptHash || '';
+          decisionContextCandidateCount = verdict?.candidateCount || 0;
+          llmInvoked = verdict?.llmInvoked === true;
+          llmVerdictStatus = verdict?.verdictStatus || 'invalid';
 
           const contextState = loadStrict();
           const contextTask = contextState.tasks[taskId];
@@ -1962,6 +1982,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           artifact_promoted: parsed.artifactPromoted,
           previous_artifact_hash: parsed.previousArtifactHash,
           artifact_hash: parsed.artifactHash,
+          decision_context_candidate_count: decisionContextCandidateCount,
+          llm_invoked: llmInvoked,
+          llm_verdict_status: llmVerdictStatus,
         });
         const lifecycleDelivery = await notifyOrderLifecycle(latest, parsed, lastRun);
         lastRun = lifecycleDelivery.lastRun;

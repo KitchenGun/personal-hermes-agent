@@ -2072,6 +2072,9 @@ test('intraday AI verdict is bounded, passed by path only, and deleted after KIS
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(fs.existsSync(seenPath), false);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.decision_context_candidate_count, 1);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_invoked, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_verdict_status, 'validated');
 });
 
 test('empty decision context still rotates the consumed attestation before no-op execution', async () => {
@@ -2106,6 +2109,9 @@ test('empty decision context still rotates the consumed attestation before no-op
   assert.equal(llmCalls, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'no_candidate_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.decision_context_candidate_count, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_invoked, false);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_verdict_status, 'skipped_no_candidates');
 });
 
 test('decision context state drift blocks before issuing an execution attestation', async () => {
