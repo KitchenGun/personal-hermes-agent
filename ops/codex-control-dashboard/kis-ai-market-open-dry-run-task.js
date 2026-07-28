@@ -89,6 +89,11 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'order_submission_unknown',
   'invalid_order_output_contract',
   'model_v3_artifact_attestation_mismatch',
+  'model_v3_shadow_batch_failed',
+  'model_v3_backfill_failed',
+  'model_v3_shadow_execution_failed',
+  'model_v3_artifact_load_failed',
+  'model_v3_artifact_verify_failed',
   'hermes_scheduler_attestation_unavailable',
 ]);
 const DISCORD_ERROR_CLASSES = new Set([
@@ -115,6 +120,9 @@ const DISCORD_ERROR_CLASSES = new Set([
   'safety_monitor_failed', 'execution_owner_disabled', 'execution_owner_invalid',
   'vps_environment_or_credentials_unavailable', 'prod_environment_or_credentials_unavailable',
   'account_risk_evidence_missing', 'prod_account_risk_evidence_missing',
+  'model_v3_refresh_failed', 'model_v3_shadow_failed', 'model_v3_shadow_batch_failed',
+  'model_v3_backfill_failed', 'model_v3_shadow_execution_failed',
+  'model_v3_artifact_load_failed', 'model_v3_artifact_verify_failed',
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
   'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
 ]);
@@ -139,8 +147,8 @@ const TASKS = Object.freeze([
   {
     id: 'kis-vps-model-v3-autonomous-pilot-v1',
     kind: 'order',
-    schedule: 'weekdays 09:10-14:40 KST every 10m; deterministic risk-off 14:41-14:42 KST; cutover check 16:20 KST',
-    minutes: [...Array.from({ length: 34 }, (_, i) => 550 + (i * 10)), 881, 882, 980],
+    schedule: 'weekdays 09:10-14:40 KST every 10m; deterministic risk-off 14:41-14:42 KST; shadow refresh 16:40 KST',
+    minutes: [...Array.from({ length: 34 }, (_, i) => 550 + (i * 10)), 881, 882, 1000],
   },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
@@ -274,7 +282,7 @@ function postCloseRefreshAtToday(from = new Date()) {
   for (let index = 0; index < (24 * 60); index += 1) {
     const parts = seoulParts(probe);
     if (parts.year !== today.year || parts.month !== today.month || parts.day !== today.day) break;
-    if (Number(parts.hour) === 16 && Number(parts.minute) === 20) return probe.toISOString();
+    if (Number(parts.hour) === 16 && Number(parts.minute) === 40) return probe.toISOString();
     probe.setUTCMinutes(probe.getUTCMinutes() + 1);
   }
   throw new Error('post_close_arm_window_unavailable');
@@ -785,7 +793,7 @@ function buildSafetyMonitorCommand() {
 function isPostCloseRefreshSlot(task, value) {
   if (task.id !== ORDER_TASK.id) return false;
   const parts = seoulParts(value);
-  return Number(parts.hour) === 16 && Number(parts.minute) === 20;
+  return Number(parts.hour) === 16 && Number(parts.minute) === 40;
 }
 
 function parseCutoverOutput(stdout) {
@@ -947,7 +955,7 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
   if (verdictPath && !/^[a-f0-9]{64}$/.test(promptHash)) throw new Error('invalid_ai_verdict');
   if (taskId === ORDER_TASK.id) {
-    const postCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:20');
+    const postCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:40');
     const action = activationPreflight ? 'activation-check' : postCloseRefresh ? 'scheduled-refresh-shadow' : 'run-once';
     const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
     if (!activationPreflight) {
