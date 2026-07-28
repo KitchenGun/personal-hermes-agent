@@ -71,9 +71,12 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'dns_failed', 'connection_failed', 'connection_reset', 'timeout',
   'http_transport_failed', 'response_read_failed',
 ]);
+const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
+  'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
+]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields',
-  'account_risk_evidence_missing',
+  'account_risk_evidence_missing', 'safety_monitor_failed',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
@@ -2051,10 +2054,30 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
     } catch (error) {
       const reason = sanitizeErrorClass(error.message);
-      const paused = pauseAll(current, TASKS[0].id, reason, { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason });
+      const consecutiveFailures = Number(current.consecutive_safety_monitor_failures || 0) + 1;
+      const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
+        && consecutiveFailures < 2;
+      if (awaitingConfirmation) {
+        return save({
+          ...current,
+          consecutive_safety_monitor_failures: consecutiveFailures,
+          last_safety_monitor: {
+            ...monitorRun,
+            status: 'blocked',
+            fail_closed: true,
+            error_class: reason,
+          },
+        });
+      }
+      const paused = pauseAll(
+        { ...current, consecutive_safety_monitor_failures: consecutiveFailures },
+        TASKS[0].id,
+        reason,
+        { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason },
+      );
       return notifyPause(paused, TASKS[0].id, reason, paused.tasks[TASKS[0].id].last_run);
     }
-    return save({ ...current, last_safety_monitor: monitorRun });
+    return save({ ...current, consecutive_safety_monitor_failures: 0, last_safety_monitor: monitorRun });
   }
   async function tick() {
     if (enforceSchedulerOwnership && typeof releaseSchedulerOwnership !== 'function') {
@@ -2069,6 +2092,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const time = now();
         current = await runSafetyMonitor(current, time);
         if (current.state !== 'ACTIVE') return current;
+        if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success') return current;
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= time.getTime()) {
