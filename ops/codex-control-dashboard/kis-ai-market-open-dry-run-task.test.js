@@ -248,6 +248,7 @@ function decisionContext(slotId, candidates = ['005930']) {
     candidates: candidates.map((symbol) => ({
       symbol,
       role: 'eligible_entry',
+      review_tier: 'primary',
       ml_action: 'ENTER',
       confidence_bucket: 'high',
       prob_up: 0.7,
@@ -1969,6 +1970,7 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   const packet = mod.buildSanitizedAiPacket({ slotId, context });
   assert.equal(packet.model_id, 'gpt-5.6-terra');
   assert.equal(packet.candidates.length, 2);
+  assert.deepEqual(packet.candidates.map((item) => item.review_tier), ['primary', 'primary']);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
     reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
@@ -1987,6 +1989,26 @@ test('AI packet accepts bounded six-digit symbols outside the legacy three-symbo
   const context = mod.parseDecisionContextOutput(decisionContext(slotId, ['035720', '247540']), slotId);
   const packet = mod.buildSanitizedAiPacket({ slotId, context });
   assert.deepEqual(packet.candidates.map((item) => item.symbol), ['035720', '247540']);
+});
+
+test('AI packet preserves bounded watch review metadata without expanding actions', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const parsed = JSON.parse(decisionContext(slotId, ['005930']));
+  parsed.candidates[0] = {
+    ...parsed.candidates[0],
+    review_tier: 'watch',
+    ml_action: 'EXIT',
+    confidence_bucket: 'low',
+    prob_up: 0.44,
+    prob_flat: 0.25,
+    prob_down: 0.31,
+  };
+  const context = mod.parseDecisionContextOutput(JSON.stringify(parsed), slotId);
+  const packet = mod.buildSanitizedAiPacket({ slotId, context });
+
+  assert.equal(packet.candidates[0].review_tier, 'watch');
+  assert.equal(packet.candidates[0].ml_action, 'EXIT');
+  assert.deepEqual(packet.decision_contract.actions, ['ENTER', 'EXIT', 'HOLD', 'HOLD_OVERNIGHT', 'REJECT']);
 });
 
 test('order lifecycle notification is once-only and delivery failure never retries the order', async () => {

@@ -617,7 +617,7 @@ function buildOrderLifecycleMessage(parsed) {
 function normalizedAiCandidates(value = []) {
   if (!Array.isArray(value) || value.length > MAX_AI_CANDIDATES) throw new Error('invalid_ai_candidates');
   const expectedKeys = new Set([
-    'symbol', 'role', 'ml_action', 'confidence_bucket', 'prob_up', 'prob_flat', 'prob_down',
+    'symbol', 'role', 'review_tier', 'ml_action', 'confidence_bucket', 'prob_up', 'prob_flat', 'prob_down',
     'expected_net_return', 'risk_overlay', 'data_quality',
   ]);
   const symbols = value.map((item) => item?.symbol);
@@ -629,6 +629,9 @@ function normalizedAiCandidates(value = []) {
       || Object.keys(item).length !== expectedKeys.size
       || [...expectedKeys].some((key) => !Object.prototype.hasOwnProperty.call(item, key))
       || !['held_position', 'eligible_entry'].includes(item.role)
+      || !['position', 'primary', 'watch'].includes(item.review_tier)
+      || (item.role === 'held_position' && item.review_tier !== 'position')
+      || (item.role === 'eligible_entry' && item.review_tier === 'position')
       || !AI_DECISION_ACTIONS.has(item.ml_action)
       || !AI_CONFIDENCE_BUCKETS.has(item.confidence_bucket)
       || !['ALLOW', 'BLOCK_ENTRY', 'FORCE_EXIT', 'SYSTEM_PAUSE'].includes(item.risk_overlay)
