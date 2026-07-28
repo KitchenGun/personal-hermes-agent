@@ -422,11 +422,11 @@ test('intraday decision and order schedules align on future 10-minute slots', ()
   assert.deepEqual(mod.TASKS[2].minutes, [980]);
   assert.deepEqual(mod.TASKS[3].minutes, [990]);
   const task = mod.TASKS[4];
-  assert.deepEqual(task.minutes, [...mod.TASKS[1].minutes, 881, 882, 980]);
+  assert.deepEqual(task.minutes, [...mod.TASKS[1].minutes, 881, 882, 1000]);
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:09:00Z')), '2026-07-21T00:10:00.000Z');
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:39:00Z')), '2026-07-21T05:40:00.000Z');
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:40:00Z')), '2026-07-21T05:41:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:42:00Z')), '2026-07-21T07:20:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:42:00Z')), '2026-07-21T07:40:00.000Z');
 });
 
 test('post-close shadow refresh reuses the existing order task and never invokes an LLM', async () => {
@@ -436,7 +436,7 @@ test('post-close shadow refresh reuses the existing order task and never invokes
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const state = value.task.status();
-  const due = '2026-07-21T07:20:00.000Z';
+  const due = '2026-07-21T07:40:00.000Z';
   state.tasks[mod.TASKS[4].id].next_run_at = due;
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
   value.setClock(due);
@@ -453,7 +453,7 @@ test('post-close shadow refresh reuses the existing order task and never invokes
 });
 
 test('post-close refresh command is attested and exposes no order approval', () => {
-  const dueKey = `${mod.TASKS[4].id}:2026-07-21:16:20`;
+  const dueKey = `${mod.TASKS[4].id}:2026-07-21:16:40`;
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '3'.repeat(32), dueKey });
   assert.deepEqual(command.args, ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'scheduled-refresh-shadow']);
   assert.equal(command.env.KIS_ACTIVE_SCHEDULER_COUNT, undefined);
@@ -474,13 +474,13 @@ test('post-close market-closed no-op accepts only the current artifact attestati
     });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
     const before = value.task.status();
-    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:40:00.000Z';
     fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-    value.setClock('2026-07-21T07:20:00.000Z');
+    value.setClock('2026-07-21T07:40:00.000Z');
 
     const state = await value.task.runOnce({
       taskId: mod.TASKS[4].id,
-      dueAt: new Date('2026-07-21T07:20:00.000Z'),
+      dueAt: new Date('2026-07-21T07:40:00.000Z'),
     });
 
     assert.equal(state.tasks[mod.TASKS[4].id].state, expectedState);
@@ -777,14 +777,14 @@ test.skip('post-close activation waiting mode remains retired', async () => {
 
   assert.equal(autonomousRuns, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T07:20:00.000Z');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T07:40:00.000Z');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_waiting_post_close');
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
 
-  value.setClock('2026-07-21T07:20:00Z');
+  value.setClock('2026-07-21T07:40:00Z');
   state = await value.task.runOnce({
     taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00Z'),
+    dueAt: new Date('2026-07-21T07:40:00Z'),
   });
   assert.equal(autonomousRuns, 1);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -801,12 +801,12 @@ test('post-close refresh rejects order execution output', async () => {
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const stateBefore = value.task.status();
-  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:40:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
 
   const state = await value.task.runOnce({
     taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+    dueAt: new Date('2026-07-21T07:40:00.000Z'),
   });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
@@ -829,13 +829,13 @@ test('post-close refresh rejects artifact promotion and hash drift', async () =>
     const value = await active({ shadowRefreshOutput: orderGood('success', extra) });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
     const before = value.task.status();
-    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:40:00.000Z';
     fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-    value.setClock('2026-07-21T07:20:00.000Z');
+    value.setClock('2026-07-21T07:40:00.000Z');
 
     const state = await value.task.runOnce({
       taskId: mod.TASKS[4].id,
-      dueAt: new Date('2026-07-21T07:20:00.000Z'),
+      dueAt: new Date('2026-07-21T07:40:00.000Z'),
     });
 
     assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
@@ -880,6 +880,11 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'order_submission_unknown',
     'invalid_order_output_contract',
     'model_v3_artifact_attestation_mismatch',
+    'model_v3_shadow_batch_failed',
+    'model_v3_backfill_failed',
+    'model_v3_shadow_execution_failed',
+    'model_v3_artifact_load_failed',
+    'model_v3_artifact_verify_failed',
     'hermes_scheduler_attestation_unavailable',
   ]) {
     const value = await active();
@@ -1168,13 +1173,13 @@ test.skip('legacy order-task post-close promotion is retired', async () => {
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const stateBefore = value.task.status();
   const orderTask = stateBefore.tasks[mod.TASKS[4].id];
-  orderTask.next_run_at = '2026-07-21T07:20:00.000Z';
+  orderTask.next_run_at = '2026-07-21T07:40:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
-  value.setClock('2026-07-21T07:20:00.000Z');
+  value.setClock('2026-07-21T07:40:00.000Z');
 
   const state = await value.task.runOnce({
     taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+    dueAt: new Date('2026-07-21T07:40:00.000Z'),
   });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -1285,13 +1290,13 @@ test.skip('legacy post-close promotion attestation is retired', async () => {
   } });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const stateBefore = value.task.status();
-  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:40:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
-  value.setClock('2026-07-21T07:20:00.000Z');
+  value.setClock('2026-07-21T07:40:00.000Z');
 
   const state = await value.task.runOnce({
     taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00.000Z'),
+    dueAt: new Date('2026-07-21T07:40:00.000Z'),
   });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
@@ -1485,6 +1490,17 @@ test('strict command and output contract reject drift and unsafe fields', () => 
 
 test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
   assert.equal(mod.sanitizeErrorClass('daily_entry_cap_attestation_mismatch'), 'daily_entry_cap_attestation_mismatch');
+  for (const errorClass of [
+    'model_v3_refresh_failed',
+    'model_v3_shadow_failed',
+    'model_v3_shadow_batch_failed',
+    'model_v3_backfill_failed',
+    'model_v3_shadow_execution_failed',
+    'model_v3_artifact_load_failed',
+    'model_v3_artifact_verify_failed',
+  ]) {
+    assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
+  }
   assert.equal(mod.sanitizeErrorClass('app_secret=value'), 'sanitized_runtime_error');
   assert.equal(mod.sanitizeErrorClass('Bearer abc.def.ghi'), 'sanitized_runtime_error');
   assert.equal(mod.sanitizeErrorClass('sk-proj-fixturetoken1234567890'), 'sanitized_runtime_error');
