@@ -96,6 +96,13 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'model_v3_artifact_verify_failed',
   'hermes_scheduler_attestation_unavailable',
 ]);
+const POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS = new Set([
+  'model_v3_shadow_batch_failed',
+  'model_v3_backfill_failed',
+  'model_v3_shadow_execution_failed',
+  'model_v3_artifact_load_failed',
+  'model_v3_artifact_verify_failed',
+]);
 const DISCORD_ERROR_CLASSES = new Set([
   'blocked', 'safe_block', 'due_time_invalid', 'timeout', 'process_error',
   'invalid_safety_output', 'scheduler_state_fault', 'state_unavailable',
@@ -161,6 +168,7 @@ const TASK_ALERT_LABELS = new Map([
 ]);
 const DRY_RUN_TASKS = Object.freeze(TASKS.filter((task) => task.kind === 'dry_run'));
 const ORDER_TASK = TASKS.find((task) => task.kind === 'order');
+const REFRESH_ONLY_ORDER_TASK = Object.freeze({ ...ORDER_TASK, minutes: [1000] });
 const POST_CLOSE_TASK = TASKS.find((task) => task.id === 'kis-ai-post-close-learning-v1');
 const ACTIVE_STATUSES = new Set(['success', 'no_op', 'waiting', 'report_ready']);
 const ALL_STATUSES = new Set([...ACTIVE_STATUSES, 'blocked']);
@@ -1245,7 +1253,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
 
   function disabledState() {
-    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
+    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, refresh_only_pending: false, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
   }
   function loadStrict() {
     try {
@@ -1262,13 +1270,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         value.tasks[ORDER_TASK.id] = {
           state: 'DISABLED', schedule: ORDER_TASK.schedule, next_run_at: null,
           last_due_at: null, last_run: null, consecutive_transport_failures: 0,
-          pending_invocation: null, activation_artifact_hash: null,
+          pending_invocation: null, activation_artifact_hash: null, refresh_only_pending: false,
           daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap,
           daily_entry_cap_approval_hash: null,
           ...INTRADAY_PROVIDER_ATTESTATION,
         };
       }
       const orderTask = value.tasks[ORDER_TASK.id];
+      if (orderTask.refresh_only_pending === undefined) orderTask.refresh_only_pending = false;
+      if (typeof orderTask.refresh_only_pending !== 'boolean') throw new Error('state_contract_invalid');
       const providerFieldsPresent = Object.keys(INTRADAY_PROVIDER_ATTESTATION)
         .filter((key) => key !== 'daily_entry_cap')
         .some((key) => orderTask[key] !== undefined);
@@ -1537,6 +1547,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         state: task.kind === 'order' ? 'DISABLED' : 'ACTIVE',
         schedule: task.schedule,
         next_run_at: task.kind === 'order' ? null : nextRunAt(task, activatedAt),
+        ...(task.kind === 'order' ? { refresh_only_pending: false } : {}),
         last_due_at: current.tasks[task.id]?.last_due_at || null,
         last_run: task.id === TASKS[0].id ? { status: 'success', action_type: 'activation_preflight', fail_closed: false, invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString() } : current.tasks[task.id]?.last_run || null,
       }]));
@@ -1637,10 +1648,26 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const activationReady = parsed.status === 'success'
         && parsed.failClosed === false
         && parsed.actionType === 'activation_check';
-      if (!activationReady) {
+      const waitingForPostCloseRefresh = prior.state === 'PAUSED'
+        && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.pause_reason)
+        && parsed.status === 'blocked'
+        && parsed.failClosed === true
+        && parsed.errorClass === 'model_v3_prediction_batch_incomplete'
+        && parsed.orderApiCalls === 0
+        && parsed.vpsLiveOrders === 0
+        && parsed.reconciliations === 0
+        && parsed.openPositions === 0
+        && parsed.dailyEntryCount === 0;
+      const refreshOnlyPending = prior.refresh_only_pending === true || waitingForPostCloseRefresh;
+      if (refreshOnlyPending
+        && (prior.activation_artifact_hash === null
+          || parsed.artifactHash !== prior.activation_artifact_hash)) {
+        throw new Error('artifact_recovery_hash_changed');
+      }
+      if (!activationReady && !waitingForPostCloseRefresh) {
         throw new Error(`order_activation_check_failed:${parsed.errorClass}`);
       }
-      if (error) {
+      if (error && !waitingForPostCloseRefresh) {
         throw new Error('order_activation_check_process_error');
       }
       if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch'
@@ -1662,11 +1689,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         throw new Error('order_activation_state_changed');
       }
       const activatedAt = now();
-      let scheduledAt = nextRunAt(ORDER_TASK, activatedAt);
-      let activationLastRun = {
-        status: 'success', action_type: 'activation_check', fail_closed: false,
-        invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
-      };
+      const scheduledAt = refreshOnlyPending
+        ? nextRunAt(REFRESH_ONLY_ORDER_TASK, activatedAt)
+        : nextRunAt(ORDER_TASK, activatedAt);
+      const activationLastRun = refreshOnlyPending
+        ? {
+            status: 'waiting', action_type: 'activation_waiting_post_close', fail_closed: true,
+            error_class: 'model_v3_prediction_batch_incomplete', order_api_calls: 0,
+            vps_live_orders: 0, open_positions: 0,
+            invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
+          }
+        : {
+            status: 'success', action_type: 'activation_check', fail_closed: false,
+            invoked_by: safeText(invokedBy), completed_at: activatedAt.toISOString(),
+          };
       return save({
         ...latest,
         order_pause_reason: undefined,
@@ -1680,6 +1716,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             pause_reason: undefined,
             schedule: ORDER_TASK.schedule,
             next_run_at: scheduledAt,
+            refresh_only_pending: refreshOnlyPending,
             activation_artifact_hash: parsed.artifactHash,
             pending_invocation: null,
             last_run: activationLastRun,
@@ -1701,6 +1738,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (current.state !== 'ACTIVE' || prior.state !== 'ACTIVE') {
         throw new Error('active_order_task_required');
       }
+      if (prior.refresh_only_pending === true) throw new Error('post_close_refresh_pending');
       if (prior.pending_invocation !== null) throw new Error('order_invocation_pending');
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
@@ -1786,7 +1824,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (!isDue(task, dueTime) || !sameMinute(taskState.next_run_at, dueTime)) {
       const scheduled = new Date(taskState.next_run_at || 0);
       if (scheduled.getTime() < dueTime.getTime()) {
-        return save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, next_run_at: nextRunAt(task, dueTime), last_run: { status: 'no_op', action_type: 'missed_window_no_op', error_class: 'none', fail_closed: false, catch_up: false, invoked_by: safeText(invokedBy), completed_at: now().toISOString() } } } });
+        const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
+          ? REFRESH_ONLY_ORDER_TASK : task;
+        return save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, next_run_at: nextRunAt(scheduleTask, dueTime), last_run: { status: taskState.refresh_only_pending ? 'waiting' : 'no_op', action_type: taskState.refresh_only_pending ? 'missed_refresh_window_no_op' : 'missed_window_no_op', error_class: taskState.refresh_only_pending ? 'model_v3_prediction_batch_incomplete' : 'none', fail_closed: taskState.refresh_only_pending === true, catch_up: false, invoked_by: safeText(invokedBy), completed_at: now().toISOString() } } } });
       }
       return current;
     }
@@ -1822,8 +1862,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let llmInvoked = false;
     let llmVerdictStatus = requiresAiVerdict ? 'pending' : 'not_required';
     try {
+      const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
+        ? REFRESH_ONLY_ORDER_TASK : task;
       save({ ...current, tasks: { ...current.tasks, [taskId]: {
-        ...taskState, last_due_at: key, next_run_at: nextRunAt(task, dueTime), pending_invocation: pendingInvocation,
+        ...taskState, last_due_at: key, next_run_at: nextRunAt(scheduleTask, dueTime), pending_invocation: pendingInvocation,
       } } });
       if (task.kind === 'order') {
         attestationPath = attestationFileForDueKey(key, orderAttestationDir);
@@ -2012,12 +2054,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseForTask(postNotificationState, parsed.errorClass || 'blocked', lastRun);
       if (task.kind === 'order') {
         const postNotificationTask = postNotificationState.tasks[taskId];
+        const refreshCompleted = postCloseRefresh && parsed.actionType === 'shadow_refreshed';
+        const refreshOnlyPending = postNotificationTask.refresh_only_pending === true && !refreshCompleted;
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
           ...postNotificationTask,
           state: 'ACTIVE',
           pause_reason: undefined,
           consecutive_transport_failures: 0,
           pending_invocation: null,
+          refresh_only_pending: refreshOnlyPending,
+          next_run_at: postNotificationTask.refresh_only_pending === true
+            ? nextRunAt(refreshOnlyPending ? REFRESH_ONLY_ORDER_TASK : task, dueTime)
+            : postNotificationTask.next_run_at,
           activation_artifact_hash: postNotificationTask.activation_artifact_hash,
           last_run: lastRun,
         } } });
