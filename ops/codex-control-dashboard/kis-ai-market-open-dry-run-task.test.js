@@ -1663,6 +1663,19 @@ test('exact IO resume recovers a process error only after the safety monitor is 
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact IO resume accepts a persisted safety monitor failure only after diagnostics are clear', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'safety_monitor_failed';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
 test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
   const value = await active();
   const paused = value.task.status();
@@ -2160,6 +2173,70 @@ test('one-minute safety monitor uses the existing manager, never calls LLM, and 
   assert.equal(state.state, 'PAUSED');
   assert.equal(state.pause_reason, 'safe_block');
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+});
+
+test('one transient safety monitor failure blocks the minute and a second consecutive failure pauses all tasks', async () => {
+  let taskRuns = 0;
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'unknown', error_class: 'safety_monitor_failed',
+    }),
+    execFile(command, args, execOptions, callback) {
+      taskRuns += 1;
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  };
+  const value = await active(options);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.state, 'ACTIVE');
+  assert.equal(held.last_safety_monitor.status, 'blocked');
+  assert.equal(held.last_safety_monitor.error_class, 'safety_monitor_failed');
+  assert.equal(held.consecutive_safety_monitor_failures, 1);
+  assert.equal(taskRuns, 0);
+
+  options.safetyOutput = safetyOutput('blocked', {
+    open_order_status: 'unknown', error_class: 'process_error',
+  });
+  value.setClock('2026-07-21T00:02:00Z');
+  const paused = await value.task.tick();
+  assert.equal(paused.state, 'PAUSED');
+  assert.equal(paused.pause_reason, 'process_error');
+  assert.equal(paused.consecutive_safety_monitor_failures, 2);
+  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(taskRuns, 0);
+});
+
+test('a clear monitor after one transient failure resumes future scheduling without catch-up', async () => {
+  let taskRuns = 0;
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'unknown', error_class: 'safety_monitor_failed',
+    }),
+    execFile(command, args, execOptions, callback) {
+      taskRuns += 1;
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  };
+  const value = await active(options);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.state, 'ACTIVE');
+  assert.equal(taskRuns, 0);
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:02:00Z');
+  const recovered = await value.task.tick();
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.last_safety_monitor.status, 'success');
+  assert.equal(recovered.consecutive_safety_monitor_failures, 0);
+  assert.equal(recovered.retry, false);
+  assert.equal(recovered.catch_up, false);
+  assert.equal(recovered.backfill, false);
 });
 
 test('safety monitor preserves a sanitized blocker returned with fail-closed exit code 2', async () => {
