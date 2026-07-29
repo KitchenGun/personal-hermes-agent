@@ -95,6 +95,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'model_v3_artifact_load_failed',
   'model_v3_artifact_verify_failed',
   'hermes_scheduler_attestation_unavailable',
+  'scheduled_shadow_refresh_slot_invalid',
 ]);
 const POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS = new Set([
   'model_v3_shadow_batch_failed',
@@ -102,6 +103,7 @@ const POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS = new Set([
   'model_v3_shadow_execution_failed',
   'model_v3_artifact_load_failed',
   'model_v3_artifact_verify_failed',
+  'scheduled_shadow_refresh_slot_invalid',
 ]);
 const DISCORD_ERROR_CLASSES = new Set([
   'blocked', 'safe_block', 'due_time_invalid', 'timeout', 'process_error',
@@ -130,6 +132,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'model_v3_refresh_failed', 'model_v3_shadow_failed', 'model_v3_shadow_batch_failed',
   'model_v3_backfill_failed', 'model_v3_shadow_execution_failed',
   'model_v3_artifact_load_failed', 'model_v3_artifact_verify_failed',
+  'scheduled_shadow_refresh_slot_invalid',
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
   'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
 ]);
@@ -154,8 +157,8 @@ const TASKS = Object.freeze([
   {
     id: 'kis-vps-model-v3-autonomous-pilot-v1',
     kind: 'order',
-    schedule: 'weekdays 09:10-14:40 KST every 10m; deterministic risk-off 14:41-14:42 KST; shadow refresh 16:40 KST',
-    minutes: [...Array.from({ length: 34 }, (_, i) => 550 + (i * 10)), 881, 882, 1000],
+    schedule: 'weekdays 09:10-14:40 KST every 10m; deterministic risk-off 14:41-14:42 KST; shadow refresh 16:20 KST',
+    minutes: [...Array.from({ length: 34 }, (_, i) => 550 + (i * 10)), 881, 882, 980],
   },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
@@ -168,7 +171,7 @@ const TASK_ALERT_LABELS = new Map([
 ]);
 const DRY_RUN_TASKS = Object.freeze(TASKS.filter((task) => task.kind === 'dry_run'));
 const ORDER_TASK = TASKS.find((task) => task.kind === 'order');
-const REFRESH_ONLY_ORDER_TASK = Object.freeze({ ...ORDER_TASK, minutes: [1000] });
+const REFRESH_ONLY_ORDER_TASK = Object.freeze({ ...ORDER_TASK, minutes: [980] });
 const POST_CLOSE_TASK = TASKS.find((task) => task.id === 'kis-ai-post-close-learning-v1');
 const ACTIVE_STATUSES = new Set(['success', 'no_op', 'waiting', 'report_ready']);
 const ALL_STATUSES = new Set([...ACTIVE_STATUSES, 'blocked']);
@@ -290,7 +293,7 @@ function postCloseRefreshAtToday(from = new Date()) {
   for (let index = 0; index < (24 * 60); index += 1) {
     const parts = seoulParts(probe);
     if (parts.year !== today.year || parts.month !== today.month || parts.day !== today.day) break;
-    if (Number(parts.hour) === 16 && Number(parts.minute) === 40) return probe.toISOString();
+    if (Number(parts.hour) === 16 && Number(parts.minute) === 20) return probe.toISOString();
     probe.setUTCMinutes(probe.getUTCMinutes() + 1);
   }
   throw new Error('post_close_arm_window_unavailable');
@@ -801,7 +804,7 @@ function buildSafetyMonitorCommand() {
 function isPostCloseRefreshSlot(task, value) {
   if (task.id !== ORDER_TASK.id) return false;
   const parts = seoulParts(value);
-  return Number(parts.hour) === 16 && Number(parts.minute) === 40;
+  return Number(parts.hour) === 16 && Number(parts.minute) === 20;
 }
 
 function parseCutoverOutput(stdout) {
@@ -963,7 +966,7 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
   if (verdictPath && !/^[a-f0-9]{64}$/.test(promptHash)) throw new Error('invalid_ai_verdict');
   if (taskId === ORDER_TASK.id) {
-    const postCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:40');
+    const postCloseRefresh = !activationPreflight && invocationDueKey.endsWith(':16:20');
     const action = activationPreflight ? 'activation-check' : postCloseRefresh ? 'scheduled-refresh-shadow' : 'run-once';
     const args = ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', action];
     if (!activationPreflight) {
