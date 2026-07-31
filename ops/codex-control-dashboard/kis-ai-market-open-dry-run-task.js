@@ -14,8 +14,17 @@ const MODEL_V3_RESEARCH_APPROVAL = 'APPROVE_KIS_MODEL_V3_30D_RESEARCH_API_VPS_V1
 const LEGACY_DAILY_ENTRY_CAP_5_APPROVAL_HASH = crypto.createHash('sha256')
   .update('APPROVE_KIS_VPS_MOCK_DAILY_ENTRY_CAP_5_V1').digest('hex');
 const INTRADAY_PROVIDER_ID = 'intraday_v1';
-const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v1';
-const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v1';
+const LEGACY_INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v1';
+const LEGACY_INTRADAY_POLICY_VERSION = 'intraday-fast-track-v1';
+const LEGACY_INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
+  decision_provider: INTRADAY_PROVIDER_ID,
+  intraday_feature_version: LEGACY_INTRADAY_FEATURE_VERSION,
+  intraday_policy_version: LEGACY_INTRADAY_POLICY_VERSION,
+  intraday_feature_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_FEATURE_VERSION).digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_POLICY_VERSION).digest('hex'),
+});
+const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v2-dynamic-universe';
+const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v2-dynamic-universe';
 const INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   decision_provider: INTRADAY_PROVIDER_ID,
   intraday_feature_version: INTRADAY_FEATURE_VERSION,
@@ -240,13 +249,13 @@ const ORDER_ACTIONS = new Set([
   ...ORDER_EXECUTION_ACTIONS,
 ]);
 
-function hasIntradayProviderAttestation(value) {
+function hasIntradayProviderAttestation(value, expected = INTRADAY_PROVIDER_ATTESTATION) {
   return Boolean(value)
-    && value.decision_provider === INTRADAY_PROVIDER_ATTESTATION.decision_provider
-    && value.intraday_feature_version === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
-    && value.intraday_policy_version === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
-    && value.intraday_feature_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash
-    && value.intraday_policy_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
+    && value.decision_provider === expected.decision_provider
+    && value.intraday_feature_version === expected.intraday_feature_version
+    && value.intraday_policy_version === expected.intraday_policy_version
+    && value.intraday_feature_hash === expected.intraday_feature_hash
+    && value.intraday_policy_hash === expected.intraday_policy_hash;
 }
 
 function seoulParts(date) {
@@ -1288,12 +1297,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const validIntraday = orderTask.daily_entry_cap === INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap
         && orderTask.daily_entry_cap_approval_hash == null
         && hasIntradayProviderAttestation(orderTask);
+      const validPreviousIntraday = orderTask.daily_entry_cap === INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap
+        && orderTask.daily_entry_cap_approval_hash == null
+        && hasIntradayProviderAttestation(orderTask, LEGACY_INTRADAY_PROVIDER_ATTESTATION);
       const validLegacy = !providerFieldsPresent && (
         (orderTask.daily_entry_cap === 3 && orderTask.daily_entry_cap_approval_hash == null)
         || (orderTask.daily_entry_cap === 5
           && orderTask.daily_entry_cap_approval_hash === LEGACY_DAILY_ENTRY_CAP_5_APPROVAL_HASH)
       );
-      if (!validIntraday && !validLegacy) {
+      if (!validIntraday && !validPreviousIntraday && !validLegacy) {
         throw new Error('state_contract_invalid');
       }
       return value;
