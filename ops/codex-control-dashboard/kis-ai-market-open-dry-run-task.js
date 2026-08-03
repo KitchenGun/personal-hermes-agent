@@ -709,6 +709,7 @@ function buildSanitizedAiPacket({ slotId, context } = {}) {
       reason_codes: [...AI_REASON_CODES].sort(),
       max_candidates: MAX_AI_CANDIDATES,
       target_weight_pct: { minimum: 0, maximum: 50, non_enter: 0 },
+      minimum_vps_entry_decisions: context.risk_aggregate.minimum_vps_entry_decisions,
     },
   };
   const promptHash = crypto.createHash('sha256').update(JSON.stringify(packet)).digest('hex');
@@ -741,6 +742,15 @@ function parseAiVerdict(value, packet) {
       throw new Error('invalid_ai_verdict');
     }
     symbols.add(decision.symbol);
+  }
+  if (packet.decision_contract.minimum_vps_entry_decisions === 1) {
+    const eligibleEntries = new Set(
+      packet.candidates.filter((item) => item.role === 'eligible_entry').map((item) => item.symbol),
+    );
+    const entries = value.decisions.filter((item) => item.action === 'ENTER');
+    if (entries.length !== 1 || !eligibleEntries.has(entries[0].symbol) || entries[0].target_weight_pct <= 0) {
+      throw new Error('invalid_ai_verdict');
+    }
   }
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(serialized)) {
@@ -799,9 +809,11 @@ function parseDecisionContextOutput(stdout, expectedSlotId) {
     || !value.account_aggregate || Object.keys(value.account_aggregate).length !== 2
     || !Number.isFinite(value.account_aggregate.available_cash) || value.account_aggregate.available_cash < 0
     || !Number.isFinite(value.account_aggregate.account_equity) || value.account_aggregate.account_equity <= 0
-    || !value.risk_aggregate || Object.keys(value.risk_aggregate).length !== 8
-    || ['open_positions', 'open_orders', 'daily_entry_submit_count', 'active_daily_entry_cap', 'max_positions']
+    || !value.risk_aggregate || Object.keys(value.risk_aggregate).length !== 9
+    || ['open_positions', 'open_orders', 'daily_entry_submit_count', 'active_daily_entry_cap', 'max_positions',
+      'minimum_vps_entry_decisions']
       .some((key) => !Number.isSafeInteger(value.risk_aggregate[key]) || value.risk_aggregate[key] < 0)
+    || ![0, 1].includes(value.risk_aggregate.minimum_vps_entry_decisions)
     || ['max_symbol_equity_pct', 'planned_position_loss_pct', 'daily_loss_limit_pct']
       .some((key) => !Number.isFinite(value.risk_aggregate[key]) || value.risk_aggregate[key] <= 0)
     || !Array.isArray(value.event_metadata) || value.event_metadata.length > 20

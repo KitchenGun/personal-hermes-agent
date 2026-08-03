@@ -15,7 +15,8 @@ function packet() {
     model_id: FIXED_MODEL_ID,
     prompt_hash: 'a'.repeat(64),
     candidates: [{ symbol: '005930' }],
-    decision_contract: { actions: ['ENTER', 'HOLD'] },
+    risk_aggregate: { minimum_vps_entry_decisions: 1 },
+    decision_contract: { actions: ['ENTER', 'HOLD'], minimum_vps_entry_decisions: 1 },
   };
 }
 
@@ -37,6 +38,7 @@ test('uses fixed Hermes model with safe mode and an empty toolset', async () => 
   ]);
   assert.equal(calls[0].options.timeout, MAX_TIMEOUT_MS);
   assert.match(calls[0].args[7], /Do not call tools/);
+  assert.match(calls[0].args[7], /minimum_vps_entry_decisions is 1/);
 });
 
 test('rejects model drift before spawning Hermes', async () => {

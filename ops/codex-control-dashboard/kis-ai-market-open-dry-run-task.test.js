@@ -238,7 +238,7 @@ function cutoverOutput(status = 'INELIGIBLE', extra = {}) {
   });
 }
 
-function decisionContext(slotId, candidates = ['005930']) {
+function decisionContext(slotId, candidates = ['005930'], minimumVpsEntryDecisions = 0) {
   return JSON.stringify({
     task_id: 'kis-llm-decision-context-v1',
     status: 'success',
@@ -266,6 +266,7 @@ function decisionContext(slotId, candidates = ['005930']) {
       daily_entry_submit_count: 0,
       active_daily_entry_cap: 3,
       max_positions: 3,
+      minimum_vps_entry_decisions: minimumVpsEntryDecisions,
       max_symbol_equity_pct: 50,
       planned_position_loss_pct: 1,
       daily_loss_limit_pct: 3,
@@ -2369,6 +2370,7 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.equal(packet.model_id, 'gpt-5.6-terra');
   assert.equal(packet.candidates.length, 2);
   assert.deepEqual(packet.candidates.map((item) => item.review_tier), ['primary', 'primary']);
+  assert.equal(packet.decision_contract.minimum_vps_entry_decisions, 0);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
     reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
@@ -2380,6 +2382,18 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005380', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
   }]), packet), /invalid_ai_verdict/);
+
+  const required = mod.buildSanitizedAiPacket({
+    slotId,
+    context: mod.parseDecisionContextOutput(decisionContext(slotId, ['005930'], 1), slotId),
+  });
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(required), required), /invalid_ai_verdict/);
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(required, [{
+    symbol: '005930', action: 'ENTER', target_weight_pct: 0, confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
+  }]), required), /invalid_ai_verdict/);
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(required, [{
+    symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
+  }]), required));
 });
 
 test('AI packet accepts bounded six-digit symbols outside the legacy three-symbol watchlist', () => {
