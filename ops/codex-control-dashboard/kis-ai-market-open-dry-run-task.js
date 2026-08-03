@@ -777,6 +777,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('invalid_decision_context');
   let value;
+  const expectedTradeDate = typeof expectedSlotId === 'string' ? expectedSlotId.split(':')[1] : '';
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_decision_context'); }
   const keys = [
     'task_id', 'status', 'slot_id', 'model_id', 'official_trade_date', 'candidates',
@@ -789,7 +790,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId) {
     || value.task_id !== 'kis-llm-decision-context-v1'
     || !['success', 'blocked'].includes(value.status)
     || value.slot_id !== expectedSlotId || value.model_id !== LLM_MODEL_ID
-    || !/^\d{4}-\d{2}-\d{2}$/.test(value.official_trade_date)
+    || value.official_trade_date !== expectedTradeDate
     || value.raw_response_persisted !== false || value.secret_exposure !== false) {
     throw new Error('invalid_decision_context');
   }
