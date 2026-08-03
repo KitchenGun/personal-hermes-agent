@@ -19,7 +19,8 @@ function buildPrompt(packet) {
     'Choose only symbols present in candidates and return one raw JSON object with no markdown.',
     'Use exactly slot_id, model_id, prompt_hash, decisions.',
     'Each decision must use symbol, action, target_weight_pct, confidence_bucket, reason_codes.',
-    'Respect the decision_contract exactly. If evidence is weak, use HOLD or REJECT.',
+    'Respect the decision_contract exactly. When minimum_vps_entry_decisions is 1, choose exactly one eligible_entry as ENTER with positive target_weight_pct; KIS risk veto remains final.',
+    'When minimum_vps_entry_decisions is 0 and evidence is weak, use HOLD or REJECT.',
     `INPUT_JSON=${JSON.stringify(packet)}`,
   ].join('\n');
 }
