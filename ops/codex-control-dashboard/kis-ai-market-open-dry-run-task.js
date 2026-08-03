@@ -14,8 +14,8 @@ const MODEL_V3_RESEARCH_APPROVAL = 'APPROVE_KIS_MODEL_V3_30D_RESEARCH_API_VPS_V1
 const LEGACY_DAILY_ENTRY_CAP_5_APPROVAL_HASH = crypto.createHash('sha256')
   .update('APPROVE_KIS_VPS_MOCK_DAILY_ENTRY_CAP_5_V1').digest('hex');
 const INTRADAY_PROVIDER_ID = 'intraday_v1';
-const LEGACY_INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v1';
-const LEGACY_INTRADAY_POLICY_VERSION = 'intraday-fast-track-v1';
+const LEGACY_INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v2-dynamic-universe';
+const LEGACY_INTRADAY_POLICY_VERSION = 'intraday-fast-track-v2-dynamic-universe';
 const LEGACY_INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   decision_provider: INTRADAY_PROVIDER_ID,
   intraday_feature_version: LEGACY_INTRADAY_FEATURE_VERSION,
@@ -24,7 +24,7 @@ const LEGACY_INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   intraday_policy_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_POLICY_VERSION).digest('hex'),
 });
 const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v2-dynamic-universe';
-const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v2-dynamic-universe';
+const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v3-intraday-discovery';
 const INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   decision_provider: INTRADAY_PROVIDER_ID,
   intraday_feature_version: INTRADAY_FEATURE_VERSION,
