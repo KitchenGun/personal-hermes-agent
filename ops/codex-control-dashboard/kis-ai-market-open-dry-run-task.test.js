@@ -244,7 +244,7 @@ function decisionContext(slotId, candidates = ['005930'], minimumVpsEntryDecisio
     status: 'success',
     slot_id: slotId,
     model_id: mod.LLM_MODEL_ID,
-    official_trade_date: '2026-07-21',
+    official_trade_date: slotId.split(':')[1],
     candidates: candidates.map((symbol) => ({
       symbol,
       role: 'eligible_entry',
@@ -2394,6 +2394,37 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(required, [{
     symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
   }]), required));
+});
+
+test('2026-08-04 09:10 stale decision context pauses before LLM and KIS execution', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-08-04:09:10`;
+  const stale = JSON.parse(decisionContext(slotId, ['005930'], 1));
+  stale.official_trade_date = '2026-08-03';
+  let llmCalls = 0;
+  let executionCalls = 0;
+  const value = await active({
+    decisionContextOutput: JSON.stringify(stale),
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    execFile(command, args, options, callback) {
+      executionCalls += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const scheduled = value.task.status();
+  scheduled.tasks[mod.TASKS[4].id].next_run_at = '2026-08-04T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(scheduled));
+  value.setClock('2026-08-04T00:10:00Z');
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-08-04T00:10:00Z') });
+
+  assert.equal(llmCalls, 0);
+  assert.equal(executionCalls, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'invalid_decision_context');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.deepEqual(fs.readdirSync(value.paths.orderAttestationDir), []);
+  assert.equal(fs.existsSync(value.paths.verdictDir), false);
 });
 
 test('AI packet accepts bounded six-digit symbols outside the legacy three-symbol watchlist', () => {
