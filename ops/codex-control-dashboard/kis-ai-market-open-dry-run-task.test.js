@@ -315,6 +315,16 @@ function fixture(options = {}) {
       callback(options.weeklyUniverseError || null, options.weeklyUniverseOutput || weeklyUniverseOutput());
       return;
     }
+    if (args.includes('vps-autonomous-order') && args.includes('refresh-shadow')) {
+      if (typeof options.onIndependentShadowRefresh === 'function') {
+        options.onIndependentShadowRefresh({ command, args, execOptions });
+      }
+      callback(options.independentShadowRefreshError || null, options.independentShadowRefreshOutput || orderGood('success', {
+        action_type: 'shadow_refreshed', previous_artifact_hash: 'a'.repeat(64),
+        artifact_hash: 'a'.repeat(64), shadow_predictions_inserted: 30,
+      }));
+      return;
+    }
     if (args.includes('vps-autonomous-order') && args.includes('scheduled-refresh-shadow')) {
       if (typeof options.onShadowRefresh === 'function') {
         options.onShadowRefresh({ command, args, execOptions });
@@ -418,6 +428,83 @@ test('order command uses VM venv and exposes no per-run approval', () => {
     finalSlot.args,
     ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once'],
   );
+});
+
+test('post-close candidate refresh uses the existing bounded KIS shadow path', () => {
+  const command = mod.buildIndependentShadowRefreshCommand();
+  assert.equal(command.command, mod.KIS_VENV_PYTHON);
+  assert.equal(command.cwd, mod.KIS_REPO);
+  assert.deepEqual(command.args, [
+    '-m', 'kis_trading_lab', 'vps-autonomous-order',
+    '--action', 'refresh-shadow', '--confirm',
+    '--approval', 'APPROVE_KIS_MODEL_V3_30D_RESEARCH_API_VPS_V1',
+  ]);
+});
+
+test('post-close creates Model v3 candidates while the order task stays disabled', async () => {
+  let refreshCalls = 0;
+  const value = await active({
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const lastRun = after.tasks[mod.TASKS[2].id].last_run;
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(lastRun.model_v3_candidate_refresh_status, 'success');
+  assert.equal(lastRun.model_v3_candidate_refresh_action_type, 'shadow_refreshed');
+  assert.equal(lastRun.model_v3_candidate_predictions_inserted, 30);
+  assert.equal(lastRun.model_v3_candidate_refresh_fail_closed, false);
+});
+
+test('post-close does not duplicate candidate refresh when the order task is active', async () => {
+  let refreshCalls = 0;
+  const value = await active({
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(refreshCalls, 0);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_status, undefined);
+});
+
+test('post-close candidate refresh preserves an exact fail-closed blocker', async () => {
+  const messages = [];
+  const value = await active({
+    independentShadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    independentShadowRefreshOutput: orderGood('blocked', {
+      error_class: 'model_v3_prediction_batch_incomplete',
+    }),
+    reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const lastRun = after.tasks[mod.TASKS[2].id].last_run;
+
+  assert.equal(after.state, 'PAUSED');
+  assert.equal(lastRun.model_v3_candidate_refresh_status, 'blocked');
+  assert.equal(lastRun.model_v3_candidate_refresh_fail_closed, true);
+  assert.equal(lastRun.model_v3_candidate_refresh_error_class, 'model_v3_prediction_batch_incomplete');
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].content, /model_v3_prediction_batch_incomplete/);
 });
 
 test('intraday decision and order schedules align on future 10-minute slots', () => {

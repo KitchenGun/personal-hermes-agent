@@ -141,6 +141,9 @@ const DISCORD_ERROR_CLASSES = new Set([
   'model_v3_refresh_failed', 'model_v3_shadow_failed', 'model_v3_shadow_batch_failed',
   'model_v3_backfill_failed', 'model_v3_shadow_execution_failed',
   'model_v3_artifact_load_failed', 'model_v3_artifact_verify_failed',
+  'model_v3_prediction_batch_incomplete',
+  'post_close_shadow_process_error', 'post_close_shadow_timeout',
+  'invalid_independent_shadow_refresh',
   'scheduled_shadow_refresh_slot_invalid',
   'weekly_universe_not_ready', 'intraday_universe_unavailable',
   'intraday_shortlist_unavailable',
@@ -612,6 +615,7 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
     intradayMode: value.intraday_mode,
     intradayModelVersion: value.intraday_model_version,
     shadowPredictionsInserted: value.shadow_predictions_inserted,
+    shadowDuplicatesSkipped: value.shadow_duplicates_skipped,
     orderSymbol: value.order_symbol,
     orderSide: value.order_side,
     requestedQuantity: value.requested_quantity,
@@ -902,6 +906,19 @@ function buildWeeklyUniverseCommand() {
       '--approval', MODEL_V3_RESEARCH_APPROVAL,
       '--action', 'weekly-universe',
       '--db', VPS_DB_PATH,
+    ],
+    cwd: KIS_REPO,
+  };
+}
+
+function buildIndependentShadowRefreshCommand() {
+  return {
+    command: KIS_VENV_PYTHON,
+    args: [
+      '-m', 'kis_trading_lab', 'vps-autonomous-order',
+      '--action', 'refresh-shadow',
+      '--confirm',
+      '--approval', MODEL_V3_RESEARCH_APPROVAL,
     ],
     cwd: KIS_REPO,
   };
@@ -1940,6 +1957,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       let weeklyUniverse = null;
+      let independentShadowRefresh = null;
       if (isWeeklyUniverseRefreshDue(task, dueTime)) {
         const weekly = await execute(buildWeeklyUniverseCommand());
         if (weekly.error && Number(weekly.error.code) !== 2) {
@@ -1970,6 +1988,43 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver);
       } catch (parseError) {
         return pauseForTask(loadStrict(), safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true });
+      }
+      if (task.id === POST_CLOSE_TASK.id && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
+        const refresh = await execute(buildIndependentShadowRefreshCommand());
+        if (refresh.error && Number(refresh.error.code) !== 2) {
+          independentShadowRefresh = {
+            status: 'blocked', actionType: 'paused', predictionsInserted: 0,
+            duplicatesSkipped: 0, failClosed: true,
+            errorClass: refresh.error.killed ? 'post_close_shadow_timeout' : 'post_close_shadow_process_error',
+          };
+        } else {
+          try {
+            const refreshResult = parseKisVpsAutonomousOutput(refresh.stdout, ORDER_TASK.id);
+            if (refreshResult.status !== 'blocked'
+              && (!['shadow_refreshed', 'market_closed_no_op'].includes(refreshResult.actionType)
+              || refreshResult.artifactPromoted
+              || refreshResult.orderApiCalls !== 0
+              || refreshResult.vpsLiveOrders !== 0
+              || refreshResult.reconciliations !== 0)) {
+              throw new Error('invalid_independent_shadow_refresh');
+            }
+            independentShadowRefresh = {
+              status: refreshResult.status,
+              actionType: refreshResult.actionType,
+              predictionsInserted: refreshResult.shadowPredictionsInserted,
+              duplicatesSkipped: refreshResult.shadowDuplicatesSkipped,
+              failClosed: refreshResult.failClosed,
+              errorClass: refreshResult.errorClass,
+              artifactHash: refreshResult.artifactHash,
+            };
+          } catch (refreshParseError) {
+            independentShadowRefresh = {
+              status: 'blocked', actionType: 'paused', predictionsInserted: 0,
+              duplicatesSkipped: 0, failClosed: true,
+              errorClass: safeText(refreshParseError.message, 80),
+            };
+          }
+        }
       }
       const slot = seoulParts(dueTime);
       const horizonExitOrderSlot = task.kind === 'order'
@@ -2053,6 +2108,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           weekly_universe_fail_closed: weeklyUniverse.failClosed,
           weekly_universe_error_class: weeklyUniverse.errorClass,
         });
+      }
+      if (independentShadowRefresh) {
+        Object.assign(lastRun, {
+          model_v3_candidate_refresh_status: independentShadowRefresh.status,
+          model_v3_candidate_refresh_action_type: independentShadowRefresh.actionType,
+          model_v3_candidate_predictions_inserted: independentShadowRefresh.predictionsInserted,
+          model_v3_candidate_duplicates_skipped: independentShadowRefresh.duplicatesSkipped,
+          model_v3_candidate_refresh_fail_closed: independentShadowRefresh.failClosed,
+          model_v3_candidate_refresh_error_class: independentShadowRefresh.errorClass,
+          model_v3_candidate_artifact_hash: independentShadowRefresh.artifactHash || null,
+        });
+        if (independentShadowRefresh.failClosed) {
+          return pauseForTask(
+            latest,
+            independentShadowRefresh.errorClass || 'post_close_shadow_failed',
+            lastRun,
+          );
+        }
       }
       if (task.kind === 'order') {
         Object.assign(lastRun, {
@@ -2288,7 +2361,8 @@ module.exports = {
   parseCutoverOutput, isPostCloseRefreshSlot,
   buildOrderLifecycleMessage, sanitizeErrorClass,
   nextRunAt, isWeeklyUniverseRefreshDue, buildCommand, buildDecisionContextCommand, buildDiagnosticCommand,
-  buildSafetyMonitorCommand, buildWeeklyUniverseCommand, parseWeeklyUniverseOutput,
+  buildSafetyMonitorCommand, buildWeeklyUniverseCommand, buildIndependentShadowRefreshCommand,
+  parseWeeklyUniverseOutput,
   defaultSourceParityCheck, acquireExclusiveLock, acquireSchedulerOwnershipLock,
   createKisAiMarketOpenDryRunTask,
 };
