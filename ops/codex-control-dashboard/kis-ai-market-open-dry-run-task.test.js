@@ -983,6 +983,35 @@ test('activation check success cannot clear an existing refresh-only marker', as
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
 });
 
+test('global recovery preserves a disabled failed refresh for the next post-close slot', async () => {
+  const value = await active({
+    activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
+    activationCheckOutput: orderGood('blocked', {
+      error_class: 'model_v3_prediction_batch_incomplete',
+    }),
+  });
+  const recovered = value.task.status();
+  recovered.tasks[mod.TASKS[4].id].state = 'DISABLED';
+  recovered.tasks[mod.TASKS[4].id].pause_reason = undefined;
+  recovered.tasks[mod.TASKS[4].id].next_run_at = null;
+  recovered.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
+  recovered.tasks[mod.TASKS[4].id].refresh_only_pending = false;
+  recovered.tasks[mod.TASKS[4].id].last_run = {
+    status: 'blocked', error_class: 'model_v3_shadow_execution_failed', fail_closed: true,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(recovered));
+  value.setClock('2026-07-21T07:50:00Z');
+
+  const state = await value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_waiting_post_close');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
+});
+
 test('provider cutover is blocked while a refresh-only gate is pending', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
@@ -1723,6 +1752,12 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'TimeoutError',
     failure_errno: 110, failure_attempt_number: 1,
   }), mod.TASKS[1].id, trading));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'no_candidates_no_op', api_calls: 0, order_api_calls: 0,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'no_op', {
+    action_type: 'no_candidates_no_op', api_calls: 0, order_api_calls: 0,
+  }), mod.TASKS[0].id, trading), /task_result/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'transport_degraded_no_op', error_class: 'tls_failed', transport_degraded: true,
     failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'SSLError',
@@ -1740,6 +1775,9 @@ test('error class sanitizer allows codes and blocks secret-like or raw detail', 
     'model_v3_shadow_execution_failed',
     'model_v3_artifact_load_failed',
     'model_v3_artifact_verify_failed',
+    'weekly_universe_not_ready',
+    'intraday_universe_unavailable',
+    'intraday_shortlist_unavailable',
   ]) {
     assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
   }
@@ -1947,6 +1985,21 @@ test('exact recovery resumes a repaired intraday output contract only after all 
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.resume_reason, 'io_fix_verified');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('exact recovery resumes after the missing weekly universe is repaired', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'intraday_universe_unavailable';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 

@@ -85,7 +85,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields',
-  'account_risk_evidence_missing', 'safety_monitor_failed',
+  'account_risk_evidence_missing', 'safety_monitor_failed', 'intraday_universe_unavailable',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
@@ -142,6 +142,8 @@ const DISCORD_ERROR_CLASSES = new Set([
   'model_v3_backfill_failed', 'model_v3_shadow_execution_failed',
   'model_v3_artifact_load_failed', 'model_v3_artifact_verify_failed',
   'scheduled_shadow_refresh_slot_invalid',
+  'weekly_universe_not_ready', 'intraday_universe_unavailable',
+  'intraday_shortlist_unavailable',
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
   'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
 ]);
@@ -363,6 +365,14 @@ function validateTaskMeaning(value) {
     if (![TASKS[0].id, TASKS[1].id].includes(value.task_id) || value.status !== 'no_op'
       || value.transport_degraded !== true || value.fail_closed !== false
       || !TRANSIENT_TRANSPORT_ERRORS.has(value.error_class)) throw new Error('invalid_task_result_contract');
+    return;
+  }
+  if (value.action_type === 'no_candidates_no_op') {
+    if (value.task_id !== TASKS[1].id || value.status !== 'no_op'
+      || value.api_calls !== 0 || value.order_api_calls !== 0
+      || value.fail_closed !== false || value.error_class !== 'none') {
+      throw new Error('invalid_task_result_contract');
+    }
     return;
   }
   const expected = {
@@ -1663,8 +1673,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const activationReady = parsed.status === 'success'
         && parsed.failClosed === false
         && parsed.actionType === 'activation_check';
-      const waitingForPostCloseRefresh = prior.state === 'PAUSED'
-        && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.pause_reason)
+      const disabledAfterRefreshFailure = prior.state === 'DISABLED'
+        && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.last_run?.error_class);
+      const waitingForPostCloseRefresh = (
+        (prior.state === 'PAUSED' && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.pause_reason))
+        || (prior.state === 'DISABLED' && prior.refresh_only_pending === true)
+        || disabledAfterRefreshFailure
+      )
         && parsed.status === 'blocked'
         && parsed.failClosed === true
         && parsed.errorClass === 'model_v3_prediction_batch_incomplete'
