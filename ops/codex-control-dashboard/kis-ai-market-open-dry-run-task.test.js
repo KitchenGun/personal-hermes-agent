@@ -415,7 +415,7 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_INTRADAY_PROVIDER_ID, 'intraday_v1');
   assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v2-dynamic-universe');
   assert.equal(command.env.KIS_INTRADAY_FEATURE_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash);
-  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v2-dynamic-universe');
+  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v3-intraday-discovery');
   assert.equal(command.env.KIS_INTRADAY_POLICY_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash);
   assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, '3');
   assert.equal(command.args.includes('--approval'), false);
@@ -879,13 +879,13 @@ test('exact provider cutover migrates the existing active order task without cre
   assert.equal(state.os_cron_used, false);
 });
 
-test('exact v1 provider attestation remains readable for atomic v2 synchronization', async () => {
+test('exact v2 provider attestation remains readable for atomic v3 synchronization', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const legacy = value.task.status();
   const order = legacy.tasks[mod.TASKS[4].id];
-  const legacyFeatureVersion = 'intraday-quote-10m-v1';
-  const legacyPolicyVersion = 'intraday-fast-track-v1';
+  const legacyFeatureVersion = 'intraday-quote-10m-v2-dynamic-universe';
+  const legacyPolicyVersion = 'intraday-fast-track-v2-dynamic-universe';
   Object.assign(order, {
     decision_provider: 'intraday_v1',
     intraday_feature_version: legacyFeatureVersion,
@@ -911,20 +911,20 @@ test('exact v1 provider attestation remains readable for atomic v2 synchronizati
   );
   assert.equal(
     state.tasks[mod.TASKS[4].id].intraday_policy_version,
-    'intraday-fast-track-v2-dynamic-universe',
+    'intraday-fast-track-v3-intraday-discovery',
   );
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(Object.keys(state.tasks).length, 5);
   assert.equal(state.os_cron_used, false);
 });
 
-test('mixed v1 provider attestation remains fail closed', async () => {
+test('mixed v2 provider attestation remains fail closed', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const state = value.task.status();
   const order = state.tasks[mod.TASKS[4].id];
-  order.intraday_feature_version = 'intraday-quote-10m-v1';
-  order.intraday_policy_version = 'intraday-fast-track-v1';
+  order.intraday_feature_version = 'intraday-quote-10m-v2-dynamic-universe';
+  order.intraday_policy_version = 'intraday-fast-track-v2-dynamic-universe';
   order.intraday_feature_hash = '0'.repeat(64);
   order.intraday_policy_hash = crypto.createHash('sha256')
     .update(order.intraday_policy_version).digest('hex');
