@@ -485,7 +485,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     const expectedFeatureHash = INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash;
     const expectedPolicyHash = INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
     const hybridMode = value.intraday_mode === 'hybrid_bootstrap'
-      && value.intraday_model_version === 'intraday_hybrid_v1';
+      && value.intraday_model_version === 'intraday_hybrid_v2';
     const championMode = value.intraday_mode === 'ml_champion'
       && /^intraday_ml_(?:logistic|hist_gradient)_[a-f0-9]{12}$/.test(String(value.intraday_model_version || ''));
     if (!Number.isSafeInteger(value.intraday_decisions)
@@ -556,7 +556,7 @@ function parseKisVpsAutonomousOutput(stdout, expectedTaskId = ORDER_TASK.id) {
   if (!hasIntradayProviderAttestation(value)) throw new Error('intraday_provider_attestation_mismatch');
   if (!(value.intraday_mode === null || ['hybrid_bootstrap', 'ml_champion'].includes(value.intraday_mode))
     || !(value.intraday_model_version === null
-      || /^intraday_(?:hybrid_v1|ml_[a-z0-9_]+)$/.test(value.intraday_model_version))) {
+      || /^intraday_(?:hybrid_v2|ml_[a-z0-9_]+)$/.test(value.intraday_model_version))) {
     throw new Error('intraday_model_contract_invalid');
   }
   const artifactHash = value.artifact_hash;
