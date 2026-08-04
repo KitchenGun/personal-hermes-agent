@@ -1500,6 +1500,7 @@ test('order invocation uses one-time hashed scheduler attestation and clears pen
         token_hash: attestation.token_hash,
         expires_at: attestation.expires_at,
         ...mod.INTRADAY_PROVIDER_ATTESTATION,
+        daily_entry_cap_approval_hash: null,
       });
       callback(null, orderGood());
     } else callback(null, good(args[args.indexOf('--task-id') + 1]));
@@ -1587,7 +1588,7 @@ test.skip('legacy order-task post-close promotion guard is retired', async () =>
   assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
 });
 
-test.skip('legacy daily cap five approval is retired', async () => {
+test('exact daily cap five approval stores only its hash', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   assert.throws(
@@ -1624,7 +1625,7 @@ test('order output count above the fixed daily cap fails closed', async () => {
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'unsafe_order_count');
 });
 
-test.skip('legacy daily cap five attestation is retired', async () => {
+test('daily cap five attestation reaches the KIS invocation', async () => {
   let value;
   value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
