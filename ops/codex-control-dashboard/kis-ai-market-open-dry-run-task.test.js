@@ -2087,7 +2087,7 @@ test('exact IO resume accepts a persisted safety monitor failure only after diag
 });
 
 test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
-  for (const pauseReason of ['invalid_output_fields', 'unsafe_output', 'invalid_safety_output']) {
+  for (const pauseReason of ['invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract']) {
     const value = await active();
     const paused = value.task.status();
     paused.state = 'PAUSED'; paused.pause_reason = pauseReason;
