@@ -1954,15 +1954,15 @@ test('invalid output, blocked result, and timeout pause all tasks without retry'
   }
 });
 
-test('one transient transport no-op stays active, success resets, and consecutive two pauses', async () => {
+test('one transient database busy no-op stays active, success resets, and consecutive two pauses', async () => {
   let mode = 'degraded';
   const value = await active({ execFile(c, a, o, cb) {
     const taskId = a[a.indexOf('--task-id') + 1];
     if (mode === 'success') cb(null, good(taskId));
     else cb(null, good(taskId, 'no_op', {
-      action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
-      failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'TimeoutError',
-      failure_errno: 110, failure_attempt_number: 1,
+      action_type: 'transport_degraded_no_op', error_class: 'database_busy', transport_degraded: true,
+      failure_phase: 'database_begin', failure_symbol: null, failure_exception_type: 'OperationalError',
+      failure_errno: null, failure_attempt_number: 1,
     }));
   } });
   value.setClock('2026-07-21T00:10:00Z');

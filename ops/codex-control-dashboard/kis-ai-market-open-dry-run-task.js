@@ -78,7 +78,7 @@ const KRX_SYMBOL_RE = /^\d{6}$/;
 const LEGACY_WATCHLIST_SYMBOLS = Object.freeze(['005930', '000660', '005380']);
 const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'dns_failed', 'connection_failed', 'connection_reset', 'timeout',
-  'http_transport_failed', 'response_read_failed',
+  'http_transport_failed', 'response_read_failed', 'database_busy',
 ]);
 const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
@@ -152,7 +152,7 @@ const DISCORD_ERROR_CLASSES = new Set([
 ]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
-  'database_open', 'database_commit', 'client_initialize', 'auth_token_request',
+  'database_open', 'database_begin', 'database_commit', 'client_initialize', 'auth_token_request',
   'account_balance_request', 'open_orders_read_request', 'quote_request',
   'quote_response_read', 'quote_parse', 'quote_persist', 'hermes_state_write',
 ]);
@@ -454,6 +454,9 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
         && value.failure_symbol === null
         && ['auth_token_request', 'account_balance_request', 'open_orders_read_request'].includes(value.failure_phase))
       || (value.task_id === TASKS[1].id && value.failure_symbol !== null)
+      || (value.error_class === 'database_busy'
+        && value.failure_phase === 'database_begin'
+        && value.failure_symbol === null)
     )
   );
   if (value.fail_closed !== blocked
