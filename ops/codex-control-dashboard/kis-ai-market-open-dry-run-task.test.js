@@ -2071,18 +2071,20 @@ test('exact IO resume accepts a persisted safety monitor failure only after diag
 });
 
 test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
-  const value = await active();
-  const paused = value.task.status();
-  paused.state = 'PAUSED'; paused.pause_reason = 'invalid_output_fields';
-  for (const item of Object.values(paused.tasks)) {
-    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  for (const pauseReason of ['invalid_output_fields', 'unsafe_output']) {
+    const value = await active();
+    const paused = value.task.status();
+    paused.state = 'PAUSED'; paused.pause_reason = pauseReason;
+    for (const item of Object.values(paused.tasks)) {
+      item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+    }
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+    const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+    assert.equal(state.state, 'ACTIVE');
+    assert.equal(state.resume_reason, 'io_fix_verified');
+    assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
   }
-  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
-  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
-  assert.equal(state.state, 'ACTIVE');
-  assert.equal(state.resume_reason, 'io_fix_verified');
-  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
 test('exact recovery resumes after the missing weekly universe is repaired', async () => {
