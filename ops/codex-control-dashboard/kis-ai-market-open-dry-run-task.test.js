@@ -26,7 +26,7 @@ function good(taskId, status = 'success', extra = {}) {
     ? {
         intraday_decisions: 3,
         intraday_mode: 'hybrid_bootstrap',
-        intraday_model_version: 'intraday_hybrid_v1',
+        intraday_model_version: 'intraday_hybrid_v2',
         intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
         intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
         intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
@@ -786,6 +786,12 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     action_type: 'ai_position_held', open_positions: 1,
   })));
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v2',
+  })));
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v1',
+  })), /intraday_model_contract_invalid/);
   for (const actionType of [
     'ai_exit_reconciled',
     'risk_stop_exit_reconciled',
