@@ -125,7 +125,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'invalid_safety_output', 'scheduler_state_fault', 'state_unavailable',
   'runtime_io_failed', 'writer_lock_active', 'legacy_run_lock_active',
   'scheduler_lock_active', 'stale_scheduler_lock', 'report_sender_missing',
-  'report_delivery_failed', 'model_v3_promotion_outside_post_close_slot',
+  'report_delivery_failed', 'invalid_report_message', 'model_v3_promotion_outside_post_close_slot',
   'order_action_not_allowed_for_schedule_slot', 'daily_entry_cap_attestation_mismatch',
   'model_v3_artifact_attestation_mismatch', 'pending_order_reconciliation',
   'balance_mismatch', 'order_not_fully_filled', 'order_submission_unknown',
