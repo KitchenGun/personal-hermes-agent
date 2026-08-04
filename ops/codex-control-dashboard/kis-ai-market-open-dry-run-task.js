@@ -84,7 +84,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
-  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output',
+  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output',
   'account_risk_evidence_missing', 'safety_monitor_failed', 'intraday_universe_unavailable',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
@@ -2004,7 +2004,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           ? parseKisVpsAutonomousOutput(stdout, taskId)
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver);
       } catch (parseError) {
-        return pauseForTask(loadStrict(), safeText(parseError.message, 80), { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: 'invalid_safety_output', fail_closed: true });
+        const errorClass = safeText(parseError.message, 80);
+        return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
       }
       if (task.id === POST_CLOSE_TASK.id && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
         const refresh = await execute(buildIndependentShadowRefreshCommand());

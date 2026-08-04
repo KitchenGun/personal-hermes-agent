@@ -1963,6 +1963,19 @@ test('invalid output, blocked result, and timeout pause all tasks without retry'
   }
 });
 
+test('task parser failures preserve the exact sanitized error class', async () => {
+  const value = await active({ execFile(c, a, o, cb) {
+    cb(null, good(a[a.indexOf('--task-id') + 1], 'success', { quote_api_calls: 11 }));
+  } });
+  const due = new Date('2026-07-21T00:10:00Z');
+  value.setClock(due);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: due });
+
+  assert.equal(state.pause_reason, 'unsafe_output');
+  assert.equal(state.tasks[mod.TASKS[1].id].last_run.error_class, 'unsafe_output');
+});
+
 test('one transient database busy no-op stays active, success resets, and consecutive two pauses', async () => {
   let mode = 'degraded';
   const value = await active({ execFile(c, a, o, cb) {
@@ -2071,7 +2084,7 @@ test('exact IO resume accepts a persisted safety monitor failure only after diag
 });
 
 test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
-  for (const pauseReason of ['invalid_output_fields', 'unsafe_output']) {
+  for (const pauseReason of ['invalid_output_fields', 'unsafe_output', 'invalid_safety_output']) {
     const value = await active();
     const paused = value.task.status();
     paused.state = 'PAUSED'; paused.pause_reason = pauseReason;
