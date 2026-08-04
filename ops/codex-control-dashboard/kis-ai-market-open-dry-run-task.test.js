@@ -264,7 +264,7 @@ function decisionContext(slotId, candidates = ['005930'], minimumVpsEntryDecisio
       open_positions: 0,
       open_orders: 0,
       daily_entry_submit_count: 0,
-      active_daily_entry_cap: 3,
+      active_daily_entry_cap: null,
       max_positions: 3,
       minimum_vps_entry_decisions: minimumVpsEntryDecisions,
       max_symbol_equity_pct: 50,
@@ -821,11 +821,7 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   }));
   assert.equal(promoted.artifactPromoted, true);
   assert.equal(promoted.previousArtifactHash, 'a'.repeat(64));
-  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 3 })));
-  assert.throws(
-    () => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 4 })),
-    /unsafe_order_count/,
-  );
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', { daily_entry_count: 37 })));
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_feature_hash: '0'.repeat(64),
   })), /intraday_provider_attestation_mismatch/);
@@ -1418,7 +1414,7 @@ test('blocked autonomous order pauses only the order task and leaves dry-run tas
   assert.equal(sent[0].targetChannelId, mod.REPORT_TARGET_CHANNEL_ID);
   assert.equal(sent[0].deliveryLayer, 'hermes_ai_market_open_error');
   assert.match(sent[0].content, /^\[KIS 자동운영 보호 중단\]/);
-  assert.match(sent[0].content, /작업: Model v3 VPS 모의투자/);
+  assert.match(sent[0].content, /작업: AI 자동매매/);
   assert.match(sent[0].content, /원인: safe_block/);
   assert.match(sent[0].content, /자동 재시도: 없음/);
   assert.match(sent[0].content, /신규 주문: 중단/);
@@ -1610,7 +1606,7 @@ test('exact daily cap five approval stores only its hash', async () => {
   assert.equal(JSON.stringify(state).includes(mod.DAILY_ENTRY_CAP_5_APPROVAL), false);
 });
 
-test('order output count above the fixed daily cap fails closed', async () => {
+test('order output count is aggregate evidence and does not impose a daily cap', async () => {
   const value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) callback(null, orderGood('no_op', { daily_entry_count: 4 }));
     else callback(null, good(args[args.indexOf('--task-id') + 1]));
@@ -1621,8 +1617,8 @@ test('order output count above the fixed daily cap fails closed', async () => {
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
 
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'unsafe_order_count');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 4);
 });
 
 test('daily cap five attestation reaches the KIS invocation', async () => {
@@ -2466,23 +2462,16 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005380', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
   }]), packet), /invalid_ai_verdict/);
-
-  const required = mod.buildSanitizedAiPacket({
-    slotId,
-    context: mod.parseDecisionContextOutput(decisionContext(slotId, ['005930'], 1), slotId),
-  });
-  assert.throws(() => mod.parseAiVerdict(aiVerdict(required), required), /invalid_ai_verdict/);
-  assert.throws(() => mod.parseAiVerdict(aiVerdict(required, [{
-    symbol: '005930', action: 'ENTER', target_weight_pct: 0, confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
-  }]), required), /invalid_ai_verdict/);
-  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(required, [{
-    symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
-  }]), required));
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet), packet));
+  assert.throws(
+    () => mod.parseDecisionContextOutput(decisionContext(slotId, ['005930'], 1), slotId),
+    /invalid_decision_context/,
+  );
 });
 
 test('2026-08-04 09:10 stale decision context pauses before LLM and KIS execution', async () => {
   const slotId = `${mod.TASKS[4].id}:2026-08-04:09:10`;
-  const stale = JSON.parse(decisionContext(slotId, ['005930'], 1));
+  const stale = JSON.parse(decisionContext(slotId, ['005930']));
   stale.official_trade_date = '2026-08-03';
   let llmCalls = 0;
   let executionCalls = 0;
