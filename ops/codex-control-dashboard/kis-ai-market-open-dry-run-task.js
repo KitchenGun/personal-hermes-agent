@@ -98,6 +98,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'order_submission_unknown',
   'invalid_order_output_contract',
   'intraday_prediction_contract_mismatch',
+  'symbol_not_allowed',
   'model_v3_artifact_attestation_mismatch',
   'model_v3_shadow_batch_failed',
   'model_v3_backfill_failed',
