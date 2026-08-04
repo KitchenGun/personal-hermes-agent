@@ -187,7 +187,7 @@ const TASK_ALERT_LABELS = new Map([
   ['kis-ai-intraday-shadow-validation-v1', '장중 AI 검증'],
   ['kis-ai-post-close-learning-v1', '장 마감 후 학습'],
   ['kis-ai-daily-learning-report-v1', '일일 결과 보고'],
-  ['kis-vps-model-v3-autonomous-pilot-v1', 'Model v3 VPS 모의투자'],
+  ['kis-vps-model-v3-autonomous-pilot-v1', 'AI 자동매매'],
 ]);
 const DRY_RUN_TASKS = Object.freeze(TASKS.filter((task) => task.kind === 'dry_run'));
 const ORDER_TASK = TASKS.find((task) => task.kind === 'order');
@@ -524,7 +524,6 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
 function parseKisVpsAutonomousOutput(
   stdout,
   expectedTaskId = ORDER_TASK.id,
-  maxDailyEntryCount = INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap,
 ) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_order_output');
@@ -549,8 +548,7 @@ function parseKisVpsAutonomousOutput(
   ];
   if (counts.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)
     || value.order_api_calls > 1 || value.vps_live_orders > 1 || value.prod_orders !== 0
-    || value.reconciliations > 1 || value.open_positions > 1
-    || ![3, 5].includes(maxDailyEntryCount) || value.daily_entry_count > maxDailyEntryCount) {
+    || value.reconciliations > 1 || value.open_positions > 1) {
     throw new Error('unsafe_order_count');
   }
   const booleans = [
@@ -760,15 +758,6 @@ function parseAiVerdict(value, packet) {
     }
     symbols.add(decision.symbol);
   }
-  if (packet.decision_contract.minimum_vps_entry_decisions === 1) {
-    const eligibleEntries = new Set(
-      packet.candidates.filter((item) => item.role === 'eligible_entry').map((item) => item.symbol),
-    );
-    const entries = value.decisions.filter((item) => item.action === 'ENTER');
-    if (entries.length !== 1 || !eligibleEntries.has(entries[0].symbol) || entries[0].target_weight_pct <= 0) {
-      throw new Error('invalid_ai_verdict');
-    }
-  }
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(serialized)) {
     throw new Error('unsafe_ai_verdict');
@@ -828,10 +817,11 @@ function parseDecisionContextOutput(stdout, expectedSlotId) {
     || !Number.isFinite(value.account_aggregate.available_cash) || value.account_aggregate.available_cash < 0
     || !Number.isFinite(value.account_aggregate.account_equity) || value.account_aggregate.account_equity <= 0
     || !value.risk_aggregate || Object.keys(value.risk_aggregate).length !== 9
-    || ['open_positions', 'open_orders', 'daily_entry_submit_count', 'active_daily_entry_cap', 'max_positions',
+    || value.risk_aggregate.active_daily_entry_cap !== null
+    || ['open_positions', 'open_orders', 'daily_entry_submit_count', 'max_positions',
       'minimum_vps_entry_decisions']
       .some((key) => !Number.isSafeInteger(value.risk_aggregate[key]) || value.risk_aggregate[key] < 0)
-    || ![0, 1].includes(value.risk_aggregate.minimum_vps_entry_decisions)
+    || value.risk_aggregate.minimum_vps_entry_decisions !== 0
     || ['max_symbol_equity_pct', 'planned_position_loss_pct', 'daily_loss_limit_pct']
       .some((key) => !Number.isFinite(value.risk_aggregate[key]) || value.risk_aggregate[key] <= 0)
     || !Array.isArray(value.event_metadata) || value.event_metadata.length > 20
@@ -2053,7 +2043,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let parsed;
       try {
         parsed = task.kind === 'order'
-          ? parseKisVpsAutonomousOutput(stdout, taskId, taskState.daily_entry_cap)
+          ? parseKisVpsAutonomousOutput(stdout, taskId)
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver);
       } catch (parseError) {
         const errorClass = safeText(parseError.message, 80);
@@ -2141,12 +2131,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
-      if (task.kind === 'order' && parsed.dailyEntryCount > latestTask.daily_entry_cap) {
-        return pauseForTask(latest, 'daily_entry_cap_attestation_mismatch', {
-          invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
-          error_class: 'daily_entry_cap_attestation_mismatch', fail_closed: true,
-        });
-      }
       const blockedBeforeArtifactLoad = task.kind === 'order'
         && parsed.status === 'blocked' && parsed.artifactHash === null
         && parsed.previousArtifactHash === null && parsed.artifactPromoted === false;
