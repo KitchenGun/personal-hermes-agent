@@ -100,6 +100,7 @@ const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'intraday_prediction_contract_mismatch',
   'symbol_not_allowed',
   'unmanaged_position_present',
+  'preflight_or_reconciliation_invalid',
   'risk_guard_blocked',
   'model_v3_artifact_attestation_mismatch',
   'model_v3_shadow_batch_failed',
