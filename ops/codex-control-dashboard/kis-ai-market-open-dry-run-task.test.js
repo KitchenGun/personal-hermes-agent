@@ -1904,6 +1904,7 @@ test('strict command and output contract reject drift and unsafe fields', () => 
 test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
   assert.equal(mod.sanitizeErrorClass('daily_entry_cap_attestation_mismatch'), 'daily_entry_cap_attestation_mismatch');
   for (const errorClass of [
+    'invalid_report_message',
     'model_v3_refresh_failed',
     'model_v3_shadow_failed',
     'model_v3_shadow_batch_failed',
