@@ -439,10 +439,11 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     || !(value.failure_errno === null || Number.isSafeInteger(value.failure_errno))
     || !Number.isSafeInteger(value.failure_attempt_number) || value.failure_attempt_number < 0
     || value.failure_attempt_number > 3) throw new Error('invalid_failure_evidence');
+  const quoteApiCallLimit = value.task_id === TASKS[1].id ? 10 : 3;
   if (value.order_api_calls !== 0 || value.vps_live_orders !== 0 || value.prod_orders !== 0
     || value.champion_changed !== false || value.raw_response_persisted !== false
     || value.secret_exposure !== false || value.retry !== false || value.catch_up !== false
-    || value.backfill !== false || value.quote_api_calls > 3) throw new Error('unsafe_output');
+    || value.backfill !== false || value.quote_api_calls > quoteApiCallLimit) throw new Error('unsafe_output');
   const blocked = value.status === 'blocked';
   const degraded = value.action_type === 'transport_degraded_no_op';
   const degradedFailureEvidenceValid = !degraded || (

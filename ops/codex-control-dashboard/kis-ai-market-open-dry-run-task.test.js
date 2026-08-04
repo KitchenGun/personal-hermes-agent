@@ -1805,6 +1805,15 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   const trading = () => calendarProof(true);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    quote_api_calls: 10,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    quote_api_calls: 11,
+  }), mod.TASKS[1].id, trading), /unsafe/);
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'success', {
+    quote_api_calls: 4,
+  }), mod.TASKS[0].id, trading), /unsafe/);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
   }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
