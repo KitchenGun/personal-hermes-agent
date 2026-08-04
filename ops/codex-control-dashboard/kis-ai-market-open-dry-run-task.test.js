@@ -1749,6 +1749,30 @@ test('server polling survives DISABLED state and adopts later CLI activation', a
   assert.equal(value.task.status().state, 'ACTIVE');
 });
 
+
+test('fail-closed pause keeps status polling alive for explicit recovery', async () => {
+  const callbacks = [];
+  let cleared = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    serverRegistered: true,
+    setTimer(fn) { callbacks.push(fn); return { unref() {} }; },
+    clearTimer() { cleared += 1; },
+    execFile(_command, _args, _options, callback) { callback(new Error('failed'), ''); },
+  });
+  value.task.start();
+
+  const state = await value.task.runOnce({
+    taskId: mod.TASKS[0].id,
+    dueAt: new Date('2026-07-21T00:00:00Z'),
+  });
+
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(cleared, 0);
+  assert.equal(callbacks.length, 1);
+});
+
+
 test('scheduler ownership lock permits exactly one live scheduler process', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-scheduler-owner-'));
   const lockPath = path.join(root, 'owner.lock');
