@@ -2139,8 +2139,8 @@ test('exact IO resume accepts a persisted safety monitor failure only after diag
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
-test('exact recovery resumes a repaired intraday output contract only after all checks pass', async () => {
-  for (const pauseReason of ['invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract']) {
+test('exact recovery resumes a repaired output contract only after all checks pass', async () => {
+  for (const pauseReason of ['invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message']) {
     const value = await active();
     const paused = value.task.status();
     paused.state = 'PAUSED'; paused.pause_reason = pauseReason;
@@ -2416,6 +2416,9 @@ test('daily report accepts bounded no-ledger and estimated-pnl variants', async 
       .replace('매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주', '없음')
       .replace('삼성전자(005930) 2주', '없음')
       .replace('+1,000원 (현금 증감 기준)', '추정 -500원 (체결가 기준, 비용 제외)'),
+    report
+      .replace('매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주', '매수 123456 2주; 매도 654321 1주')
+      .replace('삼성전자(005930) 2주', '123456 2주'),
   ];
   for (const variant of variants) {
     const sent = [];

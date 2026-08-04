@@ -85,7 +85,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
-  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract',
+  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
   'account_risk_evidence_missing', 'safety_monitor_failed', 'intraday_universe_unavailable', 'reconciliation_status_active',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
@@ -230,7 +230,7 @@ const BOOLEAN_KEYS = new Set([
 ]);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret)/i;
 const OFFICIAL_SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
-const VPS_SYMBOL_LABEL = '(?:삼성전자\\(005930\\)|SK하이닉스\\(000660\\)|현대차\\(005380\\))';
+const VPS_SYMBOL_LABEL = '(?:삼성전자\\(005930\\)|SK하이닉스\\(000660\\)|현대차\\(005380\\)|\\d{6})';
 const VPS_FILL_ITEM_RE = new RegExp(`^(?:매수|매도) ${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
 const VPS_HOLDING_ITEM_RE = new RegExp(`^${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
 const VPS_REALIZED_PNL_RE = /^(?:0원 \(매도 체결 없음\)|계산 불가 \(체결 근거 부족\)|(?:추정 )?[+-]\d{1,3}(?:,\d{3})*원 \((?:현금 증감 기준|체결가 기준, 비용 제외)\))$/;
