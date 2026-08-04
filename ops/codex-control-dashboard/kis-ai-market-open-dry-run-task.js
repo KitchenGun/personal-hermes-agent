@@ -1444,7 +1444,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (resumeBlockingLockPaths.some((lockPath) => fs.existsSync(lockPath))) throw new Error('writer_lock_active');
   }
   function pauseAll(current, taskId, reason, lastRun) {
-    if (timer) clearTimer(timer); timer = null;
     const tasks = Object.fromEntries(TASKS.map((task) => {
       const item = current.tasks[task.id];
       return [task.id, { ...item, state: 'PAUSED', pause_reason: task.id === taskId ? reason : 'peer_task_fail_closed', next_run_at: null, last_run: task.id === taskId ? lastRun : item.last_run }];
