@@ -1246,6 +1246,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'invalid_order_output_contract',
     'intraday_prediction_contract_mismatch',
     'symbol_not_allowed',
+    'risk_guard_blocked',
     'model_v3_artifact_attestation_mismatch',
     'model_v3_shadow_batch_failed',
     'model_v3_backfill_failed',
