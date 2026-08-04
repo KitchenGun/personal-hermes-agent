@@ -50,7 +50,7 @@ function good(taskId, status = 'success', extra = {}) {
     official_calendar_source_hash: blocked ? null : CALENDAR_HASH,
     api_calls: 0,
     quote_api_calls: 0,
-    decisions: 0,
+    decisions: Object.keys(intraday).length ? 3 : 0,
     simulated_orders: 0,
     simulated_positions: 0,
     experience_rows: 0,
@@ -1805,8 +1805,11 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   const trading = () => calendarProof(true);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
-    quote_api_calls: 10,
+    quote_api_calls: 10, decisions: 10, intraday_decisions: 10,
   }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    decisions: 10, intraday_decisions: 3,
+  }), mod.TASKS[1].id, trading), /intraday_output_contract/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     quote_api_calls: 11,
   }), mod.TASKS[1].id, trading), /unsafe/);

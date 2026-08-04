@@ -488,7 +488,10 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
       && value.intraday_model_version === 'intraday_hybrid_v1';
     const championMode = value.intraday_mode === 'ml_champion'
       && /^intraday_ml_(?:logistic|hist_gradient)_[a-f0-9]{12}$/.test(String(value.intraday_model_version || ''));
-    if (value.intraday_decisions !== LEGACY_WATCHLIST_SYMBOLS.length
+    if (!Number.isSafeInteger(value.intraday_decisions)
+      || value.intraday_decisions < 1
+      || value.intraday_decisions > MAX_AI_CANDIDATES
+      || value.intraday_decisions !== value.decisions
       || (!hybridMode && !championMode)
       || value.intraday_feature_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
       || value.intraday_policy_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
