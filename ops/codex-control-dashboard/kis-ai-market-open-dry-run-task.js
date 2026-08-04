@@ -84,7 +84,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
-  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields',
+  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output',
   'account_risk_evidence_missing', 'safety_monitor_failed', 'intraday_universe_unavailable',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
