@@ -1238,6 +1238,8 @@ test.skip('post-close activation waiting artifact guard remains retired', async 
 
 test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
   for (const pauseReason of [
+    'decision_context_failed',
+    'http_transport_failed',
     'balance_mismatch',
     'order_not_fully_filled',
     'order_submission_unknown',
