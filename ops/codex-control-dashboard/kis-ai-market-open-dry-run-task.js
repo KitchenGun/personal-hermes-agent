@@ -94,6 +94,8 @@ const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
   'account_risk_evidence_missing',
 ]);
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
+  'decision_context_failed',
+  ...TRANSIENT_TRANSPORT_ERRORS,
   'balance_mismatch',
   'order_not_fully_filled',
   'order_submission_unknown',
