@@ -134,7 +134,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'position_notional_limit_exceeded', ...TRANSIENT_TRANSPORT_ERRORS,
   'llm_verdict_contract_unavailable', 'llm_response_timeout', 'invalid_ai_verdict',
   'unsafe_ai_verdict', 'late_ai_verdict', 'invalid_ai_candidates',
-  'decision_context_process_error', 'invalid_decision_context',
+  'decision_context_process_error', 'decision_context_failed', 'invalid_decision_context',
   'decision_context_window_closed', 'intraday_provider_required',
   'llm_position_decision_missing', 'llm_entry_not_eligible',
   'entry_after_cutoff_blocked',
@@ -1924,6 +1924,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         return stateUnavailableStatus();
       }
     };
+    const handleTransientFailure = async (state, reason, lastRun) => {
+      const latestTask = state.tasks[taskId];
+      const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
+      lastRun.consecutive_transport_failures = consecutive;
+      if (consecutive >= 2) return pauseForTask(state, reason, lastRun);
+      return save({ ...state, tasks: { ...state.tasks, [taskId]: {
+        ...latestTask,
+        state: 'ACTIVE',
+        pause_reason: undefined,
+        consecutive_transport_failures: consecutive,
+        last_run: lastRun,
+        ...(task.kind === 'order' ? { pending_invocation: null } : {}),
+      } } });
+    };
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
     if (!isDue(task, dueTime) || !sameMinute(taskState.next_run_at, dueTime)) {
@@ -2009,10 +2023,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           atomicWrite(attestationPath, pendingInvocation);
         }
         catch (error) {
-          return pauseForTask(loadStrict(), safeText(error.message, 80), {
+          const reason = safeText(error.message, 80);
+          const lastRun = {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
-            error_class: safeText(error.message, 80), fail_closed: true,
-          });
+            status: 'no_op', action_type: 'transport_degraded_no_op',
+            error_class: reason, fail_closed: true, retry: false,
+          };
+          if (TRANSIENT_TRANSPORT_ERRORS.has(reason)) {
+            return handleTransientFailure(loadStrict(), reason, lastRun);
+          }
+          return pauseForTask(loadStrict(), reason, lastRun);
         }
       }
       let weeklyUniverse = null;
@@ -2228,10 +2248,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         } } });
       }
       if (parsed.transportDegraded) {
-        const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
-        lastRun.consecutive_transport_failures = consecutive;
-        if (consecutive >= 2) return pauseForTask(latest, parsed.errorClass, lastRun);
-        return save({ ...latest, tasks: { ...latest.tasks, [taskId]: { ...latestTask, state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: consecutive, last_run: lastRun } } });
+        return handleTransientFailure(latest, parsed.errorClass, lastRun);
       }
       if (parsed.status === 'report_ready') {
         if (typeof reportSender !== 'function') return pauseForTask(latest, 'report_sender_missing', { ...lastRun, delivery_attempted: false }, { sendAllowed: false });
