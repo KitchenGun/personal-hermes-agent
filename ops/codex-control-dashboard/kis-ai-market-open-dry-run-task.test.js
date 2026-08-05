@@ -2087,7 +2087,7 @@ test('one transient supervisor read failure stays active and preserves peer sche
 test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
   const value = await active();
   const paused = value.task.status();
-  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  paused.state = 'PAUSED'; paused.pause_reason = 'invalid_failure_evidence';
   for (const item of Object.values(paused.tasks)) {
     item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
   }
