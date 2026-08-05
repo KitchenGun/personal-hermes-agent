@@ -305,7 +305,9 @@ function fixture(options = {}) {
       if (typeof options.onDecisionContext === 'function') {
         options.onDecisionContext({ command, args, execOptions });
       }
-      callback(null, options.decisionContextOutput || decisionContext(execOptions.env.KIS_HERMES_DUE_KEY));
+      callback(null, typeof options.decisionContextOutput === 'function'
+        ? options.decisionContextOutput(execOptions.env.KIS_HERMES_DUE_KEY)
+        : options.decisionContextOutput || decisionContext(execOptions.env.KIS_HERMES_DUE_KEY));
       return;
     }
     if (args.includes('ai-quote-transport-diagnose-once')) {
@@ -2498,6 +2500,46 @@ test('2026-08-04 09:10 stale decision context pauses before LLM and KIS executio
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.deepEqual(fs.readdirSync(value.paths.orderAttestationDir), []);
   assert.equal(fs.existsSync(value.paths.verdictDir), false);
+});
+
+test('one transient decision-context failure skips the slot and consecutive two pauses', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const blocked = JSON.parse(decisionContext(slotId, []));
+  Object.assign(blocked, {
+    status: 'blocked',
+    holdings: [],
+    account_aggregate: {},
+    risk_aggregate: {},
+    event_metadata: [],
+    fail_closed: true,
+    error_class: 'http_transport_failed',
+  });
+  let llmCalls = 0;
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextOutput: (dueKey) => JSON.stringify({ ...blocked, slot_id: dueKey }),
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 1);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
+
+  value.setClock('2026-07-21T00:20:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:20:00Z') });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'http_transport_failed');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.consecutive_transport_failures, 2);
+  assert.equal(llmCalls, 0);
+  assert.equal(orderRuns, 0);
 });
 
 test('AI packet accepts bounded six-digit symbols outside the legacy three-symbol watchlist', () => {
