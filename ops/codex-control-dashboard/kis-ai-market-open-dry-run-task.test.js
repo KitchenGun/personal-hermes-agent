@@ -1889,6 +1889,11 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     failure_errno: 110, failure_attempt_number: 1,
   }), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+    failure_phase: 'quote_request', failure_symbol: '035420', failure_exception_type: 'TimeoutError',
+    failure_errno: 110, failure_attempt_number: 1,
+  }), mod.TASKS[1].id, trading));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'no_candidates_no_op', api_calls: 0, order_api_calls: 0,
   }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'no_op', {

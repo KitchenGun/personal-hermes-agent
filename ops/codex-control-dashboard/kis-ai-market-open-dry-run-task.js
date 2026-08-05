@@ -442,7 +442,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   }
   if ([...BOOLEAN_KEYS].some((key) => typeof value[key] !== 'boolean')) throw new Error('invalid_output_boolean');
   if (!FAILURE_PHASES.has(value.failure_phase)
-    || !(value.failure_symbol === null || LEGACY_WATCHLIST_SYMBOLS.includes(value.failure_symbol))
+    || !(value.failure_symbol === null || KRX_SYMBOL_RE.test(String(value.failure_symbol)))
     || !FAILURE_EXCEPTION_TYPES.has(value.failure_exception_type)
     || !(value.failure_errno === null || Number.isSafeInteger(value.failure_errno))
     || !Number.isSafeInteger(value.failure_attempt_number) || value.failure_attempt_number < 0
