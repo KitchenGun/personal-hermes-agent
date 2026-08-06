@@ -1920,6 +1920,8 @@ test('error class sanitizer allows codes and blocks secret-like or raw detail', 
     'weekly_universe_not_ready',
     'intraday_universe_unavailable',
     'intraday_shortlist_unavailable',
+    'intraday_position_signal_missing',
+    'vps_position_ledger_invalid',
   ]) {
     assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
   }

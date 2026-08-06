@@ -138,6 +138,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'unsafe_ai_verdict', 'late_ai_verdict', 'invalid_ai_candidates',
   'decision_context_process_error', 'decision_context_failed', 'invalid_decision_context',
   'decision_context_window_closed', 'intraday_provider_required',
+  'intraday_position_signal_missing', 'vps_position_ledger_invalid',
   'llm_position_decision_missing', 'llm_entry_not_eligible',
   'entry_after_cutoff_blocked',
   'mdd_liquidation_required', 'kill_switch_liquidation_required',
