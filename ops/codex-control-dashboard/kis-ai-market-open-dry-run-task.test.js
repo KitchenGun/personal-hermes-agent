@@ -2185,6 +2185,50 @@ test('exact IO resume recovers a cleared reconciliation latch with order disable
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
+test('exact IO resume keeps a VPS daily-loss entry block while restoring supervision', async () => {
+  const value = await active({
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps',
+      account_risk_status: 'active',
+      error_class: 'account_risk_status_active',
+    }),
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'account_risk_status_active';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.retry, false);
+  assert.equal(state.catch_up, false);
+});
+
+test('exact IO resume does not treat prod account risk as a day-scoped VPS entry block', async () => {
+  const value = await active({
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'prod',
+      account_risk_status: 'active',
+      error_class: 'account_risk_status_active',
+    }),
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'account_risk_status_active';
+  for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /account_risk_status_active/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
+});
+
 
 test('exact IO resume accepts a persisted safety monitor failure only after diagnostics are clear', async () => {
   const value = await active();

@@ -86,7 +86,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
-  'account_risk_evidence_missing', 'safety_monitor_failed', 'intraday_universe_unavailable', 'reconciliation_status_active', 'invalid_failure_evidence',
+  'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'intraday_universe_unavailable', 'reconciliation_status_active', 'invalid_failure_evidence',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
@@ -1725,7 +1725,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (safetyRun.error?.killed) throw new Error('timeout');
       if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
       const safety = parseSafetyMonitorOutput(safetyRun.stdout);
-      if (safety.status !== 'success') throw new Error(safety.error_class || 'safe_block');
+      const vpsDailyLossEntryBlock = safety.status === 'blocked'
+        && safety.execution_owner === 'vps'
+        && safety.error_class === 'account_risk_status_active'
+        && safety.process_lock === 'clear'
+        && safety.kill_state === 'clear'
+        && safety.open_order_status === 'clear'
+        && safety.reconciliation_status === 'clear'
+        && safety.account_risk_status === 'active';
+      if (safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
       const tasks = Object.fromEntries(TASKS.map((task) => {
         const prior = current.tasks[task.id] || {};
