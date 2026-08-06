@@ -1241,6 +1241,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
   for (const pauseReason of [
     'decision_context_failed',
     'intraday_position_signal_missing',
+    'llm_response_timeout',
     'http_transport_failed',
     'balance_mismatch',
     'order_not_fully_filled',
