@@ -2822,6 +2822,69 @@ test('one-minute safety monitor uses the existing manager, never calls LLM, and 
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
+test('active reconciliation is recovered once and verified before scheduling continues', async () => {
+  let recoveryCalls = 0;
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+    }),
+    execFile(command, args, execOptions, callback) {
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        assert.deepEqual(args.slice(-4), [
+          'reconcile-paused', '--confirm', '--approval',
+          'APPROVE_KIS_HERMES_VPS_RECONCILIATION_RECOVERY_V1',
+        ]);
+        options.safetyOutput = safetyOutput();
+        callback(null, orderGood('success', {
+          action_type: 'reconciliation_recovered', reconciliations: 1,
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  };
+  const value = await active(options);
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.last_safety_monitor.status, 'success');
+  assert.equal(state.last_safety_monitor.reconciliation_status, 'clear');
+  assert.equal(state.last_safety_monitor.reconciliation_recovery_attempted, true);
+  assert.equal(state.last_safety_monitor.reconciliation_recovery_succeeded, true);
+});
+
+test('failed reconciliation recovery pauses once without retrying an order', async () => {
+  let recoveryCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+    }),
+    execFile(command, args, execOptions, callback) {
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'reconciliation_recovery_failed',
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'reconciliation_recovery_failed');
+});
+
 test('one transient safety monitor failure blocks the minute and a second consecutive failure pauses all tasks', async () => {
   let taskRuns = 0;
   const options = {

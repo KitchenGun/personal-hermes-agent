@@ -159,7 +159,8 @@ const DISCORD_ERROR_CLASSES = new Set([
   'weekly_universe_not_ready', 'intraday_universe_unavailable',
   'intraday_shortlist_unavailable',
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
-  'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
+  'reconciliation_status_active', 'reconciliation_recovery_failed',
+  'account_risk_status_active', 'database_file_io_failed',
 ]);
 const AUTO_REPAIRABLE_ERROR_CLASSES = new Set([
   'sanitized_runtime_error', 'scheduler_state_fault', 'runtime_io_failed', 'process_error',
@@ -274,7 +275,7 @@ const ORDER_ACTIONS = new Set([
   'activation_check', 'position_held', 'ai_position_held',
   'no_candidate_no_op', 'entry_window_closed_no_op', 'market_closed_no_op',
   'waiting_regular_session', 'waiting_post_close', 'shadow_refreshed', 'idempotent_no_op', 'paused',
-  'llm_entry_not_authorized_no_op',
+  'llm_entry_not_authorized_no_op', 'reconciliation_recovered',
   ...ORDER_EXECUTION_ACTIONS,
 ]);
 
@@ -628,6 +629,11 @@ function parseKisVpsAutonomousOutput(
   if (ORDER_EXECUTION_ACTIONS.has(value.action_type)) {
     if (value.status !== 'success' || value.order_api_calls !== 1
       || value.vps_live_orders !== 1 || value.reconciliations !== 1) throw new Error('invalid_order_execution_contract');
+  } else if (value.action_type === 'reconciliation_recovered') {
+    if (value.status !== 'success' || value.order_api_calls !== 0
+      || value.vps_live_orders !== 0 || value.reconciliations !== 1) {
+      throw new Error('invalid_reconciliation_recovery_contract');
+    }
   } else if (!blocked && (value.order_api_calls !== 0 || value.vps_live_orders !== 0 || value.reconciliations !== 0)) {
     throw new Error('unexpected_order_execution');
   }
@@ -860,6 +866,17 @@ function parseDecisionContextOutput(stdout, expectedSlotId) {
 
 function buildSafetyMonitorCommand() {
   return { command: KIS_VENV_PYTHON, args: ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'safety-monitor'], cwd: KIS_REPO };
+}
+
+function buildReconciliationRecoveryCommand() {
+  return {
+    command: KIS_VENV_PYTHON,
+    args: [
+      '-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'reconcile-paused',
+      '--confirm', '--approval', 'APPROVE_KIS_HERMES_VPS_RECONCILIATION_RECOVERY_V1',
+    ],
+    cwd: KIS_REPO,
+  };
 }
 
 function isPostCloseRefreshSlot(task, value) {
@@ -2333,8 +2350,38 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         error_class: safeText(result.error_class, 80),
       });
       if (result.status === 'blocked') {
-        const emergencyRequired = new Set(['mdd_liquidation_required', 'kill_switch_liquidation_required']);
-        if (emergencyRequired.has(result.error_class)) {
+        if (result.error_class === 'reconciliation_status_active') {
+          const recoveryRun = await execute(buildReconciliationRecoveryCommand());
+          if (recoveryRun.error?.killed) throw new Error('timeout');
+          if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) {
+            throw new Error('reconciliation_recovery_process_error');
+          }
+          const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout);
+          if (recovery.status !== 'success' || recovery.actionType !== 'reconciliation_recovered'
+            || recovery.orderApiCalls !== 0 || recovery.vpsLiveOrders !== 0
+            || recovery.reconciliations !== 1) {
+            throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
+          }
+          const verifiedRun = await execute(buildSafetyMonitorCommand());
+          if (verifiedRun.error?.killed) throw new Error('timeout');
+          if (verifiedRun.error && Number(verifiedRun.error.code) !== 2) throw new Error('process_error');
+          result = parseSafetyMonitorOutput(verifiedRun.stdout);
+          Object.assign(monitorRun, {
+            status: result.status,
+            execution_owner: result.execution_owner,
+            process_lock: result.process_lock,
+            kill_state: result.kill_state,
+            open_order_status: result.open_order_status,
+            reconciliation_status: result.reconciliation_status,
+            account_risk_status: result.account_risk_status,
+            error_class: safeText(result.error_class, 80),
+            reconciliation_recovery_attempted: true,
+            reconciliation_recovery_succeeded: result.status === 'success',
+          });
+          if (result.status !== 'success') throw new Error(result.error_class || 'safe_block');
+        } else {
+          const emergencyRequired = new Set(['mdd_liquidation_required', 'kill_switch_liquidation_required']);
+          if (emergencyRequired.has(result.error_class)) {
           if (typeof emergencyStopExecutor !== 'function') throw new Error('emergency_stop_executor_missing');
           const emergency = await emergencyStopExecutor({ automaticRiskOff: true });
           Object.assign(monitorRun, {
@@ -2347,8 +2394,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           if (emergency?.status !== 'success' || emergency?.reconciliation_passed !== true) {
             throw new Error(`emergency_${sanitizeErrorClass(emergency?.error_class || 'stop_failed')}`);
           }
+          }
+          throw new Error(result.error_class || 'safe_block');
         }
-        throw new Error(result.error_class || 'safe_block');
       }
     } catch (error) {
       const reason = sanitizeErrorClass(error.message);
@@ -2479,7 +2527,8 @@ module.exports = {
   parseCutoverOutput, isPostCloseRefreshSlot,
   buildOrderLifecycleMessage, sanitizeErrorClass,
   nextRunAt, isWeeklyUniverseRefreshDue, buildCommand, buildDecisionContextCommand, buildDiagnosticCommand,
-  buildSafetyMonitorCommand, buildWeeklyUniverseCommand, buildIndependentShadowRefreshCommand,
+  buildSafetyMonitorCommand, buildReconciliationRecoveryCommand,
+  buildWeeklyUniverseCommand, buildIndependentShadowRefreshCommand,
   parseWeeklyUniverseOutput,
   defaultSourceParityCheck, acquireExclusiveLock, acquireSchedulerOwnershipLock,
   createKisAiMarketOpenDryRunTask,
