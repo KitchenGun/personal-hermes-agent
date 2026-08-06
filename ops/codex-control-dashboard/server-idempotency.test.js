@@ -164,12 +164,35 @@ function testDuplicateReportParsesReusedCreateResult() {
   assert.equal(report.reason, 'idempotency-key-reused');
 }
 
+function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
+  const key = 'a'.repeat(64);
+  const args = dashboard.__test.buildKisSelfHealTaskCreateArgs({
+    notificationKey: key,
+    taskId: 'kis-ai-intraday-shadow-validation-v1',
+    errorClass: 'sanitized_runtime_error',
+  });
+  const body = args[args.indexOf('--body') + 1];
+  assert.equal(args[args.indexOf('--workspace') + 1], 'worktree:/home/ubuntu/work/personal-hermes-agent');
+  assert.equal(args[args.indexOf('--max-retries') + 1], '1');
+  assert.equal(args[args.indexOf('--idempotency-key') + 1], `kis-self-heal:${key}`);
+  assert.match(body, /open a PR for operator review/);
+  assert.match(body, /Never merge or deploy/);
+  assert.doesNotMatch(body, /merge and deploy only related runtime files/);
+  assert.throws(
+    () => dashboard.__test.buildKisSelfHealTaskCreateArgs({
+      notificationKey: 'bad', taskId: 'kis-task', errorClass: 'process_error',
+    }),
+    /invalid_kis_self_heal_incident/,
+  );
+}
+
 try {
   testIdempotencyFingerprintNormalizesTextAndUsesRoutingFields();
   testSwarmFingerprintIncludesWorkerPlan();
   testCapabilityPlanFingerprintIgnoresVolatilePlannerMetadata();
   testDuplicateReportDocumentsDryRunFingerprint();
   testDuplicateReportParsesReusedCreateResult();
+  testKisSelfHealTaskIsIsolatedAndStopsAtPrReview();
   console.log('server idempotency tests passed');
 } catch (error) {
   console.error(error);

@@ -160,6 +160,19 @@ const DISCORD_ERROR_CLASSES = new Set([
   'process_lock_active', 'kill_state_active', 'open_order_status_active',
   'reconciliation_status_active', 'account_risk_status_active', 'database_file_io_failed',
 ]);
+const AUTO_REPAIRABLE_ERROR_CLASSES = new Set([
+  'sanitized_runtime_error', 'scheduler_state_fault', 'runtime_io_failed', 'process_error',
+  'database_file_io_failed',
+  'invalid_output_fields', 'invalid_safety_output', 'invalid_intraday_output_contract',
+  'invalid_report_message', 'report_sender_missing', 'report_delivery_failed',
+  'decision_context_process_error', 'decision_context_failed', 'invalid_decision_context',
+  'intraday_position_signal_missing', 'intraday_universe_unavailable',
+  'intraday_shortlist_unavailable', 'account_risk_evidence_missing',
+  'model_v3_refresh_failed', 'model_v3_shadow_failed', 'model_v3_shadow_batch_failed',
+  'model_v3_backfill_failed', 'model_v3_shadow_execution_failed',
+  'model_v3_artifact_load_failed', 'model_v3_artifact_verify_failed',
+  'scheduled_shadow_refresh_slot_invalid', 'post_close_shadow_process_error',
+]);
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
   'database_open', 'database_begin', 'database_commit', 'client_initialize', 'auth_token_request',
@@ -1253,6 +1266,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const clearTimer = options.clearTimer || clearTimeout;
   const runtimeHealthCheck = options.runtimeHealthCheck || defaultRuntimeHealthCheck;
   const reportSender = options.reportSender || null;
+  const repairTaskSender = options.repairTaskSender || null;
   const sourceParityCheck = options.sourceParityCheck || defaultSourceParityCheck;
   const resumeBlockingLockPaths = options.resumeBlockingLockPaths || RESUME_BLOCKING_LOCK_PATHS;
   const calendarProofResolver = options.calendarProofResolver || loadOfficialCalendarProof;
@@ -1270,6 +1284,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let schedulerFaulted = false;
   let releaseSchedulerOwnership = null;
   let stateFaultNotificationPromise = null;
+
+  async function queueSelfHeal(key, taskId, errorClass) {
+    if (!AUTO_REPAIRABLE_ERROR_CLASSES.has(errorClass) || typeof repairTaskSender !== 'function') {
+      return { key, attempted: false, queued: false, status: 'manual_review_required' };
+    }
+    try {
+      const result = await repairTaskSender({ notificationKey: key, taskId, errorClass });
+      return {
+        key,
+        attempted: true,
+        queued: result?.queued === true,
+        task_id: typeof result?.task_id === 'string' ? result.task_id : null,
+        status: result?.queued === true ? 'queued' : 'queue_failed',
+      };
+    } catch {
+      return { key, attempted: true, queued: false, task_id: null, status: 'queue_failed' };
+    }
+  }
 
   async function createAiVerdictFile(taskId, slotId, dueTime, schedulerToken) {
     if (typeof llmExecutor !== 'function' || typeof verdictDir !== 'string' || verdictDir.length === 0) {
@@ -1407,12 +1439,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       try { fs.unlinkSync(claimPath); } catch {}
       return { key, claim_failed: true };
     }
+    const selfHeal = await queueSelfHeal(key, TASKS[0].id, 'scheduler_state_fault');
     let succeeded = false;
     if (attempted) {
       try {
         const delivery = await reportSender({
           targetChannelId: REPORT_TARGET_CHANNEL_ID,
-          content: '[KIS 자동운영 보호 중단]\n작업: 장 시작 감독\n상태: 보호 중단\n원인: scheduler_state_fault\n자동 재시도: 없음\n신규 주문: 중단',
+          content: `[KIS 자동운영 보호 중단]\n작업: 장 시작 감독\n상태: 보호 중단\n원인: scheduler_state_fault\n자동 재시도: 없음\n신규 주문: 중단\n자동 복구: ${selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요'}`,
           deliveryLayer: 'hermes_ai_market_open_error',
         });
         succeeded = delivery?.discord_sent === true;
@@ -1420,7 +1453,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         succeeded = false;
       }
     }
-    const completed = { ...claim, succeeded, completed_at: now().toISOString() };
+    const completed = { ...claim, self_heal: selfHeal, succeeded, completed_at: now().toISOString() };
     try { fs.writeFileSync(claimPath, `${JSON.stringify(completed)}\n`, { encoding: 'utf8', mode: 0o600 }); } catch {}
     return completed;
   }
@@ -1483,16 +1516,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     ].join(':')).digest('hex');
     if (pausedState.last_error_notification?.key === notificationKey) return pausedState;
 
-    const content = [
-      '[KIS 자동운영 보호 중단]',
-      `작업: ${TASK_ALERT_LABELS.get(taskId) || 'KIS 자동운영'}`,
-      '상태: 보호 중단',
-      `원인: ${errorClass || 'unknown_error'}`,
-      '자동 재시도: 없음',
-      '신규 주문: 중단',
-    ].join('\n');
     const attempted = sendAllowed && typeof reportSender === 'function';
-    let succeeded = false;
     const claim = save({
       ...pausedState,
       last_error_notification: {
@@ -1505,6 +1529,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         claimed_at: now().toISOString(),
       },
     });
+    const selfHeal = await queueSelfHeal(notificationKey, taskId, errorClass);
+
+    const content = [
+      '[KIS 자동운영 보호 중단]',
+      `작업: ${TASK_ALERT_LABELS.get(taskId) || 'KIS 자동운영'}`,
+      '상태: 보호 중단',
+      `원인: ${errorClass || 'unknown_error'}`,
+      '자동 재시도: 없음',
+      '신규 주문: 중단',
+      `자동 복구: ${selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요'}`,
+    ].join('\n');
+    let succeeded = false;
+    const queuedClaim = save({ ...claim, last_self_heal: selfHeal });
     if (attempted) {
       try {
         const delivery = await reportSender({
@@ -1531,7 +1568,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         },
       });
     } catch {
-      return claim;
+      return queuedClaim;
     }
   }
   async function notifyOrderLifecycle(current, parsed, lastRun) {

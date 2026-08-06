@@ -366,6 +366,7 @@ function fixture(options = {}) {
     resumeBlockingLockPaths: options.resumeBlockingLockPaths,
     execFile,
     reportSender: options.reportSender,
+    repairTaskSender: options.repairTaskSender,
     calendarProofResolver: options.calendarProofResolver || (() => calendarProof(true)),
     llmExecutor: options.llmExecutor || (async ({ packet }) => aiVerdict(packet)),
     emergencyStopExecutor: options.emergencyStopExecutor,
@@ -1426,6 +1427,55 @@ test('blocked autonomous order pauses only the order task and leaves dry-run tas
   assert.equal(state.last_error_notification.succeeded, true);
   await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
   assert.equal(sent.length, 1);
+});
+
+test('repairable pause queues one isolated self-heal task and reports it', async () => {
+  const repairs = []; const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    repairTaskSender: async (incident) => {
+      repairs.push(incident);
+      return { queued: true, task_id: 't_self_heal' };
+    },
+    execFile(command, args, options, callback) {
+      if (args.includes('vps-autonomous-order')) {
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'intraday_position_signal_missing',
+        }));
+      } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(repairs.length, 1);
+  assert.equal(repairs[0].errorClass, 'intraday_position_signal_missing');
+  assert.equal(state.last_self_heal.queued, true);
+  assert.equal(state.last_self_heal.task_id, 't_self_heal');
+  assert.match(sent[0].content, /자동 복구: 격리 작업 생성 \(t_self_heal\)/);
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(repairs.length, 1);
+});
+
+test('financial-state blocker stays paused without autonomous repair', async () => {
+  let repairs = 0;
+  const value = await active({
+    reportSender: async () => ({ discord_sent: true }),
+    repairTaskSender: async () => { repairs += 1; return { queued: true, task_id: 'unsafe' }; },
+    execFile(command, args, options, callback) {
+      if (args.includes('vps-autonomous-order')) {
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'order_submission_unknown',
+        }));
+      } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  assert.equal(repairs, 0);
+  assert.equal(state.last_self_heal.status, 'manual_review_required');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
 });
 
 test('artifactless blocked order preserves the original fail-closed reason', async () => {
