@@ -2349,6 +2349,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         account_risk_status: result.account_risk_status,
         error_class: safeText(result.error_class, 80),
       });
+      if (result.status === 'blocked'
+        && result.execution_owner === 'vps'
+        && result.error_class === 'account_risk_status_active') {
+        result = { ...result, status: 'success', error_class: 'none' };
+        Object.assign(monitorRun, {
+          status: 'success',
+          error_class: 'none',
+          entry_blocked: true,
+          entry_block_reason: 'daily_loss_limit_reached',
+        });
+      }
       if (result.status === 'blocked') {
         if (result.error_class === 'reconciliation_status_active') {
           const recoveryRun = await execute(buildReconciliationRecoveryCommand());

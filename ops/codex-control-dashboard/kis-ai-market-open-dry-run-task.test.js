@@ -2822,6 +2822,26 @@ test('one-minute safety monitor uses the existing manager, never calls LLM, and 
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
+test('VPS daily-loss risk blocks entries without pausing supervision or learning', async () => {
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps', account_risk_status: 'active',
+      error_class: 'account_risk_status_active',
+    }),
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(Object.values(state.tasks).every((item) => item.state !== 'PAUSED'), true);
+  assert.equal(state.last_safety_monitor.status, 'success');
+  assert.equal(state.last_safety_monitor.account_risk_status, 'active');
+  assert.equal(state.last_safety_monitor.entry_blocked, true);
+  assert.equal(state.last_safety_monitor.entry_block_reason, 'daily_loss_limit_reached');
+});
+
 test('active reconciliation is recovered once and verified before scheduling continues', async () => {
   let recoveryCalls = 0;
   const options = {
@@ -2955,7 +2975,8 @@ test('safety monitor preserves a sanitized blocker returned with fail-closed exi
     schedulerRegistered: true,
     safetyError: error,
     safetyOutput: safetyOutput('blocked', {
-      account_risk_status: 'active', error_class: 'account_risk_status_active',
+      execution_owner: 'prod', account_risk_status: 'active',
+      error_class: 'account_risk_status_active',
     }),
   });
   value.setClock('2026-07-21T00:01:00Z');
