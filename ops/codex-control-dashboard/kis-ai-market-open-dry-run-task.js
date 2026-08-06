@@ -96,6 +96,7 @@ const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
 const ORDER_TASK_RECOVERY_PAUSE_REASONS = new Set([
   'decision_context_failed',
   'intraday_position_signal_missing',
+  'llm_response_timeout',
   ...TRANSIENT_TRANSPORT_ERRORS,
   'balance_mismatch',
   'order_not_fully_filled',
