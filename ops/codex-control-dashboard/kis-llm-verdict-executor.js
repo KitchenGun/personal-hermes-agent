@@ -3,7 +3,7 @@
 const { execFile: defaultExecFile } = require('node:child_process');
 
 const FIXED_MODEL_ID = 'gpt-5.6-terra';
-const MAX_TIMEOUT_MS = 60_000;
+const MAX_TIMEOUT_MS = 120_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 
 function commandFor(execMode, hermesBin, args) {

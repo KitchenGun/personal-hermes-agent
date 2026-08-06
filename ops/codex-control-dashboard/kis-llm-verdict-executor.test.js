@@ -31,12 +31,13 @@ test('uses fixed Hermes model with safe mode and an empty toolset', async () => 
     },
   });
 
-  assert.equal(await executor({ model: FIXED_MODEL_ID, timeoutMs: 90_000, packet: packet() }), '{"ok":true}');
+  assert.equal(await executor({ model: FIXED_MODEL_ID, timeoutMs: 180_000, packet: packet() }), '{"ok":true}');
   assert.equal(calls[0].file, '/opt/hermes');
   assert.deepEqual(calls[0].args.slice(0, 7), [
     '--safe-mode', '--ignore-rules', '--toolsets', '', '--model', FIXED_MODEL_ID, '--oneshot',
   ]);
   assert.equal(calls[0].options.timeout, MAX_TIMEOUT_MS);
+  assert.equal(MAX_TIMEOUT_MS, 120_000);
   assert.match(calls[0].args[7], /Do not call tools/);
   assert.match(calls[0].args[7], /minimum_vps_entry_decisions is 1/);
 });
