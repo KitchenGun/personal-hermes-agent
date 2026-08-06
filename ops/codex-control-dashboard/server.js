@@ -82,6 +82,7 @@ const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarket
   schedulerRegistered: true,
   serverRegistered: true,
   reportSender: sendKisReportViaDiscordRelay,
+  repairTaskSender: queueKisSelfHealTask,
   llmExecutor: kisLlmVerdictExecutor.createHermesLlmVerdictExecutor({
     hermesBin: process.env.HERMES_KIS_LLM_BIN || '/home/ubuntu/.local/bin/hermes',
     execMode: HERMES_EXEC_MODE === 'direct' || process.platform !== 'win32' ? 'direct' : 'wsl',
@@ -2403,6 +2404,63 @@ async function sendKisReportViaDiscordRelay(message) {
   });
 }
 
+function buildKisSelfHealTaskCreateArgs(incident = {}) {
+  const notificationKey = String(incident.notificationKey || '');
+  const taskId = String(incident.taskId || '');
+  const errorClass = String(incident.errorClass || '');
+  if (!/^[a-f0-9]{64}$/.test(notificationKey)
+    || !/^kis-[a-z0-9-]{1,80}$/.test(taskId)
+    || !/^[a-z0-9_]{1,80}$/.test(errorClass)) {
+    throw new Error('invalid_kis_self_heal_incident');
+  }
+  const branch = `codex/kis-self-heal-${notificationKey.slice(0, 12)}`;
+  const body = [
+    'Source: kis-runtime-self-heal',
+    `Incident: ${notificationKey}`,
+    `KIS task: ${taskId}`,
+    `Sanitized error: ${errorClass}`,
+    '',
+    'Fix the root cause autonomously in isolated git worktrees.',
+    'Inspect current sanitized state and logs, reproduce, make the smallest code fix, run focused and full tests, commit and push a branch, and open a PR for operator review.',
+    'Do not edit dirty canonical checkouts directly. Preserve unrelated files. Do not merge, deploy, restart services, or resume the KIS task.',
+    '',
+    'Hard stops:',
+    '- Never call broker order/account/balance/condition-search/WebSocket endpoints.',
+    '- Never access prod DB, secrets, tokens, raw responses, or private account values.',
+    '- Never weaken safety/risk/model/scheduler policy, enable a scheduler, retry an order, or force a market slot.',
+    '- Never merge or deploy the repair without separate operator approval.',
+    '- If a safe root-cause fix and PR cannot be proven, leave this task blocked for operator review.',
+    '',
+    'Required final notification:',
+    `Send exactly one sanitized result to discord:${KIS_DISCORD_CHANNEL_ID} with /home/ubuntu/.local/bin/hermes send -q.`,
+    'Use only: incident id prefix, fixed or blocked status, tests pass or fail, PR ready yes or no, and operator action required yes or no.',
+    'Do not include paths, source snippets, logs, symbols, prices, positions, secrets, or raw responses.',
+  ].join('\n');
+  return [
+    'kanban', '--board', 'codex-control', 'create', `KIS self-heal: ${errorClass}`,
+    '--body', body,
+    '--assignee', runtimeAssignee('coder'),
+    '--priority', '95',
+    '--workspace', 'worktree:/home/ubuntu/work/personal-hermes-agent',
+    '--branch', branch,
+    '--max-runtime', '45m',
+    '--max-retries', '1',
+    '--created-by', 'Hermes KIS self-healing',
+    '--idempotency-key', `kis-self-heal:${notificationKey}`,
+    '--json',
+  ];
+}
+
+async function queueKisSelfHealTask(incident = {}) {
+  const output = await runHermesLong(buildKisSelfHealTaskCreateArgs(incident), 60000);
+  const created = JSON.parse(output);
+  const createdTaskId = created.id || created.task_id || created.task?.id;
+  if (!createdTaskId) throw new Error('kis_self_heal_task_create_failed');
+  resetSupervisorBackoff();
+  supervisorTick('kis-self-heal').catch(() => {});
+  return { queued: true, task_id: String(createdTaskId) };
+}
+
 async function sendKisPredictionProgressViaDiscordRelay(message) {
   const targetChannelId = String(message?.targetChannelId || '').trim();
   if (targetChannelId !== kisPredictionValidationTask.PROGRESS_TARGET_CHANNEL_ID) {
@@ -2659,6 +2717,7 @@ module.exports = {
     duplicateReport,
     fingerprintComponents,
     planFingerprintSpec,
+    buildKisSelfHealTaskCreateArgs,
     kisReportDelivery,
     kisPredictionValidationTask,
     kisPredictionTaskRuntime,
