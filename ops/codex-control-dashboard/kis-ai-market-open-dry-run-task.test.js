@@ -2185,6 +2185,39 @@ test('exact IO resume recovers a cleared reconciliation latch with order disable
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
 });
 
+test('exact IO resume accepts only a sanitized VPS reconciliation pause after it clears', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED';
+  paused.pause_reason = 'sanitized_runtime_error';
+  paused.order_pause_reason = 'order_submission_unknown';
+  paused.last_safety_monitor = {
+    execution_owner: 'vps',
+    reconciliation_status: 'active',
+  };
+  for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('exact IO resume rejects an unclassified sanitized runtime pause', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED';
+  paused.pause_reason = 'sanitized_runtime_error';
+  for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /task_not_resumable/,
+  );
+});
+
 test('exact IO resume keeps a VPS daily-loss entry block while restoring supervision', async () => {
   const value = await active({
     safetyOutput: safetyOutput('blocked', {
