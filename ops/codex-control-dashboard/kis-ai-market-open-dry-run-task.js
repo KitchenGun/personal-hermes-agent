@@ -1682,7 +1682,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== RESUME_AFTER_IO_FIX_APPROVAL) throw new Error('exact_resume_approval_required');
     const current = loadStrict();
-    if (current.state !== 'PAUSED' || !RESUMABLE_PAUSE_REASONS.has(current.pause_reason)) throw new Error('task_not_resumable');
+    const sanitizedReconciliationPause = current.pause_reason === 'sanitized_runtime_error'
+      && current.last_safety_monitor?.execution_owner === 'vps'
+      && current.last_safety_monitor?.reconciliation_status === 'active'
+      && current.order_pause_reason === 'order_submission_unknown';
+    if (current.state !== 'PAUSED'
+      || (!RESUMABLE_PAUSE_REASONS.has(current.pause_reason) && !sanitizedReconciliationPause)) {
+      throw new Error('task_not_resumable');
+    }
     let release;
     try {
       release = acquireExclusiveLock(runLockPath);
