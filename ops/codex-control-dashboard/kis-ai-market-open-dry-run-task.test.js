@@ -641,11 +641,11 @@ test('cutover parser remains fail-closed while automatic cutover is unscheduled'
   }
 });
 
-test('weekly universe refresh reuses the Friday post-close task and strict KIS action', () => {
-  const friday = new Date('2026-07-31T07:20:00Z');
-  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[2], friday), true);
-  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[2], new Date('2026-07-30T07:20:00Z')), false);
-  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[1], friday), false);
+test('weekly universe refresh reuses each weekday supervisor and strict KIS action', () => {
+  const monday = new Date('2026-08-10T00:00:00Z');
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[0], monday), true);
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[0], new Date('2026-08-15T00:00:00Z')), false);
+  assert.equal(mod.isWeeklyUniverseRefreshDue(mod.TASKS[2], monday), false);
   const command = mod.buildWeeklyUniverseCommand();
   assert.equal(command.command, mod.KIS_VENV_PYTHON);
   assert.equal(command.cwd, mod.KIS_REPO);
@@ -660,7 +660,7 @@ test('weekly universe refresh reuses the Friday post-close task and strict KIS a
   assert.equal(parsed.failClosed, false);
 });
 
-test('Friday post-close records weekly future universe without adding a scheduler', async () => {
+test('weekday supervisor records weekly universe without adding a scheduler', async () => {
   const calls = [];
   const value = await active({
     execFile(command, args, options, callback) {
@@ -668,33 +668,33 @@ test('Friday post-close records weekly future universe without adding a schedule
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
   });
-  const due = '2026-07-31T07:20:00.000Z';
+  const due = '2026-08-10T00:00:00.000Z';
   const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
-  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  state.tasks[mod.TASKS[0].id].next_run_at = due;
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
   value.setClock(due);
-  const result = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const result = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
 
-  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_status, 'success');
-  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_selected_count, 50);
-  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_db_written, true);
+  assert.equal(result.tasks[mod.TASKS[0].id].last_run.weekly_universe_status, 'success');
+  assert.equal(result.tasks[mod.TASKS[0].id].last_run.weekly_universe_selected_count, 50);
+  assert.equal(result.tasks[mod.TASKS[0].id].last_run.weekly_universe_db_written, true);
   assert.equal(calls.length, 1);
   assert.equal(result.scheduler_registered, false);
 });
 
 test('weekly future-universe block does not change the frozen active model owner', async () => {
   const value = await active({ weeklyUniverseOutput: weeklyUniverseOutput('blocked') });
-  const due = '2026-07-31T07:20:00.000Z';
+  const due = '2026-08-10T00:00:00.000Z';
   const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
-  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  state.tasks[mod.TASKS[0].id].next_run_at = due;
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
   value.setClock(due);
-  const result = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const result = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
 
   assert.equal(result.state, 'ACTIVE');
-  assert.equal(result.tasks[mod.TASKS[2].id].state, 'ACTIVE');
-  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_fail_closed, true);
-  assert.equal(result.tasks[mod.TASKS[2].id].last_run.weekly_universe_error_class, 'weekly_universe_not_ready');
+  assert.equal(result.tasks[mod.TASKS[0].id].state, 'ACTIVE');
+  assert.equal(result.tasks[mod.TASKS[0].id].last_run.weekly_universe_fail_closed, true);
+  assert.equal(result.tasks[mod.TASKS[0].id].last_run.weekly_universe_error_class, 'weekly_universe_not_ready');
 });
 
 test('14:41 risk-off slot reuses the order task without a new LLM decision', async () => {
