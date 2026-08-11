@@ -668,7 +668,7 @@ function parseKisVpsAutonomousOutput(
 
 function isWeeklyUniverseRefreshDue(task, date) {
   const parts = seoulParts(date);
-  return task.id === POST_CLOSE_TASK.id && parts.weekday === 'Fri';
+  return task.id === TASKS[0].id && !['Sat', 'Sun'].includes(parts.weekday);
 }
 
 function isDeterministicRiskOffSlot(task, date) {
