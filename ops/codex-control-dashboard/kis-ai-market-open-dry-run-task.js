@@ -86,7 +86,7 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
-  'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'intraday_universe_unavailable', 'reconciliation_status_active', 'invalid_failure_evidence',
+  'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'intraday_universe_unavailable', 'intraday_universe_invalid', 'reconciliation_status_active', 'invalid_failure_evidence',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
