@@ -347,6 +347,23 @@ function sanitizeErrorClass(value) {
   return DISCORD_ERROR_CLASSES.has(text) ? text : 'sanitized_runtime_error';
 }
 
+function processFailureEvidence(error, stderr) {
+  const raw = String(stderr || '');
+  const matches = [...raw.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?=:|\s|$)/gm)];
+  const candidate = safeText(matches.at(-1)?.[1] || error?.name || 'Error', 64);
+  const exceptionType = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(candidate) ? candidate : 'Error';
+  const signal = String(error?.signal || '');
+  return Object.freeze({
+    failure_phase: 'child_process',
+    failure_exception_type: exceptionType,
+    failure_exit_code: Number.isSafeInteger(error?.code) ? error.code : null,
+    failure_signal: /^SIG[A-Z0-9]{1,16}$/.test(signal) ? signal : null,
+    failure_fingerprint: crypto.createHash('sha256').update(
+      raw || [error?.name, error?.code, error?.signal].join(':'),
+    ).digest('hex'),
+  });
+}
+
 function validateReportList(value, emptyValues, itemPattern, maxItems) {
   if (emptyValues.has(value)) return;
   const items = value.split('; ');
@@ -1303,12 +1320,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let releaseSchedulerOwnership = null;
   let stateFaultNotificationPromise = null;
 
-  async function queueSelfHeal(key, taskId, errorClass) {
+  async function queueSelfHeal(key, taskId, errorClass, lastRun = {}) {
     if (!AUTO_REPAIRABLE_ERROR_CLASSES.has(errorClass) || typeof repairTaskSender !== 'function') {
       return { key, attempted: false, queued: false, status: 'manual_review_required' };
     }
     try {
-      const result = await repairTaskSender({ notificationKey: key, taskId, errorClass });
+      const result = await repairTaskSender({
+        notificationKey: key,
+        taskId,
+        errorClass,
+        repairOwner: errorClass === 'scheduler_state_fault' ? 'hermes' : 'kis',
+        failurePhase: safeText(lastRun.failure_phase || 'none', 40),
+        failureExceptionType: safeText(lastRun.failure_exception_type || 'none', 64),
+        failureExitCode: Number.isSafeInteger(lastRun.failure_exit_code) ? lastRun.failure_exit_code : null,
+        failureSignal: safeText(lastRun.failure_signal || 'none', 24),
+        failureFingerprint: safeText(lastRun.failure_fingerprint || '', 64),
+      });
       return {
         key,
         attempted: true,
@@ -1547,7 +1574,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         claimed_at: now().toISOString(),
       },
     });
-    const selfHeal = await queueSelfHeal(notificationKey, taskId, errorClass);
+    const selfHeal = await queueSelfHeal(notificationKey, taskId, errorClass, lastRun);
 
     const content = [
       '[KIS 자동운영 보호 중단]',
@@ -1649,7 +1676,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         env: { ...process.env, ...(command.env || {}) },
         timeout: execTimeoutMs,
         maxBuffer,
-      }, (error, stdout) => resolve({ error, stdout }));
+      }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
     });
   }
   async function activate({ approval, invokedBy = 'hermes_cli' } = {}) {
@@ -2132,8 +2159,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const command = buildCommand(taskId, { schedulerToken, dueKey: key, verdictPath, promptHash });
-      const { error, stdout } = await execute(command);
-      if (error && Number(error.code) !== 2) return pauseForTask(loadStrict(), error.killed ? 'timeout' : 'process_error', { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: error.killed ? 'timeout' : 'process_error', fail_closed: true });
+      const { error, stdout, stderr } = await execute(command);
+      if (error && Number(error.code) !== 2) {
+        const errorClass = error.killed ? 'timeout' : 'process_error';
+        return pauseForTask(loadStrict(), errorClass, {
+          invoked_by: safeText(invokedBy),
+          started_at: startedAt,
+          completed_at: now().toISOString(),
+          error_class: errorClass,
+          fail_closed: true,
+          ...processFailureEvidence(error, stderr),
+        });
+      }
       let parsed;
       try {
         parsed = task.kind === 'order'
@@ -2349,9 +2386,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const monitorRun = { checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false };
     let result;
     try {
-      const { error, stdout } = await execute(buildSafetyMonitorCommand());
-      if (error?.killed) throw new Error('timeout');
-      if (error && Number(error.code) !== 2) throw new Error('process_error');
+      const { error, stdout, stderr } = await execute(buildSafetyMonitorCommand());
+      if (error && Number(error.code) !== 2) {
+        Object.assign(monitorRun, processFailureEvidence(error, stderr));
+        throw new Error(error.killed ? 'timeout' : 'process_error');
+      }
       result = parseSafetyMonitorOutput(stdout);
       if (error && result.status !== 'blocked') throw new Error('process_error');
       Object.assign(monitorRun, {
@@ -2378,9 +2417,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (result.status === 'blocked') {
         if (result.error_class === 'reconciliation_status_active') {
           const recoveryRun = await execute(buildReconciliationRecoveryCommand());
-          if (recoveryRun.error?.killed) throw new Error('timeout');
           if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) {
-            throw new Error('reconciliation_recovery_process_error');
+            Object.assign(monitorRun, processFailureEvidence(recoveryRun.error, recoveryRun.stderr));
+            throw new Error(recoveryRun.error.killed ? 'timeout' : 'reconciliation_recovery_process_error');
           }
           const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout);
           if (recovery.status !== 'success' || recovery.actionType !== 'reconciliation_recovered'
@@ -2389,8 +2428,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
           }
           const verifiedRun = await execute(buildSafetyMonitorCommand());
-          if (verifiedRun.error?.killed) throw new Error('timeout');
-          if (verifiedRun.error && Number(verifiedRun.error.code) !== 2) throw new Error('process_error');
+          if (verifiedRun.error && Number(verifiedRun.error.code) !== 2) {
+            Object.assign(monitorRun, processFailureEvidence(verifiedRun.error, verifiedRun.stderr));
+            throw new Error(verifiedRun.error.killed ? 'timeout' : 'process_error');
+          }
           result = parseSafetyMonitorOutput(verifiedRun.stdout);
           Object.assign(monitorRun, {
             status: result.status,

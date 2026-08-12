@@ -1458,6 +1458,48 @@ test('repairable pause queues one isolated self-heal task and reports it', async
   assert.equal(repairs.length, 1);
 });
 
+test('unexpected KIS child exit preserves sanitized evidence for self-heal without raw stderr', async () => {
+  const repairs = [];
+  const rawStderr = 'Traceback (most recent call last):\nRuntimeError: bounded failure detail';
+  const value = await active({
+    reportSender: async () => ({ discord_sent: true }),
+    repairTaskSender: async (incident) => {
+      repairs.push(incident);
+      return { queued: true, task_id: 't_process_repair' };
+    },
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('child failed'), { code: 1 }), '', rawStderr);
+    },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const lastRun = after.tasks[mod.TASKS[2].id].last_run;
+
+  assert.equal(after.pause_reason, 'process_error');
+  assert.equal(repairs.length, 1);
+  assert.deepEqual(repairs[0], {
+    notificationKey: after.last_error_notification.key,
+    taskId: mod.TASKS[2].id,
+    errorClass: 'process_error',
+    repairOwner: 'kis',
+    failurePhase: 'child_process',
+    failureExceptionType: 'RuntimeError',
+    failureExitCode: 1,
+    failureSignal: 'none',
+    failureFingerprint: crypto.createHash('sha256').update(rawStderr).digest('hex'),
+  });
+  assert.equal(lastRun.failure_phase, 'child_process');
+  assert.equal(lastRun.failure_exception_type, 'RuntimeError');
+  assert.equal(lastRun.failure_exit_code, 1);
+  assert.doesNotMatch(JSON.stringify(after), /bounded failure detail/);
+  assert.doesNotMatch(JSON.stringify(repairs), /bounded failure detail/);
+});
+
 test('financial-state blocker stays paused without autonomous repair', async () => {
   let repairs = 0;
   const value = await active({
