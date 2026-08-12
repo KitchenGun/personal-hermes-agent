@@ -170,6 +170,7 @@ function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
     notificationKey: key,
     taskId: 'kis-ai-intraday-shadow-validation-v1',
     errorClass: 'sanitized_runtime_error',
+    repairOwner: 'hermes',
   });
   const body = args[args.indexOf('--body') + 1];
   assert.equal(args[args.indexOf('--workspace') + 1], 'worktree:/home/ubuntu/work/personal-hermes-agent');
@@ -178,12 +179,71 @@ function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
   assert.match(body, /open a PR for operator review/);
   assert.match(body, /Never merge or deploy/);
   assert.doesNotMatch(body, /merge and deploy only related runtime files/);
+
+  const processArgs = dashboard.__test.buildKisSelfHealTaskCreateArgs({
+    notificationKey: 'b'.repeat(64),
+    taskId: 'kis-ai-post-close-learning-v1',
+    errorClass: 'process_error',
+    repairOwner: 'kis',
+    failurePhase: 'child_process',
+    failureExceptionType: 'RuntimeError',
+    failureExitCode: 1,
+    failureSignal: 'none',
+    failureFingerprint: 'c'.repeat(64),
+  });
+  const processBody = processArgs[processArgs.indexOf('--body') + 1];
+  assert.equal(
+    processArgs[processArgs.indexOf('--workspace') + 1],
+    'worktree:/home/ubuntu/.hermes/jobs/repos/kis-trading-lab',
+  );
+  assert.match(processBody, /Repair owner: kis-trading-lab/);
+  assert.match(processBody, /Failure exception: RuntimeError/);
+  assert.match(processBody, /runtime_source_uncommitted/);
+  assert.doesNotMatch(processBody, /bounded failure detail/);
+
   assert.throws(
     () => dashboard.__test.buildKisSelfHealTaskCreateArgs({
       notificationKey: 'bad', taskId: 'kis-task', errorClass: 'process_error',
+      repairOwner: 'kis',
     }),
     /invalid_kis_self_heal_incident/,
   );
+  assert.throws(
+    () => dashboard.__test.buildKisSelfHealTaskCreateArgs({
+      notificationKey: 'd'.repeat(64),
+      taskId: 'kis-ai-post-close-learning-v1',
+      errorClass: 'process_error',
+      repairOwner: 'kis',
+      failurePhase: 'child_process',
+      failureExceptionType: 'RuntimeError',
+      failureFingerprint: 'not-a-fingerprint',
+    }),
+    /invalid_kis_self_heal_incident/,
+  );
+  assert.doesNotThrow(() => dashboard.__test.assertKisSelfHealSourceClean('kis', () => ''));
+  assert.throws(
+    () => dashboard.__test.assertKisSelfHealSourceClean('kis', () => ' M kis_trading_lab/runtime.py'),
+    /runtime_source_uncommitted/,
+  );
+  let sourceCheckCalls = 0;
+  assert.throws(
+    () => dashboard.__test.assertKisSelfHealSourceClean('kis', () => {
+      sourceCheckCalls += 1;
+      return sourceCheckCalls === 2 ? 'kis_trading_lab/untracked_runtime.py' : '';
+    }),
+    /runtime_source_uncommitted/,
+  );
+  const gitCalls = [];
+  dashboard.__test.prepareKisSelfHealBranch('kis', 'codex/kis-self-heal-test', (root, gitArgs) => {
+    gitCalls.push({ root, gitArgs });
+    if (gitArgs[0] === 'rev-parse' && gitArgs[1].startsWith('refs/heads/')) throw new Error('missing');
+    if (gitArgs[0] === 'rev-parse') return 'e'.repeat(40);
+    return '';
+  });
+  assert.deepEqual(gitCalls.at(-1), {
+    root: '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab',
+    gitArgs: ['branch', 'codex/kis-self-heal-test', 'origin/master'],
+  });
 }
 
 try {
