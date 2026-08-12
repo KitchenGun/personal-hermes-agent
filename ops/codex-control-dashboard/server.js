@@ -2442,6 +2442,7 @@ function buildKisSelfHealTaskCreateArgs(incident = {}) {
     `Failure fingerprint: ${failureFingerprint || 'none'}`,
     '',
     'Fix the root cause autonomously in isolated git worktrees.',
+    'Use the installed Ponytail skill in full mode: touch the fewest files and add no dependency or speculative abstraction.',
     'Inspect current sanitized state and logs, reproduce, make the smallest code fix, run focused and full tests, commit and push a branch, and open a PR for operator review.',
     ...(repairOwner === 'kis' ? [
       'Before editing, verify that the deployed KIS source is reproducible from the pinned upstream commit.',
