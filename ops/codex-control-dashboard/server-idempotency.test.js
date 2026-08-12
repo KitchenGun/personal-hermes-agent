@@ -176,6 +176,7 @@ function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
   assert.equal(args[args.indexOf('--workspace') + 1], 'worktree:/home/ubuntu/work/personal-hermes-agent');
   assert.equal(args[args.indexOf('--max-retries') + 1], '1');
   assert.equal(args[args.indexOf('--idempotency-key') + 1], `kis-self-heal:${key}`);
+  assert.match(body, /Ponytail skill in full mode/);
   assert.match(body, /open a PR for operator review/);
   assert.match(body, /Never merge or deploy/);
   assert.doesNotMatch(body, /merge and deploy only related runtime files/);
