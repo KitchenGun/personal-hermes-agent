@@ -1105,6 +1105,38 @@ test('global recovery preserves a disabled failed refresh for the next post-clos
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
 });
 
+test('recovered post-close failure arms refresh-only activation from canonical evidence', async () => {
+  const value = await active({
+    activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
+    activationCheckOutput: orderGood('blocked', {
+      error_class: 'model_v3_prediction_batch_incomplete',
+    }),
+  });
+  const recovered = value.task.status();
+  recovered.last_error_notification = {
+    task_id: mod.TASKS[2].id,
+    error_class: 'process_error',
+    attempted: true,
+    succeeded: true,
+  };
+  recovered.tasks[mod.TASKS[2].id].last_run = { error_class: 'process_error', fail_closed: true };
+  recovered.tasks[mod.TASKS[4].id].state = 'DISABLED';
+  recovered.tasks[mod.TASKS[4].id].next_run_at = null;
+  recovered.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
+  recovered.tasks[mod.TASKS[4].id].refresh_only_pending = false;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(recovered));
+  value.setClock('2026-07-21T07:50:00Z');
+
+  const state = await value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_waiting_post_close');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
+});
+
 test('provider cutover is blocked while a refresh-only gate is pending', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
