@@ -1807,7 +1807,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { if (release) release(); }
   }
-  async function enableOrderTask({ confirm = false, approval = '', invokedBy = 'hermes_cli' } = {}) {
+  async function enableOrderTask({
+    confirm = false, approval = '', invokedBy = 'hermes_cli', adoptRefresh = false,
+  } = {}) {
     if (confirm !== true) throw new Error('order_task_confirmation_required');
     if (approval !== ORDER_ACTIVATION_APPROVAL) throw new Error('exact_order_activation_approval_required');
     let release;
@@ -1818,8 +1820,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const recoveredPostCloseFailure = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
         && current.last_error_notification?.error_class === current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class
         && current.tasks[POST_CLOSE_TASK.id]?.last_run?.fail_closed === true;
+      const refreshAdoption = adoptRefresh === true
+        && prior.state === 'ACTIVE'
+        && prior.refresh_only_pending === true;
       const canEnable = prior.state === 'DISABLED'
-        || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason));
+        || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason))
+        || refreshAdoption;
       if (current.state !== 'ACTIVE' || !canEnable) throw new Error('order_task_must_be_disabled');
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
@@ -1846,7 +1852,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.reconciliations === 0
         && parsed.openPositions === 0
         && parsed.dailyEntryCount === 0;
-      const refreshOnlyPending = prior.refresh_only_pending === true || waitingForPostCloseRefresh;
+      const refreshOnlyPending = refreshAdoption
+        ? !activationReady
+        : prior.refresh_only_pending === true || waitingForPostCloseRefresh;
       if (refreshOnlyPending
         && (prior.activation_artifact_hash === null
           || parsed.artifactHash !== prior.activation_artifact_hash)) {
@@ -2582,7 +2590,10 @@ async function cli(argv = process.argv.slice(2)) {
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'enable-order' ? await task.enableOrderTask({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
+    : action === 'enable-order' ? await task.enableOrderTask({
+      confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli',
+      adoptRefresh: argv.includes('--adopt-refresh'),
+    })
     : action === 'cutover-intraday-provider' ? await task.cutoverIntradayProvider({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'approve-daily-entry-cap-five' ? task.approveAggressiveDailyEntryCap({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()

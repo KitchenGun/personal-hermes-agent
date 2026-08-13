@@ -1076,6 +1076,32 @@ test('activation check success cannot clear an existing refresh-only marker', as
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
 });
 
+test('explicit refresh adoption verifies the batch before restoring intraday order slots', async () => {
+  const value = await active();
+  const current = value.task.status();
+  current.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  current.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T07:20:00.000Z';
+  current.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
+  current.tasks[mod.TASKS[4].id].refresh_only_pending = true;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+  value.setClock('2026-07-21T07:50:00Z');
+
+  await assert.rejects(
+    value.task.enableOrderTask({
+      confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
+    }),
+    /order_task_must_be_disabled/,
+  );
+  const state = await value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL, adoptRefresh: true,
+  });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:10:00.000Z');
+});
+
 test('global recovery preserves a disabled failed refresh for the next post-close slot', async () => {
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
