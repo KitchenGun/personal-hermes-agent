@@ -1991,6 +1991,14 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     intraday_decisions: 3,
   }), mod.TASKS[0].id, trading), /fields/);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id), mod.TASKS[2].id, trading));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id, 'blocked', {
+    error_class: 'runtime_unhandled_error', failure_phase: 'post_close_learning',
+    failure_exception_type: 'RuntimeError', failure_attempt_number: 1,
+  }), mod.TASKS[2].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'blocked', {
+    error_class: 'runtime_unhandled_error', failure_phase: 'post_close_learning',
+    failure_exception_type: 'RuntimeError', failure_attempt_number: 1,
+  }), mod.TASKS[0].id, trading), /invalid_failure_evidence/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[2].id, 'success', {
     intraday_outcomes_inserted: -1,
   }), mod.TASKS[2].id, trading), /count/);
@@ -2030,6 +2038,25 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'SSLError',
     failure_errno: null, failure_attempt_number: 1,
   }), mod.TASKS[1].id, trading), /task_result/);
+});
+
+test('post-close runtime failure preserves its sanitized cause instead of masking evidence', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    const taskId = args[args.indexOf('--task-id') + 1];
+    callback(null, good(taskId, 'blocked', {
+      error_class: 'runtime_unhandled_error', failure_phase: 'post_close_learning',
+      failure_exception_type: 'RuntimeError', failure_attempt_number: 1,
+    }));
+  } });
+  const due = new Date('2026-07-21T07:20:00Z');
+  value.setClock(due);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: due });
+
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'runtime_unhandled_error');
+  assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_phase, 'post_close_learning');
+  assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_exception_type, 'RuntimeError');
 });
 
 test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
