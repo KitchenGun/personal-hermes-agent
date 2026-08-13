@@ -1769,6 +1769,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && safety.account_risk_status === 'active';
       if (safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
+      const postCloseRefreshPending = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
+        && current.last_error_notification?.error_class === current.pause_reason
+        && current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === current.pause_reason
+        && current.tasks[ORDER_TASK.id]?.activation_artifact_hash != null;
       const tasks = Object.fromEntries(TASKS.map((task) => {
         const prior = current.tasks[task.id] || {};
         return [task.id, {
@@ -1776,6 +1780,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           state: task.kind === 'order' ? 'DISABLED' : 'ACTIVE',
           pause_reason: undefined,
           next_run_at: task.kind === 'order' ? null : nextRunAt(task, resumedAt),
+          ...(task.kind === 'order' && postCloseRefreshPending ? { refresh_only_pending: true } : {}),
           consecutive_transport_failures: 0,
         }];
       }));

@@ -2211,6 +2211,31 @@ test('exact IO resume recovers a process error only after the safety monitor is 
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact IO resume preserves a post-close shadow refresh without enabling orders', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'process_error';
+  paused.last_error_notification = {
+    task_id: mod.TASKS[2].id,
+    error_class: 'process_error',
+    attempted: true,
+    succeeded: true,
+  };
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  paused.tasks[mod.TASKS[2].id].last_run = { error_class: 'process_error', fail_closed: true };
+  paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+});
+
 
 test('exact IO resume recovers a cleared reconciliation latch with order disabled', async () => {
   const value = await active();
