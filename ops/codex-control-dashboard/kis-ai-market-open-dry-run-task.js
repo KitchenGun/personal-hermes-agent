@@ -1808,6 +1808,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       release = acquireExclusiveLock(runLockPath);
       const current = loadStrict();
       const prior = current.tasks[ORDER_TASK.id];
+      const recoveredPostCloseFailure = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
+        && current.last_error_notification?.error_class === current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class
+        && current.tasks[POST_CLOSE_TASK.id]?.last_run?.fail_closed === true;
       const canEnable = prior.state === 'DISABLED'
         || (prior.state === 'PAUSED' && ORDER_TASK_RECOVERY_PAUSE_REASONS.has(prior.pause_reason));
       if (current.state !== 'ACTIVE' || !canEnable) throw new Error('order_task_must_be_disabled');
@@ -1826,6 +1829,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         (prior.state === 'PAUSED' && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.pause_reason))
         || (prior.state === 'DISABLED' && prior.refresh_only_pending === true)
         || disabledAfterRefreshFailure
+        || (prior.state === 'DISABLED' && recoveredPostCloseFailure)
       )
         && parsed.status === 'blocked'
         && parsed.failClosed === true
