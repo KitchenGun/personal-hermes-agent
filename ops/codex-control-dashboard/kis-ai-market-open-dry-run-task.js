@@ -2590,10 +2590,7 @@ async function cli(argv = process.argv.slice(2)) {
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'enable-order' ? await task.enableOrderTask({
-      confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli',
-      adoptRefresh: argv.includes('--adopt-refresh'),
-    })
+    : action === 'enable-order' ? await task.enableOrderTask(parseEnableOrderArgs(argv))
     : action === 'cutover-intraday-provider' ? await task.cutoverIntradayProvider({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'approve-daily-entry-cap-five' ? task.approveAggressiveDailyEntryCap({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'status' ? task.status()
@@ -2602,6 +2599,16 @@ async function cli(argv = process.argv.slice(2)) {
     : action === 'tick' || action === 'run-once' ? (() => { throw new Error('scheduler_owner_required'); })()
     : (() => { throw new Error('unknown_action'); })();
   process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+function parseEnableOrderArgs(argv) {
+  const approvalIndex = argv.indexOf('--approval');
+  return {
+    confirm: argv.includes('--confirm'),
+    approval: approvalIndex >= 0 ? argv[approvalIndex + 1] : '',
+    invokedBy: 'hermes_cli',
+    adoptRefresh: argv.includes('--adopt-refresh'),
+  };
 }
 if (require.main === module) cli().catch((error) => { process.stderr.write(`${safeText(error.message, 100)}\n`); process.exitCode = 1; });
 
@@ -2624,6 +2631,7 @@ module.exports = {
   buildSafetyMonitorCommand, buildReconciliationRecoveryCommand,
   buildWeeklyUniverseCommand, buildIndependentShadowRefreshCommand,
   parseWeeklyUniverseOutput,
+  parseEnableOrderArgs,
   defaultSourceParityCheck, acquireExclusiveLock, acquireSchedulerOwnershipLock,
   createKisAiMarketOpenDryRunTask,
 };
