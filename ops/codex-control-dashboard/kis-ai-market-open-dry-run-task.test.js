@@ -1102,6 +1102,78 @@ test('explicit refresh adoption verifies the batch before restoring intraday ord
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:10:00.000Z');
 });
 
+test('refresh adoption preserves refresh-only state when activation check fails', async () => {
+  for (const options of [
+    {
+      activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
+      activationCheckOutput: orderGood('blocked', { error_class: 'model_v3_prediction_batch_incomplete' }),
+    },
+    {
+      activationCheckError: Object.assign(new Error('process'), { code: 1 }),
+      activationCheckOutput: orderGood('success', { action_type: 'activation_check' }),
+    },
+  ]) {
+    const value = await active(options);
+    const current = value.task.status();
+    const prior = current.tasks[mod.TASKS[4].id];
+    prior.state = 'ACTIVE';
+    prior.next_run_at = '2026-07-22T07:20:00.000Z';
+    prior.activation_artifact_hash = 'a'.repeat(64);
+    prior.refresh_only_pending = true;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+
+    await assert.rejects(value.task.enableOrderTask({
+      confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL, adoptRefresh: true,
+    }));
+    const after = value.task.status().tasks[mod.TASKS[4].id];
+    assert.equal(after.state, 'ACTIVE');
+    assert.equal(after.refresh_only_pending, true);
+    assert.equal(after.next_run_at, '2026-07-22T07:20:00.000Z');
+    assert.equal(after.activation_artifact_hash, 'a'.repeat(64));
+  }
+});
+
+test('refresh adoption stores a newly verified artifact hash and is idempotent', async () => {
+  const value = await active({
+    activationCheckOutput: orderGood('success', {
+      action_type: 'activation_check', artifact_hash: 'b'.repeat(64),
+    }),
+  });
+  const current = value.task.status();
+  const prior = current.tasks[mod.TASKS[4].id];
+  prior.state = 'ACTIVE';
+  prior.next_run_at = '2026-07-22T07:20:00.000Z';
+  prior.activation_artifact_hash = 'a'.repeat(64);
+  prior.refresh_only_pending = true;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+
+  const adopted = await value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL, adoptRefresh: true,
+  });
+  assert.equal(adopted.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
+  assert.equal(adopted.tasks[mod.TASKS[4].id].refresh_only_pending, false);
+  await assert.rejects(value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL, adoptRefresh: true,
+  }), /order_task_must_be_disabled/);
+});
+
+test('enable-order CLI maps the explicit refresh adoption contract only', () => {
+  assert.deepEqual(mod.parseEnableOrderArgs([
+    'enable-order', '--confirm', '--adopt-refresh', '--approval', mod.ORDER_ACTIVATION_APPROVAL,
+  ]), {
+    confirm: true,
+    approval: mod.ORDER_ACTIVATION_APPROVAL,
+    invokedBy: 'hermes_cli',
+    adoptRefresh: true,
+  });
+  assert.equal(mod.parseEnableOrderArgs([
+    'enable-order', '--confirm', '--approval', mod.ORDER_ACTIVATION_APPROVAL,
+  ]).adoptRefresh, false);
+  assert.equal(mod.parseEnableOrderArgs([
+    'enable-order', '--adopt-refresh', '--approval', 'wrong',
+  ]).confirm, false);
+});
+
 test('global recovery preserves a disabled failed refresh for the next post-close slot', async () => {
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
