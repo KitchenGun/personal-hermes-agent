@@ -201,6 +201,12 @@ const TASKS = Object.freeze([
   },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
+const TASK_FAILURE_PHASES = new Map([
+  [TASKS[0].id, new Set(['supervisor_run'])],
+  [TASKS[1].id, new Set(['intraday_shortlist_resolve', 'intraday_run'])],
+  [TASKS[2].id, new Set(['post_close_learning'])],
+  [TASKS[3].id, new Set(['daily_report'])],
+]);
 const TASK_ALERT_LABELS = new Map([
   ['kis-ai-market-open-supervisor-v1', '장 시작 감독'],
   ['kis-ai-intraday-shadow-validation-v1', '장중 AI 검증'],
@@ -475,7 +481,8 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     throw new Error('invalid_output_count');
   }
   if ([...BOOLEAN_KEYS].some((key) => typeof value[key] !== 'boolean')) throw new Error('invalid_output_boolean');
-  if (!FAILURE_PHASES.has(value.failure_phase)
+  const taskFailurePhases = TASK_FAILURE_PHASES.get(expectedTaskId);
+  if (!(FAILURE_PHASES.has(value.failure_phase) || taskFailurePhases?.has(value.failure_phase))
     || !(value.failure_symbol === null || KRX_SYMBOL_RE.test(String(value.failure_symbol)))
     || !FAILURE_EXCEPTION_TYPES.has(value.failure_exception_type)
     || !(value.failure_errno === null || Number.isSafeInteger(value.failure_errno))
