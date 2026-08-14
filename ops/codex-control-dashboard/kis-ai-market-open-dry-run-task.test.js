@@ -3324,6 +3324,32 @@ test('a paused transient safety failure auto-resumes all previously activated ta
   assert.equal(recovered.catch_up, false);
 });
 
+test('a paused open-order outage auto-resumes only after a clear safety monitor', async () => {
+  const value = await active({ schedulerRegistered: true, safetyOutput: safetyOutput() });
+  const current = value.task.status();
+  const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
+    ...item,
+    state: 'PAUSED',
+    next_run_at: null,
+    pause_reason: 'open_order_status_unavailable',
+  }]));
+  fs.writeFileSync(value.paths.statePath, JSON.stringify({
+    ...current,
+    state: 'PAUSED',
+    pause_reason: 'open_order_status_unavailable',
+    order_activated_at: '2026-07-21T00:00:00.000Z',
+    tasks,
+  }));
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const recovered = await value.task.tick();
+
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.resume_reason, 'safety_monitor_auto_recovered');
+  assert.equal(Object.values(recovered.tasks).every((item) => item.state === 'ACTIVE'), true);
+  assert.equal(recovered.last_safety_monitor.status, 'success');
+});
+
 test('provider timeout stays fail-closed without pausing or running tasks', async () => {
   let taskRuns = 0;
   const value = await active({
