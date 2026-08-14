@@ -2261,6 +2261,23 @@ test('invalid output, blocked result, and timeout pause all tasks without retry'
   }
 });
 
+test('supervisor timeout notification identifies automatic safety checks', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('timeout'), { killed: true, code: null }), '');
+    },
+  });
+  value.setClock('2026-07-21T00:00:11Z');
+
+  await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:11Z') });
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].content, /자동 복구: 안전 확인 자동 진행 중/);
+  assert.doesNotMatch(sent[0].content, /운영자 확인 필요/);
+});
+
 test('task parser failures preserve the exact sanitized error class', async () => {
   const value = await active({ execFile(c, a, o, cb) {
     cb(null, good(a[a.indexOf('--task-id') + 1], 'success', { quote_api_calls: 11 }));
@@ -3307,7 +3324,7 @@ test('a paused transient safety failure auto-resumes all previously activated ta
   assert.equal(recovered.catch_up, false);
 });
 
-test('provider timeout stays active without running tasks for four checks and pauses on the fifth', async () => {
+test('provider timeout stays fail-closed without pausing or running tasks', async () => {
   let taskRuns = 0;
   const value = await active({
     schedulerRegistered: true,
@@ -3318,17 +3335,12 @@ test('provider timeout stays active without running tasks for four checks and pa
     },
   });
 
-  for (let minute = 1; minute <= 4; minute += 1) {
+  for (let minute = 1; minute <= 6; minute += 1) {
     value.setClock(`2026-07-21T00:0${minute}:00Z`);
     const held = await value.task.tick();
     assert.equal(held.state, 'ACTIVE');
     assert.equal(held.consecutive_safety_monitor_failures, minute);
   }
-  value.setClock('2026-07-21T00:05:00Z');
-  const paused = await value.task.tick();
-
-  assert.equal(paused.state, 'PAUSED');
-  assert.equal(paused.pause_reason, 'timeout');
   assert.equal(taskRuns, 0);
 });
 
