@@ -1213,11 +1213,13 @@ test('recovered post-close failure arms refresh-only activation from canonical e
   const recovered = value.task.status();
   recovered.last_error_notification = {
     task_id: mod.TASKS[2].id,
-    error_class: 'process_error',
+    error_class: 'sanitized_runtime_error',
     attempted: true,
     succeeded: true,
   };
-  recovered.tasks[mod.TASKS[2].id].last_run = { error_class: 'process_error', fail_closed: true };
+  recovered.tasks[mod.TASKS[2].id].last_run = {
+    error_class: 'runtime_unhandled_error', fail_closed: true,
+  };
   recovered.tasks[mod.TASKS[4].id].state = 'DISABLED';
   recovered.tasks[mod.TASKS[4].id].next_run_at = null;
   recovered.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
