@@ -85,6 +85,10 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'open_order_status_unavailable', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const OPEN_ORDER_STATUS_FAILURE_LIMIT = 5;
+const TRANSIENT_TRANSPORT_FAILURE_LIMIT = 5;
+const AUTO_RESUME_AFTER_CLEAR_SAFETY = new Set([
+  'account_risk_evidence_missing', 'safety_monitor_failed', ...TRANSIENT_TRANSPORT_ERRORS,
+]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
   'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'open_order_status_unavailable', 'intraday_universe_unavailable', 'intraday_universe_invalid', 'reconciliation_status_active', 'invalid_failure_evidence',
@@ -2497,7 +2501,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && (consecutiveFailures === 1
           || current.last_safety_monitor?.error_class === 'open_order_status_unavailable');
       const failureLimit = consecutiveOpenOrderFailures
-        ? OPEN_ORDER_STATUS_FAILURE_LIMIT : 2;
+        ? OPEN_ORDER_STATUS_FAILURE_LIMIT
+        : (TRANSIENT_TRANSPORT_ERRORS.has(reason) ? TRANSIENT_TRANSPORT_FAILURE_LIMIT : 2);
       const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
         && consecutiveFailures < failureLimit;
       if (awaitingConfirmation) {
@@ -2531,8 +2536,33 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     try {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
+      const time = now();
+      if (current.state === 'PAUSED' && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(current.pause_reason)) {
+        current = await runSafetyMonitor(current, time);
+        if (current.last_safety_monitor?.status !== 'success') return current;
+        const orderWasActivated = Boolean(current.order_activated_at);
+        const tasks = Object.fromEntries(TASKS.map((task) => [task.id, {
+          ...current.tasks[task.id],
+          state: task.kind === 'order' && !orderWasActivated ? 'DISABLED' : 'ACTIVE',
+          pause_reason: undefined,
+          next_run_at: task.kind === 'order' && !orderWasActivated ? null : nextRunAt(task, time),
+          consecutive_transport_failures: 0,
+        }]));
+        current = save({
+          ...current,
+          state: 'ACTIVE',
+          tasks,
+          pause_reason: undefined,
+          consecutive_safety_monitor_failures: 0,
+          resumed_at: time.toISOString(),
+          resumed_by: 'hermes_safety_monitor',
+          resume_reason: 'safety_monitor_auto_recovered',
+          retry: false,
+          catch_up: false,
+          backfill: false,
+        });
+      }
       if (current.state === 'ACTIVE') {
-        const time = now();
         current = await runSafetyMonitor(current, time);
         if (current.state !== 'ACTIVE') return current;
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success') return current;
