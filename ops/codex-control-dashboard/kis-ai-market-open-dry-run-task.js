@@ -82,11 +82,12 @@ const TRANSIENT_TRANSPORT_ERRORS = new Set([
   'http_transport_failed', 'response_read_failed', 'database_busy',
 ]);
 const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
-  'safety_monitor_failed', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
+  'safety_monitor_failed', 'open_order_status_unavailable', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
+const OPEN_ORDER_STATUS_FAILURE_LIMIT = 5;
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
-  'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'intraday_universe_unavailable', 'intraday_universe_invalid', 'reconciliation_status_active', 'invalid_failure_evidence',
+  'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'open_order_status_unavailable', 'intraday_universe_unavailable', 'intraday_universe_invalid', 'reconciliation_status_active', 'invalid_failure_evidence',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const PREFLIGHT_RESUMABLE_PAUSE_REASONS = new Set([
@@ -146,7 +147,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'mdd_liquidation_required', 'kill_switch_liquidation_required',
   'emergency_stop_executor_missing', 'open_buy_cancel_unconfirmed',
   'emergency_open_buy_cancel_unconfirmed',
-  'safety_monitor_failed', 'execution_owner_disabled', 'execution_owner_invalid',
+  'safety_monitor_failed', 'open_order_status_unavailable', 'execution_owner_disabled', 'execution_owner_invalid',
   'vps_environment_or_credentials_unavailable', 'prod_environment_or_credentials_unavailable',
   'account_risk_evidence_missing', 'prod_account_risk_evidence_missing',
   'model_v3_refresh_failed', 'model_v3_shadow_failed', 'model_v3_shadow_batch_failed',
@@ -2492,8 +2493,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     } catch (error) {
       const reason = sanitizeErrorClass(error.message);
       const consecutiveFailures = Number(current.consecutive_safety_monitor_failures || 0) + 1;
+      const consecutiveOpenOrderFailures = reason === 'open_order_status_unavailable'
+        && (consecutiveFailures === 1
+          || current.last_safety_monitor?.error_class === 'open_order_status_unavailable');
+      const failureLimit = consecutiveOpenOrderFailures
+        ? OPEN_ORDER_STATUS_FAILURE_LIMIT : 2;
       const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
-        && consecutiveFailures < 2;
+        && consecutiveFailures < failureLimit;
       if (awaitingConfirmation) {
         return save({
           ...current,
