@@ -1784,7 +1784,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
       const postCloseRefreshPending = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
-        && current.last_error_notification?.error_class === current.pause_reason
+        && current.last_error_notification?.error_class === sanitizeErrorClass(current.pause_reason)
         && current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === current.pause_reason
         && current.tasks[ORDER_TASK.id]?.activation_artifact_hash != null;
       const tasks = Object.fromEntries(TASKS.map((task) => {
@@ -1825,7 +1825,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const current = loadStrict();
       const prior = current.tasks[ORDER_TASK.id];
       const recoveredPostCloseFailure = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
-        && current.last_error_notification?.error_class === current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class
+        && current.last_error_notification?.error_class
+          === sanitizeErrorClass(current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class)
         && current.tasks[POST_CLOSE_TASK.id]?.last_run?.fail_closed === true;
       const refreshAdoption = adoptRefresh === true
         && prior.state === 'ACTIVE'
