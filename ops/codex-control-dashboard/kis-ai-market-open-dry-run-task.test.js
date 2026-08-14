@@ -3272,6 +3272,66 @@ test('a clear monitor after one transient failure resumes future scheduling with
   assert.equal(recovered.backfill, false);
 });
 
+test('a paused transient safety failure auto-resumes all previously activated tasks after a clear monitor', async () => {
+  const value = await active({ schedulerRegistered: true, safetyOutput: safetyOutput() });
+  const current = value.task.status();
+  const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
+    ...item,
+    state: 'PAUSED',
+    next_run_at: null,
+    pause_reason: 'account_risk_evidence_missing',
+  }]));
+  fs.writeFileSync(value.paths.statePath, JSON.stringify({
+    ...current,
+    state: 'PAUSED',
+    pause_reason: 'account_risk_evidence_missing',
+    order_activated_at: '2026-07-21T00:00:00.000Z',
+    tasks,
+    last_safety_monitor: {
+      checked_at: '2026-07-20T23:59:00.000Z',
+      status: 'blocked',
+      error_class: 'account_risk_evidence_missing',
+    },
+  }));
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const recovered = await value.task.tick();
+
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.pause_reason, undefined);
+  assert.equal(recovered.resume_reason, 'safety_monitor_auto_recovered');
+  assert.equal(recovered.resumed_by, 'hermes_safety_monitor');
+  assert.equal(Object.values(recovered.tasks).every((item) => item.state === 'ACTIVE'), true);
+  assert.equal(recovered.last_safety_monitor.status, 'success');
+  assert.equal(recovered.retry, false);
+  assert.equal(recovered.catch_up, false);
+});
+
+test('provider timeout stays active without running tasks for four checks and pauses on the fifth', async () => {
+  let taskRuns = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', { error_class: 'timeout' }),
+    execFile(command, args, execOptions, callback) {
+      taskRuns += 1;
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+
+  for (let minute = 1; minute <= 4; minute += 1) {
+    value.setClock(`2026-07-21T00:0${minute}:00Z`);
+    const held = await value.task.tick();
+    assert.equal(held.state, 'ACTIVE');
+    assert.equal(held.consecutive_safety_monitor_failures, minute);
+  }
+  value.setClock('2026-07-21T00:05:00Z');
+  const paused = await value.task.tick();
+
+  assert.equal(paused.state, 'PAUSED');
+  assert.equal(paused.pause_reason, 'timeout');
+  assert.equal(taskRuns, 0);
+});
+
 test('open-order read outage holds orders for four minutes and pauses on the fifth', async () => {
   let taskRuns = 0;
   let notifications = 0;
