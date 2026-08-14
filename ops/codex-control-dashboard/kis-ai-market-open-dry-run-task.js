@@ -90,7 +90,7 @@ const AUTO_RESUME_AFTER_CLEAR_SAFETY = new Set([
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
-  'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
+  'runtime_io_failed', 'runtime_unhandled_error', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
   'account_risk_evidence_missing', 'account_risk_status_active', 'safety_monitor_failed', 'open_order_status_unavailable', 'intraday_universe_unavailable', 'intraday_universe_invalid', 'reconciliation_status_active', 'invalid_failure_evidence',
   ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
@@ -1113,7 +1113,7 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   }
   const args = ['-m', 'kis_trading_lab', 'ai-market-open-dry-run-once', '--approval', ACTIVATION_APPROVAL, '--task-id', taskId, '--strategy-manifest', STRATEGY_MANIFEST, '--db', VPS_DB_PATH];
   if (activationPreflight) args.push('--activation-preflight');
-  return { command: 'python3', args, cwd: KIS_REPO, env: verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath } : {} };
+  return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO, env: verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath } : {} };
 }
 
 function buildDiagnosticCommand() {

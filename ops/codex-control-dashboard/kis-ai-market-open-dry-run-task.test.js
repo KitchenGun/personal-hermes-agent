@@ -2060,7 +2060,10 @@ test('14:30 and later entry output is rejected even when KIS reports success', a
 
 test('strict command and output contract reject drift and unsafe fields', () => {
   const command = mod.buildCommand(mod.TASKS[1].id);
-  assert.equal(command.command, 'python3'); assert.equal(command.cwd, mod.KIS_REPO);
+  assert.equal(command.command, mod.KIS_VENV_PYTHON); assert.equal(command.cwd, mod.KIS_REPO);
+  for (const task of mod.TASKS.slice(0, 4)) {
+    assert.equal(mod.buildCommand(task.id).command, mod.KIS_VENV_PYTHON);
+  }
   assert.equal(command.args.includes('--activation-preflight'), false);
   const trading = () => calendarProof(true);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
@@ -2381,6 +2384,21 @@ test('exact IO resume recovers a process error only after the safety monitor is 
   }
   fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
   const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
+test('exact IO resume recovers a fixed post-close unhandled runtime error', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_unhandled_error';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
