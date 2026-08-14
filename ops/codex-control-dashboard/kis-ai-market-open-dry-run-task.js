@@ -86,7 +86,8 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
 ]);
 const OPEN_ORDER_STATUS_FAILURE_LIMIT = 5;
 const AUTO_RESUME_AFTER_CLEAR_SAFETY = new Set([
-  'account_risk_evidence_missing', 'safety_monitor_failed', ...TRANSIENT_TRANSPORT_ERRORS,
+  'account_risk_evidence_missing', 'safety_monitor_failed', 'open_order_status_unavailable',
+  ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const RESUMABLE_PAUSE_REASONS = new Set([
   'runtime_io_failed', 'process_error', 'database_file_io_failed', 'invalid_output_fields', 'unsafe_output', 'invalid_safety_output', 'invalid_intraday_output_contract', 'invalid_report_message',
@@ -1594,7 +1595,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       `원인: ${errorClass || 'unknown_error'}`,
       '자동 재시도: 없음',
       '신규 주문: 중단',
-      `자동 복구: ${taskId === TASKS[0].id && TRANSIENT_TRANSPORT_ERRORS.has(errorClass)
+      `자동 복구: ${taskId === TASKS[0].id && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(errorClass)
         ? '안전 확인 자동 진행 중'
         : (selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요')}`,
     ].join('\n');
