@@ -3272,6 +3272,97 @@ test('a clear monitor after one transient failure resumes future scheduling with
   assert.equal(recovered.backfill, false);
 });
 
+test('open-order read outage holds orders for four minutes and pauses on the fifth', async () => {
+  let taskRuns = 0;
+  let notifications = 0;
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'unknown', error_class: 'open_order_status_unavailable',
+    }),
+    execFile(command, args, execOptions, callback) {
+      taskRuns += 1;
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+    reportSender: async () => {
+      notifications += 1;
+      return { discord_sent: true };
+    },
+  };
+  const value = await active(options);
+
+  for (let minute = 1; minute <= 4; minute += 1) {
+    value.setClock(`2026-07-21T00:0${minute}:00Z`);
+    const held = await value.task.tick();
+    assert.equal(held.state, 'ACTIVE');
+    assert.equal(held.last_safety_monitor.status, 'blocked');
+    assert.equal(held.consecutive_safety_monitor_failures, minute);
+    assert.equal(taskRuns, 0);
+  }
+
+  value.setClock('2026-07-21T00:05:00Z');
+  const paused = await value.task.tick();
+  assert.equal(paused.state, 'PAUSED');
+  assert.equal(paused.pause_reason, 'open_order_status_unavailable');
+  assert.equal(paused.consecutive_safety_monitor_failures, 5);
+  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(notifications, 1);
+  assert.equal(taskRuns, 0);
+});
+
+test('open-order read outage recovers automatically before its bounded limit', async () => {
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'unknown', error_class: 'open_order_status_unavailable',
+    }),
+  };
+  const value = await active(options);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  await value.task.tick();
+  value.setClock('2026-07-21T00:02:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.state, 'ACTIVE');
+  assert.equal(held.consecutive_safety_monitor_failures, 2);
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:03:00Z');
+  const recovered = await value.task.tick();
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.last_safety_monitor.status, 'success');
+  assert.equal(recovered.consecutive_safety_monitor_failures, 0);
+});
+
+test('mixed safety failures retain the existing two-failure pause threshold', async () => {
+  let notifications = 0;
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'unknown', error_class: 'safety_monitor_failed',
+    }),
+    reportSender: async () => {
+      notifications += 1;
+      return { discord_sent: true };
+    },
+  };
+  const value = await active(options);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  const first = await value.task.tick();
+  assert.equal(first.state, 'ACTIVE');
+
+  options.safetyOutput = safetyOutput('blocked', {
+    open_order_status: 'unknown', error_class: 'open_order_status_unavailable',
+  });
+  value.setClock('2026-07-21T00:02:00Z');
+  const paused = await value.task.tick();
+  assert.equal(paused.state, 'PAUSED');
+  assert.equal(paused.pause_reason, 'open_order_status_unavailable');
+  assert.equal(paused.consecutive_safety_monitor_failures, 2);
+  assert.equal(notifications, 1);
+});
+
 test('safety monitor preserves a sanitized blocker returned with fail-closed exit code 2', async () => {
   const error = Object.assign(new Error('Command failed'), { code: 2, killed: false });
   const value = await active({
