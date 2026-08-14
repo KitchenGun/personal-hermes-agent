@@ -85,7 +85,6 @@ const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set([
   'safety_monitor_failed', 'open_order_status_unavailable', 'process_error', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
 const OPEN_ORDER_STATUS_FAILURE_LIMIT = 5;
-const TRANSIENT_TRANSPORT_FAILURE_LIMIT = 5;
 const AUTO_RESUME_AFTER_CLEAR_SAFETY = new Set([
   'account_risk_evidence_missing', 'safety_monitor_failed', ...TRANSIENT_TRANSPORT_ERRORS,
 ]);
@@ -1595,7 +1594,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       `원인: ${errorClass || 'unknown_error'}`,
       '자동 재시도: 없음',
       '신규 주문: 중단',
-      `자동 복구: ${selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요'}`,
+      `자동 복구: ${taskId === TASKS[0].id && TRANSIENT_TRANSPORT_ERRORS.has(errorClass)
+        ? '안전 확인 자동 진행 중'
+        : (selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요')}`,
     ].join('\n');
     let succeeded = false;
     const queuedClaim = save({ ...claim, last_self_heal: selfHeal });
@@ -2500,9 +2501,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const consecutiveOpenOrderFailures = reason === 'open_order_status_unavailable'
         && (consecutiveFailures === 1
           || current.last_safety_monitor?.error_class === 'open_order_status_unavailable');
+      if (TRANSIENT_TRANSPORT_ERRORS.has(reason)) {
+        return save({
+          ...current,
+          consecutive_safety_monitor_failures: consecutiveFailures,
+          last_safety_monitor: {
+            ...monitorRun,
+            status: 'blocked',
+            fail_closed: true,
+            error_class: reason,
+          },
+        });
+      }
       const failureLimit = consecutiveOpenOrderFailures
         ? OPEN_ORDER_STATUS_FAILURE_LIMIT
-        : (TRANSIENT_TRANSPORT_ERRORS.has(reason) ? TRANSIENT_TRANSPORT_FAILURE_LIMIT : 2);
+        : 2;
       const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
         && consecutiveFailures < failureLimit;
       if (awaitingConfirmation) {
