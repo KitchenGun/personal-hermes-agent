@@ -1382,6 +1382,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
+    'unsafe_order_count',
     'intraday_prediction_contract_mismatch',
     'symbol_not_allowed',
     'unmanaged_position_present',
