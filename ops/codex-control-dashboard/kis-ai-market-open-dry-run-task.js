@@ -487,13 +487,13 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   }
   if ([...BOOLEAN_KEYS].some((key) => typeof value[key] !== 'boolean')) throw new Error('invalid_output_boolean');
   const taskFailurePhases = TASK_FAILURE_PHASES.get(expectedTaskId);
+  const quoteApiCallLimit = value.task_id === TASKS[1].id ? 10 : 3;
   if (!(FAILURE_PHASES.has(value.failure_phase) || taskFailurePhases?.has(value.failure_phase))
     || !(value.failure_symbol === null || KRX_SYMBOL_RE.test(String(value.failure_symbol)))
     || !FAILURE_EXCEPTION_TYPES.has(value.failure_exception_type)
     || !(value.failure_errno === null || Number.isSafeInteger(value.failure_errno))
     || !Number.isSafeInteger(value.failure_attempt_number) || value.failure_attempt_number < 0
-    || value.failure_attempt_number > 3) throw new Error('invalid_failure_evidence');
-  const quoteApiCallLimit = value.task_id === TASKS[1].id ? 10 : 3;
+    || value.failure_attempt_number > quoteApiCallLimit) throw new Error('invalid_failure_evidence');
   if (value.order_api_calls !== 0 || value.vps_live_orders !== 0 || value.prod_orders !== 0
     || value.champion_changed !== false || value.raw_response_persisted !== false
     || value.secret_exposure !== false || value.retry !== false || value.catch_up !== false
