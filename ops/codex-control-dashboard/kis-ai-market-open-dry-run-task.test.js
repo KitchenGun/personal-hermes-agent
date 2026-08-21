@@ -265,7 +265,7 @@ function decisionContext(slotId, candidates = ['005930'], minimumVpsEntryDecisio
       open_orders: 0,
       daily_entry_submit_count: 0,
       active_daily_entry_cap: null,
-      max_positions: 3,
+      max_positions: 5,
       minimum_vps_entry_decisions: minimumVpsEntryDecisions,
       max_symbol_equity_pct: 50,
       planned_position_loss_pct: 1,
@@ -361,6 +361,7 @@ function fixture(options = {}) {
   const task = mod.createKisAiMarketOpenDryRunTask({
     ...paths,
     now: () => clock,
+    runtimeContract: options.runtimeContract || mod.REQUIRED_RUNTIME_CONTRACT,
     runtimeHealthCheck: options.runtimeHealthCheck || (async () => true),
     sourceParityCheck: options.sourceParityCheck || (() => true),
     resumeBlockingLockPaths: options.resumeBlockingLockPaths,
@@ -420,7 +421,7 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_INTRADAY_FEATURE_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash);
   assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v3-intraday-discovery');
   assert.equal(command.env.KIS_INTRADAY_POLICY_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash);
-  assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, '3');
+  assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, 'null');
   assert.equal(command.args.includes('--approval'), false);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
   const finalDueKey = `${mod.TASKS[4].id}:2026-07-22:14:40`;
@@ -790,7 +791,7 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
     action_type: 'ai_position_held', open_positions: 3,
   })));
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
-    action_type: 'ai_position_held', open_positions: 4,
+    action_type: 'ai_position_held', open_positions: 6,
   })), /unsafe_order_count/);
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v2',
@@ -821,6 +822,10 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     error_class: 'app_secret=value',
   })), /unsafe_order_output/);
+  const normalized = mod.parseKisVpsAutonomousOutput(orderGood('blocked', {
+    action_type: 'paused', error_class: 'HTTP 500 from private endpoint',
+  }));
+  assert.equal(normalized.errorClass, 'sanitized_runtime_error');
   const promoted = mod.parseKisVpsAutonomousOutput(orderGood('success', {
     action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
     previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
@@ -879,7 +884,7 @@ test('exact provider cutover migrates the existing active order task without cre
   });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 3);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
   assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
   assert.equal(state.tasks[mod.TASKS[4].id].decision_provider, 'intraday_v1');
   assert.equal(state.tasks[mod.TASKS[4].id].schedule, mod.TASKS[4].schedule);
@@ -1216,7 +1221,7 @@ test('recovered post-close failure arms refresh-only activation from canonical e
   const recovered = value.task.status();
   recovered.last_error_notification = {
     task_id: mod.TASKS[2].id,
-    error_class: 'sanitized_runtime_error',
+    error_class: 'runtime_unhandled_error',
     attempted: true,
     succeeded: true,
   };
@@ -1814,30 +1819,20 @@ test.skip('legacy order-task post-close promotion guard is retired', async () =>
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_promotion_outside_post_close_slot');
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 3);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
   assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
 });
 
-test('exact daily cap five approval stores only its hash', async () => {
+test('runtime contract disables legacy daily cap elevation', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   assert.throws(
-    () => value.task.approveAggressiveDailyEntryCap({ confirm: true, approval: `${mod.DAILY_ENTRY_CAP_5_APPROVAL} ` }),
-    /exact_daily_entry_cap/,
+    () => value.task.approveAggressiveDailyEntryCap({ confirm: true, approval: mod.DAILY_ENTRY_CAP_5_APPROVAL }),
+    /daily_entry_cap_managed_by_runtime_contract/,
   );
-
-  const state = value.task.approveAggressiveDailyEntryCap({
-    confirm: true,
-    approval: mod.DAILY_ENTRY_CAP_5_APPROVAL,
-    invokedBy: 'operator',
-  });
-
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 5);
-  assert.equal(
-    state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash,
-    mod.DAILY_ENTRY_CAP_5_APPROVAL_HASH,
-  );
-  assert.equal(JSON.stringify(state).includes(mod.DAILY_ENTRY_CAP_5_APPROVAL), false);
+  const state = value.task.status();
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
 });
 
 test('order output count is aggregate evidence and does not impose a daily cap', async () => {
@@ -1855,27 +1850,26 @@ test('order output count is aggregate evidence and does not impose a daily cap',
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 4);
 });
 
-test('daily cap five attestation reaches the KIS invocation', async () => {
+test('order attestation persists the runtime contract daily cap', async () => {
   let value;
   value = await active({ execFile(command, args, options, callback) {
     if (args.includes('vps-autonomous-order')) {
       const files = fs.readdirSync(value.paths.orderAttestationDir);
       assert.equal(files.length, 1);
       const attestation = JSON.parse(fs.readFileSync(path.join(value.paths.orderAttestationDir, files[0]), 'utf8'));
-      assert.equal(attestation.daily_entry_cap, 5);
-      assert.equal(attestation.daily_entry_cap_approval_hash, mod.DAILY_ENTRY_CAP_5_APPROVAL_HASH);
+      assert.equal(attestation.daily_entry_cap, null);
+      assert.equal(attestation.daily_entry_cap_approval_hash, null);
       callback(null, orderGood('no_op', { daily_entry_count: 5 }));
     } else callback(null, good(args[args.indexOf('--task-id') + 1]));
   } });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.task.approveAggressiveDailyEntryCap({ confirm: true, approval: mod.DAILY_ENTRY_CAP_5_APPROVAL });
   const due = value.task.status().tasks[mod.TASKS[4].id].next_run_at;
   value.setClock(due);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, 5);
+  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 5);
 });
 
@@ -2080,10 +2074,10 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     decisions: 10, intraday_decisions: 3,
   }), mod.TASKS[1].id, trading), /intraday_output_contract/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
-    quote_api_calls: 11,
+    quote_api_calls: 21,
   }), mod.TASKS[1].id, trading), /unsafe/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[0].id, 'success', {
-    quote_api_calls: 4,
+    quote_api_calls: 21,
   }), mod.TASKS[0].id, trading), /unsafe/);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
@@ -2132,12 +2126,12 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
     failure_phase: 'quote_request', failure_symbol: '035420', failure_exception_type: 'TimeoutError',
-    failure_errno: 110, failure_attempt_number: 10,
+    failure_errno: 110, failure_attempt_number: 20,
   }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
     failure_phase: 'quote_request', failure_symbol: '035420', failure_exception_type: 'TimeoutError',
-    failure_errno: 110, failure_attempt_number: 11,
+    failure_errno: 110, failure_attempt_number: 21,
   }), mod.TASKS[1].id, trading), /invalid_failure_evidence/);
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'no_candidates_no_op', api_calls: 0, order_api_calls: 0,
@@ -2233,14 +2227,15 @@ test('missed slot is not executed but advances so the next slot runs once', asyn
   assert.equal(calls, 1);
 });
 
-test('active filesystem lock prevents duplicate child execution without overwriting state', async () => {
+test('active filesystem lock persistently pauses without duplicate child execution', async () => {
   let calls = 0;
   const value = await active({ execFile(c, a, o, cb) { calls += 1; cb(null, good(mod.TASKS[0].id)); } });
   const release = mod.acquireExclusiveLock(value.paths.runLockPath);
   value.setClock('2026-07-21T00:00:17Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:17Z') });
-  assert.equal(calls, 0); assert.equal(state.state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
+  assert.equal(calls, 0); assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'scheduler_lock_active');
+  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
   release();
 });
 
@@ -2295,7 +2290,7 @@ test('supervisor timeout notification identifies automatic safety checks', async
 
 test('task parser failures preserve the exact sanitized error class', async () => {
   const value = await active({ execFile(c, a, o, cb) {
-    cb(null, good(a[a.indexOf('--task-id') + 1], 'success', { quote_api_calls: 11 }));
+    cb(null, good(a[a.indexOf('--task-id') + 1], 'success', { quote_api_calls: 21 }));
   } });
   const due = new Date('2026-07-21T00:10:00Z');
   value.setClock(due);
@@ -2746,6 +2741,7 @@ test('independent task instances acquire one exclusive state-fault notification 
   });
   const peer = mod.createKisAiMarketOpenDryRunTask({
     ...value.paths,
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
     reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
   });
   fs.writeFileSync(value.paths.statePath, '{');
@@ -3172,7 +3168,7 @@ test('one-minute safety monitor uses the existing manager, never calls LLM, and 
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
-test('VPS daily-loss risk blocks entries without pausing supervision or learning', async () => {
+test('VPS account-risk state persistently pauses scheduling', async () => {
   const value = await active({
     schedulerRegistered: true,
     safetyOutput: safetyOutput('blocked', {
@@ -3184,51 +3180,12 @@ test('VPS daily-loss risk blocks entries without pausing supervision or learning
 
   const state = await value.task.tick();
 
-  assert.equal(state.state, 'ACTIVE');
-  assert.equal(Object.values(state.tasks).every((item) => item.state !== 'PAUSED'), true);
-  assert.equal(state.last_safety_monitor.status, 'success');
-  assert.equal(state.last_safety_monitor.account_risk_status, 'active');
-  assert.equal(state.last_safety_monitor.entry_blocked, true);
-  assert.equal(state.last_safety_monitor.entry_block_reason, 'daily_loss_limit_reached');
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'account_risk_status_active');
+  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
-test('active reconciliation is recovered once and verified before scheduling continues', async () => {
-  let recoveryCalls = 0;
-  const options = {
-    schedulerRegistered: true,
-    safetyOutput: safetyOutput('blocked', {
-      reconciliation_status: 'active', error_class: 'reconciliation_status_active',
-    }),
-    execFile(command, args, execOptions, callback) {
-      if (args.includes('reconcile-paused')) {
-        recoveryCalls += 1;
-        assert.deepEqual(args.slice(-4), [
-          'reconcile-paused', '--confirm', '--approval',
-          'APPROVE_KIS_HERMES_VPS_RECONCILIATION_RECOVERY_V1',
-        ]);
-        options.safetyOutput = safetyOutput();
-        callback(null, orderGood('success', {
-          action_type: 'reconciliation_recovered', reconciliations: 1,
-        }));
-        return;
-      }
-      callback(null, good(args[args.indexOf('--task-id') + 1]));
-    },
-  };
-  const value = await active(options);
-  value.setClock('2026-07-21T00:01:00Z');
-
-  const state = await value.task.tick();
-
-  assert.equal(recoveryCalls, 1);
-  assert.equal(state.state, 'ACTIVE');
-  assert.equal(state.last_safety_monitor.status, 'success');
-  assert.equal(state.last_safety_monitor.reconciliation_status, 'clear');
-  assert.equal(state.last_safety_monitor.reconciliation_recovery_attempted, true);
-  assert.equal(state.last_safety_monitor.reconciliation_recovery_succeeded, true);
-});
-
-test('failed reconciliation recovery pauses once without retrying an order', async () => {
+test('active reconciliation persistently pauses without automatic recovery', async () => {
   let recoveryCalls = 0;
   const value = await active({
     schedulerRegistered: true,
@@ -3238,10 +3195,6 @@ test('failed reconciliation recovery pauses once without retrying an order', asy
     execFile(command, args, execOptions, callback) {
       if (args.includes('reconcile-paused')) {
         recoveryCalls += 1;
-        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
-          error_class: 'reconciliation_recovery_failed',
-        }));
-        return;
       }
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
@@ -3250,9 +3203,9 @@ test('failed reconciliation recovery pauses once without retrying an order', asy
 
   const state = await value.task.tick();
 
-  assert.equal(recoveryCalls, 1);
+  assert.equal(recoveryCalls, 0);
   assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'reconciliation_recovery_failed');
+  assert.equal(state.pause_reason, 'reconciliation_status_active');
 });
 
 test('one transient safety monitor failure blocks the minute and a second consecutive failure pauses all tasks', async () => {
@@ -3553,4 +3506,72 @@ test('failed automatic risk-off is not retried and records sanitized blocker', a
   assert.equal(emergencyCalls, 1);
   assert.equal(state.state, 'PAUSED');
   assert.equal(state.pause_reason, 'emergency_open_buy_cancel_unconfirmed');
+});
+
+test('runtime contract is required for production construction and governs slot, quote, and position limits', () => {
+  assert.throws(() => mod.loadRuntimeContract('/missing/runtime-contract.json'), /runtime_contract_unavailable/);
+  assert.equal(mod.REQUIRED_RUNTIME_CONTRACT.slot_review_limit, 20);
+  assert.equal(mod.REQUIRED_RUNTIME_CONTRACT.quote_api_calls_per_slot, 20);
+  assert.equal(mod.REQUIRED_RUNTIME_CONTRACT.max_open_positions, 5);
+  assert.equal(mod.REQUIRED_RUNTIME_CONTRACT.daily_entry_cap, null);
+  const sourcePath = process.env.KIS_RUNTIME_CONTRACT_MANIFEST_PATH;
+  assert.ok(sourcePath);
+  const sourceManifest = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-runtime-contract-'));
+  const manifestPath = path.join(root, 'adaptive_ai_dry_run_strategy_v1.json');
+  fs.writeFileSync(manifestPath, JSON.stringify(sourceManifest));
+  assert.deepEqual(mod.loadRuntimeContract(manifestPath), mod.REQUIRED_RUNTIME_CONTRACT);
+  delete sourceManifest.manifest_hash;
+  fs.writeFileSync(manifestPath, JSON.stringify(sourceManifest));
+  assert.throws(() => mod.loadRuntimeContract(manifestPath), /runtime_contract_manifest_hash_mismatch/);
+  sourceManifest.manifest_hash = '0'.repeat(64);
+  fs.writeFileSync(manifestPath, JSON.stringify(sourceManifest));
+  assert.throws(() => mod.loadRuntimeContract(manifestPath), /runtime_contract_manifest_hash_mismatch/);
+});
+
+test('error policy preserves unknown safe classes without recovery and sanitizes secret-like detail', () => {
+  assert.equal(mod.sanitizeErrorClass('future_safe_error'), 'future_safe_error');
+  assert.equal(mod.ERROR_POLICY.future_safe_error, undefined);
+  for (const errorClass of [
+    'model_v3_post_close_promotion_forbidden',
+    'hermes_scheduler_attestation_unavailable',
+    'order_action_not_allowed_for_schedule_slot',
+    'order_submission_unknown',
+    'reconciliation_status_active',
+    'account_risk_status_active',
+    'scheduler_lock_active',
+  ]) {
+    assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
+    assert.equal(mod.ERROR_POLICY[errorClass].persistent, true);
+    assert.equal(mod.ERROR_POLICY[errorClass].autoRepair, false);
+    assert.equal(mod.ERROR_POLICY[errorClass].autoResume, false);
+  }
+  assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
+  assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
+  assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
+});
+
+test('LLM timeout degrades one order slot without a same-slot order invocation', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    llmExecutor: async () => { throw new Error('llm_response_timeout'); },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'llm_response_timeout');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  value.setClock(nextDueAt);
+  const nextState = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
+  assert.equal(nextState.state, 'ACTIVE');
+  assert.equal(nextState.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(nextState.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
+  assert.equal(orderRuns, 0);
 });
