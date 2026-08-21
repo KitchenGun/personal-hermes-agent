@@ -138,7 +138,7 @@ const DISCORD_ERROR_CLASSES = new Set([
   'order_action_not_allowed_for_schedule_slot', 'daily_entry_cap_attestation_mismatch',
   'model_v3_artifact_attestation_mismatch', 'pending_order_reconciliation',
   'balance_mismatch', 'order_not_fully_filled', 'order_submission_unknown',
-  'invalid_order_output_contract', 'existing_open_orders', 'daily_entry_cap_reached',
+  'invalid_order_output_contract', 'unsafe_order_count', 'existing_open_orders', 'daily_entry_cap_reached',
   'same_symbol_reentry_cap_reached', 'daily_loss_limit_reached',
   'position_notional_limit_exceeded', ...TRANSIENT_TRANSPORT_ERRORS,
   'llm_verdict_contract_unavailable', 'llm_response_timeout', 'invalid_ai_verdict',
@@ -596,7 +596,7 @@ function parseKisVpsAutonomousOutput(
   ];
   if (counts.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)
     || value.order_api_calls > 1 || value.vps_live_orders > 1 || value.prod_orders !== 0
-    || value.reconciliations > 1 || value.open_positions > 1) {
+    || value.reconciliations > 1 || value.open_positions > 3) {
     throw new Error('unsafe_order_count');
   }
   const booleans = [
