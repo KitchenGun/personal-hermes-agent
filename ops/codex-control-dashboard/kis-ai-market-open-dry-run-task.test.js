@@ -787,8 +787,11 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   assert.equal(parsed.actionType, 'entry_reconciled');
   assert.equal(parsed.orderApiCalls, 1);
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
-    action_type: 'ai_position_held', open_positions: 1,
+    action_type: 'ai_position_held', open_positions: 3,
   })));
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    action_type: 'ai_position_held', open_positions: 4,
+  })), /unsafe_order_count/);
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v2',
   })));
@@ -2169,6 +2172,7 @@ test('post-close runtime failure preserves its sanitized cause instead of maskin
 
 test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
   assert.equal(mod.sanitizeErrorClass('daily_entry_cap_attestation_mismatch'), 'daily_entry_cap_attestation_mismatch');
+  assert.equal(mod.sanitizeErrorClass('unsafe_order_count'), 'unsafe_order_count');
   for (const errorClass of [
     'invalid_report_message',
     'model_v3_refresh_failed',
