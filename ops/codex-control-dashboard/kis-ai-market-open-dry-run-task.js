@@ -99,6 +99,10 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['http_transport_failed', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
   ['response_read_failed', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
   ['database_busy', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
+  ['tls_failed', {}],
+  ['quote_api_failed', {}],
+  ['local_file_io_failed', { autoRepair: true, resumable: true }],
+  ['unknown_runtime_io_failed', {}],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
@@ -1501,13 +1505,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       orderTask.daily_entry_cap = runtimeContract.daily_entry_cap;
       orderTask.daily_entry_cap_approval_hash = null;
       Object.assign(orderTask, INTRADAY_PROVIDER_ATTESTATION);
+      if (orderTask.state === 'ACTIVE') delete value.order_pause_reason;
       return value;
     } catch (error) {
       if (error.code === 'ENOENT') return disabledState();
       throw new Error('state_unavailable');
     }
   }
-  function save(value) { atomicWrite(statePath, value); return value; }
+  function save(value) {
+    if (value.tasks?.[ORDER_TASK.id]?.state === 'ACTIVE') delete value.order_pause_reason;
+    atomicWrite(statePath, value);
+    return value;
+  }
   function stateUnavailableStatus() {
     return { ...disabledState(), state: 'PAUSED', pause_reason: 'state_unavailable', scheduler_faulted: true };
   }
