@@ -1352,31 +1352,6 @@ test('post-close refresh rejects artifact promotion and hash drift', async () =>
   }
 });
 
-test.skip('post-close activation waiting artifact guard remains retired', async () => {
-  for (const failure of ['artifact', 'window']) {
-    const value = await active({
-      activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
-      activationCheckOutput: orderGood('blocked', {
-        error_class: 'model_v3_prediction_batch_incomplete',
-      }),
-    });
-    if (failure === 'artifact') {
-      const state = value.task.status();
-      state.tasks[mod.TASKS[4].id].activation_artifact_hash = 'b'.repeat(64);
-      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
-      value.setClock('2026-07-21T04:42:00Z');
-    } else {
-      value.setClock('2026-07-21T07:21:00Z');
-    }
-
-    await assert.rejects(
-      value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
-      failure === 'artifact' ? /artifact_attestation_mismatch/ : /post_close_arm_window_unavailable/,
-    );
-    assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'DISABLED');
-  }
-});
-
 test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
   for (const pauseReason of [
     'decision_context_failed',
@@ -1766,63 +1741,6 @@ test('artifact hash drift pauses only the order task', async () => {
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
 });
 
-test.skip('legacy order-task post-close promotion is retired', async () => {
-  const value = await active({ execFile(command, args, options, callback) {
-    if (args.includes('vps-autonomous-order')) {
-      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
-      else callback(null, orderGood('success', {
-        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
-        previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
-      }));
-    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
-  } });
-  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const stateBefore = value.task.status();
-  const orderTask = stateBefore.tasks[mod.TASKS[4].id];
-  orderTask.next_run_at = '2026-07-21T07:20:00.000Z';
-  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
-  value.setClock('2026-07-21T07:20:00.000Z');
-
-  const state = await value.task.runOnce({
-    taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00.000Z'),
-  });
-
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.artifact_promoted, true);
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.previous_artifact_hash, 'a'.repeat(64));
-  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
-});
-
-test.skip('legacy order-task post-close promotion guard is retired', async () => {
-  const value = await active({ execFile(command, args, options, callback) {
-    if (args.includes('vps-autonomous-order')) {
-      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
-      else callback(null, orderGood('success', {
-        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
-        previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
-      }));
-    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
-  } });
-  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const stateBefore = value.task.status();
-  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
-  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
-  value.setClock('2026-07-21T00:15:00.000Z');
-
-  const state = await value.task.runOnce({
-    taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T00:15:00.000Z'),
-  });
-
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_promotion_outside_post_close_slot');
-  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
-  assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap_approval_hash, null);
-});
-
 test('runtime contract disables legacy daily cap elevation', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
@@ -1871,32 +1789,6 @@ test('order attestation persists the runtime contract daily cap', async () => {
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].daily_entry_cap, null);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.daily_entry_count, 5);
-});
-
-test.skip('legacy post-close promotion attestation is retired', async () => {
-  const value = await active({ execFile(command, args, options, callback) {
-    if (args.includes('vps-autonomous-order')) {
-      if (args.includes('activation-check')) callback(null, orderGood('success', { action_type: 'activation_check' }));
-      else callback(null, orderGood('success', {
-        action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
-        previous_artifact_hash: 'c'.repeat(64), artifact_hash: 'b'.repeat(64),
-      }));
-    } else callback(null, good(args[args.indexOf('--task-id') + 1]));
-  } });
-  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const stateBefore = value.task.status();
-  stateBefore.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
-  fs.writeFileSync(value.paths.statePath, JSON.stringify(stateBefore));
-  value.setClock('2026-07-21T07:20:00.000Z');
-
-  const state = await value.task.runOnce({
-    taskId: mod.TASKS[4].id,
-    dueAt: new Date('2026-07-21T07:20:00.000Z'),
-  });
-
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_artifact_attestation_mismatch');
-  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
 });
 
 test('legacy four-task state migrates order task as disabled', async () => {
