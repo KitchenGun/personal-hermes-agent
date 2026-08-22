@@ -3533,6 +3533,20 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.sanitizeErrorClass('future_safe_error'), 'future_safe_error');
   assert.equal(mod.ERROR_POLICY.future_safe_error, undefined);
   for (const errorClass of [
+    'tls_failed',
+    'quote_api_failed',
+    'local_file_io_failed',
+    'unknown_runtime_io_failed',
+  ]) {
+    assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
+    assert.ok(mod.ERROR_POLICY[errorClass]);
+  }
+  assert.equal(mod.ERROR_POLICY.tls_failed.autoRepair, false);
+  assert.equal(mod.ERROR_POLICY.quote_api_failed.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.local_file_io_failed.autoRepair, true);
+  assert.equal(mod.ERROR_POLICY.local_file_io_failed.resumable, true);
+  assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.autoRepair, false);
+  for (const errorClass of [
     'model_v3_post_close_promotion_forbidden',
     'hermes_scheduler_attestation_unavailable',
     'order_action_not_allowed_for_schedule_slot',
@@ -3550,6 +3564,45 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
   assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
+});
+
+test('active order task drops a stale root order pause reason', async () => {
+  const value = await active();
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  state.order_pause_reason = 'unsafe_order_count';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(value.task.status().order_pause_reason, undefined);
+  value.setClock('2026-07-21T00:01:00Z');
+  await value.task.tick();
+  const persisted = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(persisted.order_pause_reason, undefined);
+});
+
+test('local file failure reports its exact class and queues one bounded repair', async () => {
+  const repairs = []; const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    repairTaskSender: async (incident) => {
+      repairs.push(incident);
+      return { queued: true, task_id: 't_local_file_repair' };
+    },
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('blocked'), { code: 2 }), good(
+        args[args.indexOf('--task-id') + 1],
+        'blocked',
+        { error_class: 'local_file_io_failed' },
+      ));
+    },
+  });
+  const due = value.task.status().tasks[mod.TASKS[0].id].next_run_at;
+  const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
+  assert.equal(state.pause_reason, 'local_file_io_failed');
+  assert.equal(repairs.length, 1);
+  assert.equal(repairs[0].errorClass, 'local_file_io_failed');
+  assert.match(sent[0].content, /원인: local_file_io_failed/);
+  assert.equal(state.last_error_notification.retry, false);
 });
 
 test('LLM timeout degrades one order slot without a same-slot order invocation', async () => {
