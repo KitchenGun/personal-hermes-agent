@@ -145,6 +145,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['post_close_shadow_process_error', { autoRepair: true }],
   ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true }],
   ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true }],
+  ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true }],
   ['order_submission_unknown', { persistent: true, orderRecovery: true }],
   ['reconciliation_status_active', { persistent: true, resumable: true }],
   ['scheduler_lock_active', { persistent: true }],

@@ -3203,19 +3203,19 @@ test('a paused transient safety failure auto-resumes all previously activated ta
   assert.equal(recovered.catch_up, false);
 });
 
-test('a paused open-order outage auto-resumes only after a clear safety monitor', async () => {
+for (const pauseReason of ['open_order_status_unavailable', 'open_order_status_active']) test(`a paused ${pauseReason} auto-resumes only after a clear safety monitor`, async () => {
   const value = await active({ schedulerRegistered: true, safetyOutput: safetyOutput() });
   const current = value.task.status();
   const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
     ...item,
     state: 'PAUSED',
     next_run_at: null,
-    pause_reason: 'open_order_status_unavailable',
+    pause_reason: pauseReason,
   }]));
   fs.writeFileSync(value.paths.statePath, JSON.stringify({
     ...current,
     state: 'PAUSED',
-    pause_reason: 'open_order_status_unavailable',
+    pause_reason: pauseReason,
     order_activated_at: '2026-07-21T00:00:00.000Z',
     tasks,
   }));
@@ -3227,6 +3227,40 @@ test('a paused open-order outage auto-resumes only after a clear safety monitor'
   assert.equal(recovered.resume_reason, 'safety_monitor_auto_recovered');
   assert.equal(Object.values(recovered.tasks).every((item) => item.state === 'ACTIVE'), true);
   assert.equal(recovered.last_safety_monitor.status, 'success');
+});
+
+test('an active broker order stays paused until a later safety monitor reports clear', async () => {
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      open_order_status: 'active', error_class: 'open_order_status_active',
+    }),
+  };
+  const value = await active(options);
+  const current = value.task.status();
+  const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
+    ...item, state: 'PAUSED', next_run_at: null, pause_reason: 'open_order_status_active',
+  }]));
+  fs.writeFileSync(value.paths.statePath, JSON.stringify({
+    ...current,
+    state: 'PAUSED',
+    pause_reason: 'open_order_status_active',
+    order_activated_at: '2026-07-21T00:00:00.000Z',
+    tasks,
+  }));
+
+  value.setClock('2026-07-21T00:01:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.state, 'PAUSED');
+  assert.equal(held.last_safety_monitor.error_class, 'open_order_status_active');
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:02:00Z');
+  const recovered = await value.task.tick();
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.resume_reason, 'safety_monitor_auto_recovered');
+  assert.equal(recovered.retry, false);
+  assert.equal(recovered.catch_up, false);
 });
 
 test('provider timeout stays fail-closed without pausing or running tasks', async () => {
