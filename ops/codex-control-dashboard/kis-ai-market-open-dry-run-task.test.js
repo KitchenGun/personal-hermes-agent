@@ -1357,6 +1357,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'decision_context_failed',
     'intraday_position_signal_missing',
     'llm_response_timeout',
+    'llm_candidate_limit_exceeded',
     'http_transport_failed',
     'balance_mismatch',
     'order_not_fully_filled',
