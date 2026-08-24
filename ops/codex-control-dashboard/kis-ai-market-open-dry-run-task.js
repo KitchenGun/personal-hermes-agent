@@ -86,6 +86,17 @@ const AI_REASON_CODES = new Set([
   'DATA_QUALITY', 'MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH', 'EVENT_RISK',
   'RISK_REDUCTION', 'EXIT_SIGNAL', 'OVERNIGHT_THESIS', 'NO_EDGE', 'CONFLICTING_SIGNALS',
 ]);
+const AI_REASON_LABELS = Object.freeze({
+  DATA_QUALITY: '데이터 품질 확인',
+  MOMENTUM_CONFIRMATION: '상승 흐름 확인',
+  RELATIVE_STRENGTH: '시장·동종 종목 대비 강세',
+  EVENT_RISK: '뉴스·공시 위험',
+  RISK_REDUCTION: '위험 축소',
+  EXIT_SIGNAL: '상승 동력 약화',
+  OVERNIGHT_THESIS: '다음 거래일까지 보유 근거',
+  NO_EDGE: '뚜렷한 우위 없음',
+  CONFLICTING_SIGNALS: '신호가 엇갈림',
+});
 const TIMEZONE = 'Asia/Seoul';
 const CANONICAL_TASK_ID = 'kis-ai-market-open-dry-run-v1';
 const TASK_OWNER = 'hermes';
@@ -758,11 +769,12 @@ function buildOrderLifecycleMessage(parsed) {
   const quantity = parsed.lifecycleStatus === 'partial_fill'
     ? `${parsed.filledQuantity}/${parsed.requestedQuantity}주`
     : `${parsed.filledQuantity || parsed.requestedQuantity}주`;
+  const reasons = parsed.decisionReasonCodes.map((code) => AI_REASON_LABELS[code]);
   return [
     '[KIS AI 모의투자]',
     `주문: ${side} ${parsed.orderSymbol} ${quantity}`,
     `상태: ${status}`,
-    `AI 판단: ${parsed.decisionReasonCodes.join(', ') || '규칙 기반 보호 청산'}`,
+    `판단 근거: ${reasons.join(', ') || '규칙 기반 보호 청산'}`,
   ].join('\n');
 }
 
