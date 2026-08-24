@@ -2878,7 +2878,7 @@ test('order lifecycle notification is once-only and delivery failure never retri
     reconciliations: 1, open_positions: 1, daily_entry_count: 1,
     order_symbol: '035720', order_side: 'buy', requested_quantity: 3,
     filled_quantity: 3, unfilled_quantity: 0, lifecycle_status: 'filled',
-    decision_reason_codes: ['MOMENTUM_CONFIRMATION'],
+    decision_reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
     notification_idempotency_key: notificationKey,
   });
   const value = await active({
@@ -2892,6 +2892,8 @@ test('order lifecycle notification is once-only and delivery failure never retri
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_succeeded, false);
   assert.equal(sent[0].idempotencyKey, notificationKey);
   assert.match(sent[0].content, /매수 035720 3주/);
+  assert.match(sent[0].content, /판단 근거: 상승 흐름 확인, 시장·동종 종목 대비 강세/);
+  assert.doesNotMatch(sent[0].content, /MOMENTUM_CONFIRMATION|RELATIVE_STRENGTH/);
   value.setClock('2026-07-21T00:20:00Z');
   state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:20:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
