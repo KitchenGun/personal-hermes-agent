@@ -101,6 +101,7 @@ const TIMEZONE = 'Asia/Seoul';
 const CANONICAL_TASK_ID = 'kis-ai-market-open-dry-run-v1';
 const TASK_OWNER = 'hermes';
 const KRX_SYMBOL_RE = /^\d{6}$/;
+const ORDER_NAME_RE = /^[\p{L}\p{N} .&()+-]{1,60}$/u;
 const LEGACY_WATCHLIST_SYMBOLS = Object.freeze(['005930', '000660', '005380']);
 const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['dns_failed', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
@@ -280,7 +281,7 @@ const ORDER_OUTPUT_KEYS = new Set([
   'intraday_mode', 'intraday_model_version',
   'decision_provider', 'intraday_feature_version', 'intraday_policy_version',
   'intraday_feature_hash', 'intraday_policy_hash',
-  'order_symbol', 'order_side', 'requested_quantity', 'filled_quantity',
+  'order_symbol', 'order_name', 'order_side', 'requested_quantity', 'filled_quantity',
   'unfilled_quantity', 'lifecycle_status', 'decision_reason_codes',
   'notification_idempotency_key',
 ]);
@@ -684,6 +685,7 @@ function parseKisVpsAutonomousOutput(
     throw new Error('invalid_order_artifact_reuse');
   }
   if (!(value.order_symbol === null || KRX_SYMBOL_RE.test(String(value.order_symbol)))
+    || !(value.order_name === null || (typeof value.order_name === 'string' && ORDER_NAME_RE.test(value.order_name)))
     || !(value.order_side === null || ['buy', 'sell'].includes(value.order_side))
     || !(value.lifecycle_status === null
       || ['submitted', 'accepted', 'partial_fill', 'filled', 'cancelled', 'liquidated', 'unknown'].includes(value.lifecycle_status))
@@ -738,6 +740,7 @@ function parseKisVpsAutonomousOutput(
     shadowPredictionsInserted: value.shadow_predictions_inserted,
     shadowDuplicatesSkipped: value.shadow_duplicates_skipped,
     orderSymbol: value.order_symbol,
+    orderName: value.order_name,
     orderSide: value.order_side,
     requestedQuantity: value.requested_quantity,
     filledQuantity: value.filled_quantity,
@@ -769,10 +772,13 @@ function buildOrderLifecycleMessage(parsed) {
   const quantity = parsed.lifecycleStatus === 'partial_fill'
     ? `${parsed.filledQuantity}/${parsed.requestedQuantity}주`
     : `${parsed.filledQuantity || parsed.requestedQuantity}주`;
+  const symbol = parsed.orderName
+    ? `${parsed.orderName}(${parsed.orderSymbol})`
+    : `종목명 미확인(${parsed.orderSymbol})`;
   const reasons = parsed.decisionReasonCodes.map((code) => AI_REASON_LABELS[code]);
   return [
     '[KIS AI 모의투자]',
-    `주문: ${side} ${parsed.orderSymbol} ${quantity}`,
+    `주문: ${side} ${symbol} ${quantity}`,
     `상태: ${status}`,
     `판단 근거: ${reasons.join(', ') || '규칙 기반 보호 청산'}`,
   ].join('\n');
