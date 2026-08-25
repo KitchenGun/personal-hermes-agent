@@ -2383,7 +2383,7 @@ test('exact IO resume keeps a VPS daily-loss entry block while restoring supervi
     safetyOutput: safetyOutput('blocked', {
       execution_owner: 'vps',
       account_risk_status: 'active',
-      error_class: 'account_risk_status_active',
+      error_class: 'daily_loss_entry_blocked',
     }),
   });
   const paused = value.task.status();
@@ -3402,6 +3402,106 @@ test('safety monitor preserves a sanitized blocker returned with fail-closed exi
   assert.equal(state.state, 'PAUSED');
   assert.equal(state.pause_reason, 'account_risk_status_active');
   assert.equal(state.pause_reason === 'process_error', false);
+});
+
+test('VPS daily loss blocks entries without pausing supervision or position management', async () => {
+  let notifications = 0;
+  let orderRuns = 0;
+  const error = Object.assign(new Error('Command failed'), { code: 2, killed: false });
+  const value = await active({
+    schedulerRegistered: true,
+    reportSender: async () => { notifications += 1; return { discord_sent: true }; },
+    safetyError: error,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps', account_risk_status: 'active',
+      error_class: 'daily_loss_entry_blocked',
+    }),
+    decisionContextOutput(dueKey) {
+      const held = JSON.parse(decisionContext(dueKey, ['005930']));
+      Object.assign(held.candidates[0], { role: 'held_position', review_tier: 'position' });
+      held.holdings = [{ symbol: '005930', quantity: 2 }];
+      held.risk_aggregate.open_positions = 1;
+      return JSON.stringify(held);
+    },
+    llmExecutor: async ({ packet }) => aiVerdict(packet, [{
+      symbol: '005930', action: 'HOLD', target_weight_pct: 0,
+      confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+    }]),
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op', { action_type: 'ai_position_held', open_positions: 1 }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = '2026-07-21T00:10:00.000Z';
+  const scheduled = value.task.status();
+  for (const task of mod.TASKS) scheduled.tasks[task.id].next_run_at = '2026-07-21T23:59:00.000Z';
+  scheduled.tasks[mod.TASKS[4].id].next_run_at = dueAt;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(scheduled));
+  value.setClock(dueAt);
+
+  const state = await value.task.tick();
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.last_safety_monitor.error_class, 'daily_loss_entry_blocked');
+  assert.equal(state.last_safety_monitor.fail_closed, true);
+  assert.equal(state.consecutive_safety_monitor_failures, 0);
+  assert.equal(notifications, 0);
+  assert.equal(orderRuns, 1);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'ai_position_held');
+});
+
+test('VPS daily loss rejects a mixed-slot entry without pausing later position management', async () => {
+  let orderRuns = 0;
+  const error = Object.assign(new Error('Command failed'), { code: 2, killed: false });
+  const value = await active({
+    safetyError: error,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps', account_risk_status: 'active',
+      error_class: 'daily_loss_entry_blocked',
+    }),
+    decisionContextOutput(dueKey) {
+      const mixed = JSON.parse(decisionContext(dueKey, ['005930', '000660']));
+      Object.assign(mixed.candidates[0], { role: 'held_position', review_tier: 'position' });
+      mixed.holdings = [{ symbol: '005930', quantity: 2 }];
+      mixed.risk_aggregate.open_positions = 1;
+      return JSON.stringify(mixed);
+    },
+    llmExecutor: async ({ packet }) => aiVerdict(packet, [
+      {
+        symbol: '005930', action: 'HOLD', target_weight_pct: 0,
+        confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+      },
+      {
+        symbol: '000660', action: 'ENTER', target_weight_pct: 20,
+        confidence_bucket: 'high', reason_codes: ['MOMENTUM_CONFIRMATION'],
+      },
+    ]),
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(error, orderGood('blocked', { error_class: 'daily_loss_limit_reached', open_positions: 1 }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = '2026-07-21T00:10:00.000Z';
+  const scheduled = value.task.status();
+  for (const task of mod.TASKS) scheduled.tasks[task.id].next_run_at = '2026-07-21T23:59:00.000Z';
+  scheduled.tasks[mod.TASKS[4].id].next_run_at = dueAt;
+  scheduled.tasks[mod.TASKS[4].id].consecutive_transport_failures = 1;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(scheduled));
+  value.setClock(dueAt);
+
+  const state = await value.task.tick();
+
+  assert.equal(orderRuns, 1);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'daily_loss_limit_reached');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_api_calls, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:20:00\.000Z$/);
 });
 
 test('MDD safety block performs one automatic risk-off reconciliation before persistent pause', async () => {

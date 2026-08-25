@@ -157,6 +157,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['runtime_unhandled_error', { resumable: true }],
   ['unsafe_output', { resumable: true }],
   ['account_risk_status_active', { persistent: true, resumable: true }],
+  ['daily_loss_entry_blocked', { resumable: true }],
   ['intraday_universe_invalid', { resumable: true }],
   ['invalid_failure_evidence', { resumable: true }],
   ['balance_mismatch', { orderRecovery: true }],
@@ -410,6 +411,16 @@ function loadRuntimeContract(
     throw new Error('runtime_contract_manifest_hash_mismatch');
   }
   return normalizeRuntimeContract(manifest.runtime_contract);
+}
+
+function isVpsDailyLossEntryBlock(result) {
+  return result?.execution_owner === 'vps'
+    && result.error_class === 'daily_loss_entry_blocked'
+    && result.process_lock === 'clear'
+    && result.kill_state === 'clear'
+    && result.open_order_status === 'clear'
+    && result.reconciliation_status === 'clear'
+    && result.account_risk_status === 'active';
 }
 
 function processFailureEvidence(error, stderr) {
@@ -1860,7 +1871,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const safety = parseSafetyMonitorOutput(safetyRun.stdout);
       const vpsDailyLossEntryBlock = safety.status === 'blocked'
         && safety.execution_owner === 'vps'
-        && safety.error_class === 'account_risk_status_active'
+        && ['account_risk_status_active', 'daily_loss_entry_blocked'].includes(safety.error_class)
         && safety.process_lock === 'clear'
         && safety.kill_state === 'clear'
         && safety.open_order_status === 'clear'
@@ -2441,6 +2452,27 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         });
       }
       const postNotificationState = task.kind === 'order' ? loadStrict() : latest;
+      const dailyLossEntryOnlyBlock = task.kind === 'order'
+        && !postCloseRefresh
+        && parsed.status === 'blocked'
+        && parsed.failClosed
+        && parsed.errorClass === 'daily_loss_limit_reached'
+        && parsed.orderApiCalls === 0
+        && parsed.vpsLiveOrders === 0
+        && parsed.reconciliations === 0
+        && parsed.orderSymbol === null;
+      if (dailyLossEntryOnlyBlock) {
+        const postNotificationTask = postNotificationState.tasks[taskId];
+        return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
+          ...postNotificationTask,
+          state: 'ACTIVE',
+          pause_reason: undefined,
+          consecutive_transport_failures: 0,
+          pending_invocation: null,
+          next_run_at: nextRunAt(task, dueTime),
+          last_run: lastRun,
+        } } });
+      }
       if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseForTask(postNotificationState, parsed.errorClass || 'blocked', lastRun);
       if (task.kind === 'order') {
         const postNotificationTask = postNotificationState.tasks[taskId];
@@ -2506,6 +2538,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         error_class: safeText(result.error_class, 80),
       });
       if (result.status === 'blocked') {
+        if (isVpsDailyLossEntryBlock(result)) {
+          return save({
+            ...current,
+            consecutive_safety_monitor_failures: 0,
+            last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true },
+          });
+        }
         const emergencyRequired = new Set(['mdd_liquidation_required', 'kill_switch_liquidation_required']);
         if (emergencyRequired.has(result.error_class)) {
           if (typeof emergencyStopExecutor !== 'function') throw new Error('emergency_stop_executor_missing');
@@ -2606,7 +2645,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (current.state === 'ACTIVE') {
         current = await runSafetyMonitor(current, time);
         if (current.state !== 'ACTIVE') return current;
-        if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success') return current;
+        if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
+          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) return current;
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= time.getTime()) {
