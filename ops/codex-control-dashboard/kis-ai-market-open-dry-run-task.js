@@ -116,7 +116,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['local_file_io_failed', { autoRepair: true, resumable: true }],
   ['unknown_runtime_io_failed', {}],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
-  ['llm_position_decision_missing', { slotDegradeOnly: true }],
+  ['llm_position_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],

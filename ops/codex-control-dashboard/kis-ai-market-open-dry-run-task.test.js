@@ -3505,6 +3505,7 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   }
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
   assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
