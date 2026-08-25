@@ -2754,6 +2754,7 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.equal(packet.candidates.length, 2);
   assert.deepEqual(packet.candidates.map((item) => item.review_tier), ['primary', 'primary']);
   assert.equal(packet.decision_contract.minimum_vps_entry_decisions, 0);
+  assert.deepEqual(packet.decision_contract.required_position_symbols, []);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
     reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
@@ -2766,6 +2767,18 @@ test('AI verdict packet and response enforce the fixed model and decision contra
     symbol: '005380', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
   }]), packet), /invalid_ai_verdict/);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet), packet));
+  const held = JSON.parse(decisionContext(slotId, ['005930', '000660']));
+  Object.assign(held.candidates[0], { role: 'held_position', review_tier: 'position' });
+  held.holdings = [{ symbol: '005930', quantity: 2 }];
+  held.risk_aggregate.open_positions = 1;
+  const heldContext = mod.parseDecisionContextOutput(JSON.stringify(held), slotId);
+  const heldPacket = mod.buildSanitizedAiPacket({ slotId, context: heldContext });
+  assert.deepEqual(heldPacket.decision_contract.required_position_symbols, ['005930']);
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(heldPacket), heldPacket), /llm_position_decision_missing/);
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
+    symbol: '005930', action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'medium',
+    reason_codes: ['NO_EDGE'],
+  }]), heldPacket));
   assert.throws(
     () => mod.parseDecisionContextOutput(decisionContext(slotId, ['005930'], 1), slotId),
     /invalid_decision_context/,
@@ -3491,6 +3504,7 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
     assert.equal(mod.ERROR_POLICY[errorClass].autoResume, false);
   }
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
   assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
@@ -3556,5 +3570,31 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(nextState.state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
+  assert.equal(orderRuns, 0);
+});
+
+test('missing held-position decision degrades one slot without invoking KIS orders', async () => {
+  let orderRuns = 0;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const held = JSON.parse(decisionContext(slotId, ['005930', '000660']));
+  Object.assign(held.candidates[0], { role: 'held_position', review_tier: 'position' });
+  held.holdings = [{ symbol: '005930', quantity: 2 }];
+  held.risk_aggregate.open_positions = 1;
+  const value = await active({
+    decisionContextOutput: JSON.stringify(held),
+    llmExecutor: async ({ packet }) => aiVerdict(packet),
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'llm_position_decision_missing');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(orderRuns, 0);
 });
