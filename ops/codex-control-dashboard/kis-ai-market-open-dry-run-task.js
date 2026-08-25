@@ -116,6 +116,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['local_file_io_failed', { autoRepair: true, resumable: true }],
   ['unknown_runtime_io_failed', {}],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
+  ['llm_position_decision_missing', { slotDegradeOnly: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
@@ -839,6 +840,9 @@ function buildSanitizedAiPacket({ slotId, context, runtimeContract = REQUIRED_RU
       max_candidates: runtimeContract.slot_review_limit,
       target_weight_pct: { minimum: 0, maximum: 50, non_enter: 0 },
       minimum_vps_entry_decisions: context.risk_aggregate.minimum_vps_entry_decisions,
+      required_position_symbols: candidates
+        .filter((item) => item.role === 'held_position')
+        .map((item) => item.symbol),
     },
   };
   const promptHash = crypto.createHash('sha256').update(JSON.stringify(packet)).digest('hex');
@@ -871,6 +875,9 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
       throw new Error('invalid_ai_verdict');
     }
     symbols.add(decision.symbol);
+  }
+  if (packet.decision_contract.required_position_symbols.some((symbol) => !symbols.has(symbol))) {
+    throw new Error('llm_position_decision_missing');
   }
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(serialized)) {
