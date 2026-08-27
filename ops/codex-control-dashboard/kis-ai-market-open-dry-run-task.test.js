@@ -390,6 +390,15 @@ async function active(options = {}) {
   return value;
 }
 
+function markOrderActive(value) {
+  const state = value.task.status();
+  state.order_activated_at = '2026-07-21T00:00:00.000Z';
+  state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  state.tasks[mod.TASKS[4].id].pause_reason = undefined;
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+}
+
 test('exact activation approval enables four dry-run schedules and keeps order disabled', async () => {
   const value = fixture();
   value.task.prepareDisabled();
@@ -507,7 +516,8 @@ test('post-close candidate refresh preserves an exact fail-closed blocker', asyn
   const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
   const lastRun = after.tasks[mod.TASKS[2].id].last_run;
 
-  assert.equal(after.state, 'PAUSED');
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
   assert.equal(lastRun.model_v3_candidate_refresh_status, 'blocked');
   assert.equal(lastRun.model_v3_candidate_refresh_fail_closed, true);
   assert.equal(lastRun.model_v3_candidate_refresh_error_class, 'model_v3_prediction_batch_incomplete');
@@ -1540,7 +1550,7 @@ test('blocked autonomous order pauses only the order task and leaves dry-run tas
   assert.equal(sent.length, 1);
   assert.equal(sent[0].targetChannelId, mod.REPORT_TARGET_CHANNEL_ID);
   assert.equal(sent[0].deliveryLayer, 'hermes_ai_market_open_error');
-  assert.match(sent[0].content, /^\[KIS 자동운영 보호 중단\]/);
+  assert.match(sent[0].content, /^\[KIS 자동운영 기능 제한\]/);
   assert.match(sent[0].content, /작업: AI 자동매매/);
   assert.match(sent[0].content, /원인: safe_block/);
   assert.match(sent[0].content, /자동 재시도: 없음/);
@@ -1600,7 +1610,8 @@ test('unexpected KIS child exit preserves sanitized evidence for self-heal witho
   const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
   const lastRun = after.tasks[mod.TASKS[2].id].last_run;
 
-  assert.equal(after.pause_reason, 'process_error');
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[2].id].pause_reason, 'process_error');
   assert.equal(repairs.length, 1);
   assert.deepEqual(repairs[0], {
     notificationKey: after.last_error_notification.key,
@@ -1691,7 +1702,9 @@ test('blocked dry-run attempts one alert and preserves the original pause when d
   value.setClock(due);
   const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
   assert.equal(runs, 1); assert.equal(sends, 1);
-  assert.equal(state.state, 'PAUSED'); assert.equal(state.pause_reason, 'safe_block');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[0].id].pause_reason, 'safe_block');
   assert.equal(state.last_error_notification.attempted, true);
   assert.equal(state.last_error_notification.succeeded, false);
   assert.equal(state.last_error_notification.retry, false);
@@ -1871,7 +1884,7 @@ test('server polling survives DISABLED state and adopts later CLI activation', a
 });
 
 
-test('fail-closed pause keeps status polling alive for explicit recovery', async () => {
+test('task-scoped pause keeps status polling and peer tasks active', async () => {
   const callbacks = [];
   let cleared = 0;
   const value = await active({
@@ -1888,7 +1901,9 @@ test('fail-closed pause keeps status polling alive for explicit recovery', async
     dueAt: new Date('2026-07-21T00:00:00Z'),
   });
 
-  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
   assert.equal(cleared, 0);
   assert.equal(callbacks.length, 1);
 });
@@ -2055,8 +2070,9 @@ test('post-close runtime failure preserves its sanitized cause instead of maskin
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: due });
 
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'runtime_unhandled_error');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[2].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[2].id].pause_reason, 'runtime_unhandled_error');
   assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_phase, 'post_close_learning');
   assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_exception_type, 'RuntimeError');
 });
@@ -2150,7 +2166,7 @@ test('stale filesystem lock pauses visibly without deleting the lock', async () 
   fs.unlinkSync(value.paths.runLockPath);
 });
 
-test('invalid output, blocked result, and timeout pause all tasks without retry', async () => {
+test('invalid output and blocked result pause only the failing task while one timeout degrades once', async () => {
   for (const behavior of ['unsafe', 'blocked', 'timeout']) {
     let calls = 0;
     const value = await active({ execFile(c, a, o, cb) {
@@ -2161,8 +2177,9 @@ test('invalid output, blocked result, and timeout pause all tasks without retry'
     } });
     value.setClock('2026-07-21T00:00:11Z');
     const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:00:11Z') });
-    assert.equal(calls, 1); assert.equal(state.state, 'PAUSED');
-    assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+    assert.equal(calls, 1); assert.equal(state.state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[0].id].state, behavior === 'timeout' ? 'ACTIVE' : 'PAUSED');
+    assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
     assert.equal(fs.existsSync(value.paths.runLockPath), false);
   }
 });
@@ -2193,7 +2210,9 @@ test('task parser failures preserve the exact sanitized error class', async () =
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: due });
 
-  assert.equal(state.pause_reason, 'unsafe_output');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[1].id].pause_reason, 'unsafe_output');
   assert.equal(state.tasks[mod.TASKS[1].id].last_run.error_class, 'unsafe_output');
 });
 
@@ -2220,8 +2239,9 @@ test('one transient database busy no-op stays active, success resets, and consec
   assert.equal(state.state, 'ACTIVE');
   value.setClock('2026-07-21T00:40:00Z');
   state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:40:00Z') });
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
 });
 
 test('one transient supervisor read failure stays active and preserves peer schedules', async () => {
@@ -2255,9 +2275,10 @@ test('one transient supervisor read failure stays active and preserves peer sche
     taskId: mod.TASKS[0].id,
     dueAt: new Date('2026-07-22T00:00:00Z'),
   });
-  assert.equal(paused.state, 'PAUSED');
-  assert.equal(paused.pause_reason, 'http_transport_failed');
-  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(paused.state, 'ACTIVE');
+  assert.equal(paused.tasks[mod.TASKS[0].id].state, 'PAUSED');
+  assert.equal(paused.tasks[mod.TASKS[0].id].pause_reason, 'http_transport_failed');
+  assert.equal(paused.tasks[mod.TASKS[1].id].state, 'ACTIVE');
 });
 
 test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
@@ -2701,8 +2722,9 @@ test('daily report rejects unapproved symbols, price details, and mismatched fac
     });
     value.setClock('2026-07-21T07:30:29Z');
     const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:29Z') });
-    assert.equal(state.state, 'PAUSED');
-    assert.equal(state.pause_reason, 'invalid_report_message');
+    assert.equal(state.state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[3].id].state, 'PAUSED');
+    assert.equal(state.tasks[mod.TASKS[3].id].pause_reason, 'invalid_report_message');
     assert.equal(sends, 1);
     assert.equal(state.last_error_notification.succeeded, true);
   }
@@ -2735,7 +2757,7 @@ test('daily report accepts bounded no-ledger and estimated-pnl variants', async 
   }
 });
 
-test('report failure pauses all tasks and never retries the KIS cycle', async () => {
+test('report failure pauses only reporting and never retries the KIS cycle', async () => {
   let sends = 0; let runs = 0;
   const value = await active({
     reportSender: async () => { sends += 1; throw new Error('private detail'); },
@@ -2743,7 +2765,9 @@ test('report failure pauses all tasks and never retries the KIS cycle', async ()
   });
   value.setClock('2026-07-21T07:30:00Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:00Z') });
-  assert.equal(sends, 1); assert.equal(runs, 1); assert.equal(state.state, 'PAUSED');
+  assert.equal(sends, 1); assert.equal(runs, 1); assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[3].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
   assert.equal(state.last_error_notification.attempted, false);
   assert.equal(state.last_error_notification.succeeded, false);
 });
@@ -3064,41 +3088,78 @@ test('mismatched AI verdict blocks before KIS execution without fallback', async
   assert.equal(fs.existsSync(value.paths.verdictDir), false);
 });
 
-test('one-minute safety monitor uses the existing manager, never calls LLM, and pauses on blocked status', async () => {
+test('one-minute safety monitor keeps supervision active and pauses only orders on a non-global block', async () => {
   let llmCalls = 0;
   const value = await active({
     schedulerRegistered: true,
     llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
     safetyOutput: safetyOutput('blocked', { process_lock: 'active' }),
   });
+  markOrderActive(value);
   value.setClock('2026-07-21T00:01:00Z');
   const state = await value.task.tick();
   assert.equal(llmCalls, 0);
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'safe_block');
-  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'safe_block');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
 });
 
-test('VPS account-risk state persistently pauses scheduling', async () => {
-  const value = await active({
+test('VPS account-risk state pauses new orders while supervision remains active', async () => {
+  const options = {
     schedulerRegistered: true,
     safetyOutput: safetyOutput('blocked', {
       execution_owner: 'vps', account_risk_status: 'active',
       error_class: 'account_risk_status_active',
     }),
-  });
+  };
+  const value = await active(options);
+  markOrderActive(value);
   value.setClock('2026-07-21T00:01:00Z');
 
   const state = await value.task.tick();
 
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'account_risk_status_active');
-  assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:02:00Z');
+  const recovered = await value.task.tick();
+  assert.equal(recovered.state, 'ACTIVE');
+  assert.equal(recovered.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(recovered.tasks[mod.TASKS[4].id].pause_reason, undefined);
+  assert.equal(recovered.retry, false);
+  assert.equal(recovered.catch_up, false);
+});
+
+test('prod account-risk state remains paused after a clear monitor', async () => {
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'prod', account_risk_status: 'active',
+      error_class: 'account_risk_status_active',
+    }),
+  };
+  const value = await active(options);
+  markOrderActive(value);
+  value.setClock('2026-07-21T00:01:00Z');
+  const paused = await value.task.tick();
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:02:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.state, 'ACTIVE');
+  assert.equal(held.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(held.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
 });
 
 test('active reconciliation runs one bounded recovery and verifies clear safety state', async () => {
   let recoveryCalls = 0;
   let safetyCalls = 0;
+  let orderCalls = 0;
   const value = await active({
     schedulerRegistered: true,
     safetyOutput() {
@@ -3117,19 +3178,32 @@ test('active reconciliation runs one bounded recovery and verifies clear safety 
         }));
         return;
       }
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) {
+        orderCalls += 1;
+        callback(null, orderGood());
+        return;
+      }
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
   });
-  value.setClock('2026-07-21T00:01:00Z');
+  markOrderActive(value);
+  value.setClock('2026-07-21T00:10:00Z');
 
   const state = await value.task.tick();
 
   assert.equal(recoveryCalls, 1);
   assert.equal(safetyCalls, 2);
+  assert.equal(orderCalls, 0);
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.last_safety_monitor.status, 'success');
   assert.equal(state.last_safety_monitor.reconciliation_recovery_attempted, true);
   assert.equal(state.last_safety_monitor.reconciliation_recovery_succeeded, true);
+  assert.equal(state.last_safety_monitor.order_slot_deferred, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T00:20:00.000Z');
+
+  value.setClock('2026-07-21T00:20:00Z');
+  await value.task.tick();
+  assert.equal(orderCalls, 1);
 });
 
 test('failed reconciliation recovery pauses without retrying', async () => {
@@ -3150,14 +3224,22 @@ test('failed reconciliation recovery pauses without retrying', async () => {
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
   });
+  markOrderActive(value);
   value.setClock('2026-07-21T00:00:00Z');
 
   const state = await value.task.tick();
 
   assert.equal(recoveryCalls, 1);
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'pending_reconciliation_not_found');
-  assert.equal(state.tasks[mod.TASKS[0].id].last_run.reconciliation_recovery_attempted, true);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'pending_reconciliation_not_found');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.reconciliation_recovery_attempted, true);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  const held = await value.task.tick();
+  assert.equal(recoveryCalls, 1);
+  assert.equal(held.state, 'ACTIVE');
+  assert.equal(held.tasks[mod.TASKS[4].id].state, 'PAUSED');
 });
 
 test('reconciliation recovery keeps scheduling paused when safety verification remains blocked', async () => {
@@ -3186,19 +3268,22 @@ test('reconciliation recovery keeps scheduling paused when safety verification r
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
   });
+  markOrderActive(value);
   value.setClock('2026-07-21T00:00:00Z');
 
   const state = await value.task.tick();
 
   assert.equal(recoveryCalls, 1);
   assert.equal(safetyCalls, 2);
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'account_risk_status_active');
-  assert.equal(state.tasks[mod.TASKS[0].id].last_run.reconciliation_recovery_succeeded, true);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.reconciliation_recovery_succeeded, true);
 });
 
-test('one transient safety monitor failure blocks the minute and a second consecutive failure pauses all tasks', async () => {
+test('repeated transient safety failure pauses only new orders', async () => {
   let taskRuns = 0;
+  let repairs = 0;
   const options = {
     schedulerRegistered: true,
     safetyOutput: safetyOutput('blocked', {
@@ -3208,8 +3293,10 @@ test('one transient safety monitor failure blocks the minute and a second consec
       taskRuns += 1;
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
+    repairTaskSender: async () => { repairs += 1; return { task_id: 'repair' }; },
   };
   const value = await active(options);
+  markOrderActive(value);
 
   value.setClock('2026-07-21T00:01:00Z');
   const held = await value.task.tick();
@@ -3217,6 +3304,8 @@ test('one transient safety monitor failure blocks the minute and a second consec
   assert.equal(held.last_safety_monitor.status, 'blocked');
   assert.equal(held.last_safety_monitor.error_class, 'safety_monitor_failed');
   assert.equal(held.consecutive_safety_monitor_failures, 1);
+  assert.equal(held.last_self_heal, undefined);
+  assert.equal(repairs, 0);
   assert.equal(taskRuns, 0);
 
   options.safetyOutput = safetyOutput('blocked', {
@@ -3224,10 +3313,12 @@ test('one transient safety monitor failure blocks the minute and a second consec
   });
   value.setClock('2026-07-21T00:02:00Z');
   const paused = await value.task.tick();
-  assert.equal(paused.state, 'PAUSED');
-  assert.equal(paused.pause_reason, 'process_error');
+  assert.equal(paused.state, 'ACTIVE');
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(paused.tasks[mod.TASKS[4].id].pause_reason, 'process_error');
   assert.equal(paused.consecutive_safety_monitor_failures, 2);
-  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => paused.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(repairs, 1);
   assert.equal(taskRuns, 0);
 });
 
@@ -3244,6 +3335,7 @@ test('a clear monitor after one transient failure resumes future scheduling with
     },
   };
   const value = await active(options);
+  markOrderActive(value);
 
   value.setClock('2026-07-21T00:01:00Z');
   const held = await value.task.tick();
@@ -3330,6 +3422,7 @@ test('an active broker order stays paused until a later safety monitor reports c
     }),
   };
   const value = await active(options);
+  markOrderActive(value);
   const current = value.task.status();
   const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
     ...item, state: 'PAUSED', next_run_at: null, pause_reason: 'open_order_status_active',
@@ -3376,7 +3469,7 @@ test('provider timeout stays fail-closed without pausing or running tasks', asyn
   assert.equal(taskRuns, 0);
 });
 
-test('open-order read outage holds orders for four minutes and pauses on the fifth', async () => {
+test('open-order read outage holds tasks for four minutes and then pauses only new orders', async () => {
   let taskRuns = 0;
   let notifications = 0;
   const options = {
@@ -3394,6 +3487,7 @@ test('open-order read outage holds orders for four minutes and pauses on the fif
     },
   };
   const value = await active(options);
+  markOrderActive(value);
 
   for (let minute = 1; minute <= 4; minute += 1) {
     value.setClock(`2026-07-21T00:0${minute}:00Z`);
@@ -3406,10 +3500,11 @@ test('open-order read outage holds orders for four minutes and pauses on the fif
 
   value.setClock('2026-07-21T00:05:00Z');
   const paused = await value.task.tick();
-  assert.equal(paused.state, 'PAUSED');
-  assert.equal(paused.pause_reason, 'open_order_status_unavailable');
+  assert.equal(paused.state, 'ACTIVE');
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(paused.tasks[mod.TASKS[4].id].pause_reason, 'open_order_status_unavailable');
   assert.equal(paused.consecutive_safety_monitor_failures, 5);
-  assert.equal(Object.values(paused.tasks).every((item) => item.state === 'PAUSED'), true);
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => paused.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(notifications, 1);
   assert.equal(taskRuns, 0);
 });
@@ -3422,6 +3517,7 @@ test('open-order read outage recovers automatically before its bounded limit', a
     }),
   };
   const value = await active(options);
+  markOrderActive(value);
 
   value.setClock('2026-07-21T00:01:00Z');
   await value.task.tick();
@@ -3438,7 +3534,7 @@ test('open-order read outage recovers automatically before its bounded limit', a
   assert.equal(recovered.consecutive_safety_monitor_failures, 0);
 });
 
-test('mixed safety failures retain the existing two-failure pause threshold', async () => {
+test('mixed safety failures retain the threshold but pause only new orders', async () => {
   let notifications = 0;
   const options = {
     schedulerRegistered: true,
@@ -3451,6 +3547,7 @@ test('mixed safety failures retain the existing two-failure pause threshold', as
     },
   };
   const value = await active(options);
+  markOrderActive(value);
 
   value.setClock('2026-07-21T00:01:00Z');
   const first = await value.task.tick();
@@ -3461,8 +3558,9 @@ test('mixed safety failures retain the existing two-failure pause threshold', as
   });
   value.setClock('2026-07-21T00:02:00Z');
   const paused = await value.task.tick();
-  assert.equal(paused.state, 'PAUSED');
-  assert.equal(paused.pause_reason, 'open_order_status_unavailable');
+  assert.equal(paused.state, 'ACTIVE');
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(paused.tasks[mod.TASKS[4].id].pause_reason, 'open_order_status_unavailable');
   assert.equal(paused.consecutive_safety_monitor_failures, 2);
   assert.equal(notifications, 1);
 });
@@ -3477,11 +3575,13 @@ test('safety monitor preserves a sanitized blocker returned with fail-closed exi
       error_class: 'account_risk_status_active',
     }),
   });
+  markOrderActive(value);
   value.setClock('2026-07-21T00:01:00Z');
   const state = await value.task.tick();
-  assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'account_risk_status_active');
-  assert.equal(state.pause_reason === 'process_error', false);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason === 'process_error', false);
 });
 
 test('VPS daily loss blocks entries without pausing supervision or position management', async () => {
@@ -3605,7 +3705,7 @@ test('MDD safety block performs one automatic risk-off reconciliation before per
   assert.equal(emergencyCalls, 1);
   assert.equal(state.state, 'PAUSED');
   assert.equal(state.pause_reason, 'mdd_liquidation_required');
-  assert.equal(state.last_safety_monitor, undefined);
+  assert.equal(state.last_safety_monitor.error_class, 'mdd_liquidation_required');
   assert.equal(state.tasks[mod.TASKS[0].id].last_run.emergency_reconciliation_passed, true);
 });
 
@@ -3681,8 +3781,16 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
     assert.equal(mod.sanitizeErrorClass(errorClass), errorClass);
     assert.equal(mod.ERROR_POLICY[errorClass].persistent, true);
     assert.equal(mod.ERROR_POLICY[errorClass].autoRepair, false);
-    assert.equal(mod.ERROR_POLICY[errorClass].autoResume, false);
   }
+  assert.equal(mod.ERROR_POLICY.reconciliation_status_active.autoResume, true);
+  assert.equal(mod.ERROR_POLICY.account_risk_status_active.autoResume, true);
+  assert.equal(mod.ERROR_POLICY.scheduler_lock_active.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.scheduler_lock_active.scope, 'global');
+  assert.equal(mod.ERROR_POLICY.scheduler_state_fault.persistent, true);
+  assert.equal(mod.ERROR_POLICY.scheduler_lock_failed.scope, 'global');
+  assert.equal(mod.ERROR_POLICY.model_v1_must_be_paused.scope, 'global');
+  assert.equal(mod.ERROR_POLICY.model_v2_must_be_paused.scope, 'global');
+  assert.equal(mod.ERROR_POLICY.open_order_status_active.scope, 'order');
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.orderRecovery, true);
@@ -3723,7 +3831,8 @@ test('local file failure reports its exact class and queues one bounded repair',
   });
   const due = value.task.status().tasks[mod.TASKS[0].id].next_run_at;
   const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date(due) });
-  assert.equal(state.pause_reason, 'local_file_io_failed');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].pause_reason, 'local_file_io_failed');
   assert.equal(repairs.length, 1);
   assert.equal(repairs[0].errorClass, 'local_file_io_failed');
   assert.match(sent[0].content, /원인: local_file_io_failed/);
