@@ -118,7 +118,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_position_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
-  ['scheduler_state_fault', { autoRepair: true }],
+  ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
   ['process_error', { autoRepair: true, resumable: true, safetyAwait: true }],
   ['database_file_io_failed', { autoRepair: true, resumable: true }],
@@ -144,19 +144,30 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['model_v3_artifact_verify_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['scheduled_shadow_refresh_slot_invalid', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['post_close_shadow_process_error', { autoRepair: true }],
-  ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true }],
-  ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true }],
-  ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true }],
+  ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
+  ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
+  ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['order_submission_unknown', { persistent: true, orderRecovery: true }],
-  ['reconciliation_status_active', { persistent: true, resumable: true, orderRecovery: true }],
-  ['scheduler_lock_active', { persistent: true }],
-  ['scheduler_owner_lock_active', { persistent: true }],
+  ['reconciliation_status_active', { persistent: true, resumable: true, autoResume: true, orderRecovery: true, scope: 'order' }],
+  ['scheduler_lock_active', { persistent: true, scope: 'global' }],
+  ['scheduler_lock_stale', { persistent: true, scope: 'global' }],
+  ['scheduler_lock_failed', { persistent: true, scope: 'global' }],
+  ['scheduler_owner_lock_active', { persistent: true, scope: 'global' }],
+  ['scheduler_owner_lock_failed', { persistent: true, scope: 'global' }],
+  ['scheduler_owner_lock_invalid', { persistent: true, scope: 'global' }],
+  ['scheduler_owner_lock_stale', { persistent: true, scope: 'global' }],
+  ['scheduler_owner_lock_release_failed', { persistent: true, scope: 'global' }],
+  ['legacy_run_lock_active', { persistent: true, scope: 'global' }],
+  ['model_v1_state_unavailable', { persistent: true, scope: 'global' }],
+  ['model_v1_must_be_paused', { persistent: true, scope: 'global' }],
+  ['model_v2_state_unavailable', { persistent: true, scope: 'global' }],
+  ['model_v2_must_be_paused', { persistent: true, scope: 'global' }],
   ['model_v3_post_close_promotion_forbidden', { persistent: true }],
   ['hermes_scheduler_attestation_unavailable', { persistent: true, orderRecovery: true }],
   ['order_action_not_allowed_for_schedule_slot', { persistent: true }],
   ['runtime_unhandled_error', { resumable: true }],
   ['unsafe_output', { resumable: true }],
-  ['account_risk_status_active', { persistent: true, resumable: true }],
+  ['account_risk_status_active', { persistent: true, resumable: true, autoResume: true, scope: 'order' }],
   ['daily_loss_entry_blocked', { resumable: true }],
   ['intraday_universe_invalid', { resumable: true }],
   ['invalid_failure_evidence', { resumable: true }],
@@ -172,8 +183,13 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['pending_reconciliation_evidence_invalid', { persistent: true, orderRecovery: true }],
   ['risk_guard_blocked', { orderRecovery: true }],
   ['model_v3_artifact_attestation_mismatch', { orderRecovery: true }],
+  ['mdd_liquidation_required', { persistent: true, scope: 'global' }],
+  ['kill_switch_liquidation_required', { persistent: true, scope: 'global' }],
 
-].map(([errorClass, policy]) => [errorClass, Object.freeze({ visible: true, autoRepair: false, autoResume: false, transient: false, persistent: false, ...policy })])));
+].map(([errorClass, policy]) => [errorClass, Object.freeze({
+  visible: true, autoRepair: false, autoResume: false, transient: false, persistent: false,
+  scope: 'task', ...policy,
+})])));
 const TRANSIENT_TRANSPORT_ERRORS = new Set(Object.entries(ERROR_POLICY)
   .filter(([, policy]) => policy.transient).map(([errorClass]) => errorClass));
 const TRANSIENT_SAFETY_MONITOR_ERRORS = new Set(Object.entries(ERROR_POLICY)
@@ -1641,25 +1657,31 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }));
     return { ...current, state: 'PAUSED', pause_reason: reason, scheduler_registered: false, server_registered: false, tasks };
   }
-  function pauseOrder(current, reason, lastRun) {
-    const prior = current.tasks[ORDER_TASK.id];
+  function pauseTask(current, taskId, reason, lastRun) {
+    const prior = current.tasks[taskId];
     return {
       ...current,
-      order_pause_reason: reason,
       tasks: {
         ...current.tasks,
-        [ORDER_TASK.id]: {
+        [taskId]: {
           ...prior,
           state: 'PAUSED',
           pause_reason: reason,
           next_run_at: null,
           last_run: lastRun,
-          pending_invocation: null,
+          ...(TASK_BY_ID.get(taskId)?.kind === 'order' ? { pending_invocation: null } : {}),
         },
       },
     };
   }
-  async function notifyPause(pausedState, taskId, reason, lastRun, { sendAllowed = true } = {}) {
+  function pauseOrder(current, reason, lastRun) {
+    const paused = pauseTask(current, ORDER_TASK.id, reason, lastRun);
+    return {
+      ...paused,
+      order_pause_reason: reason,
+    };
+  }
+  async function notifyPause(pausedState, taskId, reason, lastRun, { sendAllowed = true, transientOnly = false } = {}) {
     const errorClass = sanitizeErrorClass(reason);
     const taskState = pausedState.tasks?.[taskId];
     const notificationKey = crypto.createHash('sha256').update([
@@ -1683,16 +1705,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         claimed_at: now().toISOString(),
       },
     });
-    const selfHeal = await queueSelfHeal(notificationKey, taskId, errorClass, lastRun);
+    const selfHeal = transientOnly
+      ? { queued: false, skipped: true, reason: 'transient_slot_no_op' }
+      : await queueSelfHeal(notificationKey, taskId, errorClass, lastRun);
 
+    const globalPause = pausedState.state === 'PAUSED';
+    const orderPause = taskId === ORDER_TASK.id;
     const content = [
-      '[KIS 자동운영 보호 중단]',
+      transientOnly ? '[KIS 자동운영 일시 지연]' : (globalPause ? '[KIS 자동운영 보호 중단]' : '[KIS 자동운영 기능 제한]'),
       `작업: ${TASK_ALERT_LABELS.get(taskId) || 'KIS 자동운영'}`,
-      '상태: 보호 중단',
+      `상태: ${transientOnly ? '해당 슬롯 건너뜀' : (globalPause ? '전체 보호 중단' : (orderPause ? '신규 주문 중단' : '해당 기능 중단'))}`,
       `원인: ${errorClass || 'unknown_error'}`,
       '자동 재시도: 없음',
-      '신규 주문: 중단',
-      `자동 복구: ${taskId === TASKS[0].id && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(errorClass)
+      `신규 주문: ${transientOnly ? '추가 실행 없음' : (globalPause || orderPause ? '중단' : '안전 조건에 따라 계속')}`,
+      `자동 복구: ${transientOnly
+        ? (taskId === TASKS[0].id ? '안전 확인 자동 진행 중' : '다음 정규 실행에서 재확인')
+        : (taskId === TASKS[0].id || orderPause) && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(errorClass)
         ? '안전 확인 자동 진행 중'
         : (selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요')}`,
     ].join('\n');
@@ -1713,8 +1741,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     try {
       const latest = loadStrict();
       const latestTask = latest.tasks?.[taskId];
-      if (latestTask?.state !== 'PAUSED' || latestTask.pause_reason !== reason
-        || latest.last_error_notification?.key !== notificationKey) return latest;
+      const stateMatches = transientOnly
+        ? latestTask?.state === 'ACTIVE' && latestTask.last_run?.completed_at === lastRun?.completed_at
+        : latestTask?.state === 'PAUSED' && latestTask.pause_reason === reason;
+      if (!stateMatches || latest.last_error_notification?.key !== notificationKey) return latest;
       return save({
         ...latest,
         last_error_notification: {
@@ -2111,8 +2141,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE') return current;
     const pauseForTask = async (state, reason, lastRun, options) => {
       try {
+        const policy = ERROR_POLICY[sanitizeErrorClass(reason)] || {};
+        const paused = policy.scope === 'global'
+          ? pauseAll(state, taskId, reason, lastRun)
+          : task.kind === 'order'
+            ? pauseOrder(state, reason, lastRun)
+            : pauseTask(state, taskId, reason, lastRun);
         return await notifyPause(
-          task.kind === 'order' ? pauseOrder(state, reason, lastRun) : pauseAll(state, taskId, reason, lastRun),
+          paused,
           taskId,
           reason,
           lastRun,
@@ -2129,7 +2165,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
       lastRun.consecutive_transport_failures = consecutive;
       if (consecutive >= 2) return pauseForTask(state, reason, lastRun);
-      return save({ ...state, tasks: { ...state.tasks, [taskId]: {
+      const degraded = save({ ...state, tasks: { ...state.tasks, [taskId]: {
         ...latestTask,
         state: 'ACTIVE',
         pause_reason: undefined,
@@ -2137,6 +2173,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         last_run: lastRun,
         ...(task.kind === 'order' ? { pending_invocation: null } : {}),
       } } });
+      return notifyPause(degraded, taskId, reason, lastRun, { transientOnly: true });
     };
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
@@ -2277,14 +2314,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const { error, stdout, stderr } = await execute(command);
       if (error && Number(error.code) !== 2) {
         const errorClass = error.killed ? 'timeout' : 'process_error';
-        return pauseForTask(loadStrict(), errorClass, {
+        const lastRun = {
           invoked_by: safeText(invokedBy),
           started_at: startedAt,
           completed_at: now().toISOString(),
           error_class: errorClass,
           fail_closed: true,
           ...processFailureEvidence(error, stderr),
-        });
+        };
+        if (TRANSIENT_TRANSPORT_ERRORS.has(errorClass)) {
+          return handleTransientFailure(loadStrict(), errorClass, lastRun);
+        }
+        return pauseForTask(loadStrict(), errorClass, lastRun);
       }
       let parsed;
       try {
@@ -2541,6 +2582,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
       capture(result);
       if (result.status === 'blocked' && result.error_class === 'reconciliation_status_active') {
+        if (last?.reconciliation_status === 'active'
+          && last.reconciliation_recovery_attempted === true
+          && last.reconciliation_recovery_succeeded !== true) {
+          throw new Error(last.error_class || 'reconciliation_status_active');
+        }
         const recoveryRun = await execute(buildReconciliationRecoveryCommand());
         monitorRun.reconciliation_recovery_attempted = true;
         if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('process_error');
@@ -2618,15 +2664,48 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           },
         });
       }
-      const paused = pauseAll(
-        { ...current, consecutive_safety_monitor_failures: consecutiveFailures },
-        TASKS[0].id,
-        reason,
-        { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason },
-      );
-      return notifyPause(paused, TASKS[0].id, reason, paused.tasks[TASKS[0].id].last_run);
+      const lastRun = { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason };
+      const monitored = {
+        ...current,
+        consecutive_safety_monitor_failures: consecutiveFailures,
+        last_safety_monitor: lastRun,
+      };
+      const globalPause = ERROR_POLICY[reason]?.scope === 'global' || reason.startsWith('emergency_');
+      if (!globalPause && monitored.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') return save(monitored);
+      const paused = globalPause
+        ? pauseAll(monitored, TASKS[0].id, reason, lastRun)
+        : pauseOrder(monitored, reason, lastRun);
+      const notificationTaskId = globalPause ? TASKS[0].id : ORDER_TASK.id;
+      return notifyPause(paused, notificationTaskId, reason, paused.tasks[notificationTaskId].last_run);
     }
-    return save({ ...current, consecutive_safety_monitor_failures: 0, last_safety_monitor: monitorRun });
+    const orderTask = current.tasks[ORDER_TASK.id];
+    const resumeOrder = current.order_activated_at
+      && orderTask?.state === 'PAUSED'
+      && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(orderTask.pause_reason)
+      && (orderTask.pause_reason !== 'account_risk_status_active'
+        || orderTask.last_run?.execution_owner === 'vps');
+    const deferRecoveredOrder = monitorRun.reconciliation_recovery_succeeded === true
+      && orderTask?.state === 'ACTIVE';
+    const updateOrder = resumeOrder || deferRecoveredOrder;
+    return save({
+      ...current,
+      ...(resumeOrder ? { order_pause_reason: undefined } : {}),
+      consecutive_safety_monitor_failures: 0,
+      last_safety_monitor: deferRecoveredOrder
+        ? { ...monitorRun, order_slot_deferred: true }
+        : monitorRun,
+      tasks: updateOrder ? {
+        ...current.tasks,
+        [ORDER_TASK.id]: {
+          ...orderTask,
+          state: resumeOrder ? 'ACTIVE' : orderTask.state,
+          pause_reason: resumeOrder ? undefined : orderTask.pause_reason,
+          next_run_at: nextRunAt(orderTask.refresh_only_pending ? REFRESH_ONLY_ORDER_TASK : ORDER_TASK, checkedAt),
+          consecutive_transport_failures: 0,
+          pending_invocation: null,
+        },
+      } : current.tasks,
+    });
   }
   async function tick() {
     if (enforceSchedulerOwnership && typeof releaseSchedulerOwnership !== 'function') {
