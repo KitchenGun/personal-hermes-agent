@@ -299,7 +299,9 @@ function fixture(options = {}) {
   const taskExec = options.execFile || ((c, a, o, cb) => cb(null, good(a[a.indexOf('--task-id') + 1])));
   const execFile = (command, args, execOptions, callback) => {
     if (args.includes('safety-monitor')) {
-      callback(options.safetyError || null, options.safetyOutput || safetyOutput());
+      callback(options.safetyError || null, typeof options.safetyOutput === 'function'
+        ? options.safetyOutput()
+        : options.safetyOutput || safetyOutput());
       return;
     }
     if (args.includes('decision-context')) {
@@ -3094,7 +3096,43 @@ test('VPS account-risk state persistently pauses scheduling', async () => {
   assert.equal(Object.values(state.tasks).every((item) => item.state === 'PAUSED'), true);
 });
 
-test('active reconciliation persistently pauses without automatic recovery', async () => {
+test('active reconciliation runs one bounded recovery and verifies clear safety state', async () => {
+  let recoveryCalls = 0;
+  let safetyCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput() {
+      safetyCalls += 1;
+      return safetyCalls === 1
+        ? safetyOutput('blocked', {
+          reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+        })
+        : safetyOutput();
+    },
+    execFile(command, args, execOptions, callback) {
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        callback(null, orderGood('success', {
+          action_type: 'reconciliation_recovered', reconciliations: 1,
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(safetyCalls, 2);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.last_safety_monitor.status, 'success');
+  assert.equal(state.last_safety_monitor.reconciliation_recovery_attempted, true);
+  assert.equal(state.last_safety_monitor.reconciliation_recovery_succeeded, true);
+});
+
+test('failed reconciliation recovery pauses without retrying', async () => {
   let recoveryCalls = 0;
   const value = await active({
     schedulerRegistered: true,
@@ -3104,17 +3142,59 @@ test('active reconciliation persistently pauses without automatic recovery', asy
     execFile(command, args, execOptions, callback) {
       if (args.includes('reconcile-paused')) {
         recoveryCalls += 1;
+        callback(null, orderGood('blocked', {
+          error_class: 'pending_reconciliation_not_found',
+        }));
+        return;
       }
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
   });
-  value.setClock('2026-07-21T00:01:00Z');
+  value.setClock('2026-07-21T00:00:00Z');
 
   const state = await value.task.tick();
 
-  assert.equal(recoveryCalls, 0);
+  assert.equal(recoveryCalls, 1);
   assert.equal(state.state, 'PAUSED');
-  assert.equal(state.pause_reason, 'reconciliation_status_active');
+  assert.equal(state.pause_reason, 'pending_reconciliation_not_found');
+  assert.equal(state.tasks[mod.TASKS[0].id].last_run.reconciliation_recovery_attempted, true);
+});
+
+test('reconciliation recovery keeps scheduling paused when safety verification remains blocked', async () => {
+  let recoveryCalls = 0;
+  let safetyCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput() {
+      safetyCalls += 1;
+      return safetyCalls === 1
+        ? safetyOutput('blocked', {
+          reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+        })
+        : safetyOutput('blocked', {
+          account_risk_status: 'active', error_class: 'account_risk_status_active',
+        });
+    },
+    execFile(command, args, execOptions, callback) {
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        callback(null, orderGood('success', {
+          action_type: 'reconciliation_recovered', reconciliations: 1,
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  value.setClock('2026-07-21T00:00:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(safetyCalls, 2);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'account_risk_status_active');
+  assert.equal(state.tasks[mod.TASKS[0].id].last_run.reconciliation_recovery_succeeded, true);
 });
 
 test('one transient safety monitor failure blocks the minute and a second consecutive failure pauses all tasks', async () => {
