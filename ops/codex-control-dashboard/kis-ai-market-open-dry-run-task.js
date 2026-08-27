@@ -148,7 +148,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true }],
   ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true }],
   ['order_submission_unknown', { persistent: true, orderRecovery: true }],
-  ['reconciliation_status_active', { persistent: true, resumable: true }],
+  ['reconciliation_status_active', { persistent: true, resumable: true, orderRecovery: true }],
   ['scheduler_lock_active', { persistent: true }],
   ['scheduler_owner_lock_active', { persistent: true }],
   ['model_v3_post_close_promotion_forbidden', { persistent: true }],
@@ -168,6 +168,8 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['symbol_not_allowed', { orderRecovery: true }],
   ['unmanaged_position_present', { orderRecovery: true }],
   ['preflight_or_reconciliation_invalid', { orderRecovery: true }],
+  ['pending_order_reconciliation', { persistent: true, orderRecovery: true }],
+  ['pending_reconciliation_evidence_invalid', { persistent: true, orderRecovery: true }],
   ['risk_guard_blocked', { orderRecovery: true }],
   ['model_v3_artifact_attestation_mismatch', { orderRecovery: true }],
 
@@ -2527,16 +2529,35 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       result = parseSafetyMonitorOutput(stdout);
       if (error && result.status !== 'blocked') throw new Error('process_error');
-      Object.assign(monitorRun, {
-        status: result.status,
-        execution_owner: result.execution_owner,
-        process_lock: result.process_lock,
-        kill_state: result.kill_state,
-        open_order_status: result.open_order_status,
-        reconciliation_status: result.reconciliation_status,
-        account_risk_status: result.account_risk_status,
-        error_class: safeText(result.error_class, 80),
+      const capture = (value) => Object.assign(monitorRun, {
+        status: value.status,
+        execution_owner: value.execution_owner,
+        process_lock: value.process_lock,
+        kill_state: value.kill_state,
+        open_order_status: value.open_order_status,
+        reconciliation_status: value.reconciliation_status,
+        account_risk_status: value.account_risk_status,
+        error_class: safeText(value.error_class, 80),
       });
+      capture(result);
+      if (result.status === 'blocked' && result.error_class === 'reconciliation_status_active') {
+        const recoveryRun = await execute(buildReconciliationRecoveryCommand());
+        monitorRun.reconciliation_recovery_attempted = true;
+        if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('process_error');
+        const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
+        if (recoveryRun.error && recovery.status !== 'blocked') throw new Error('process_error');
+        monitorRun.reconciliation_recovery_status = recovery.status;
+        if (recovery.status !== 'success' || recovery.failClosed
+          || recovery.actionType !== 'reconciliation_recovered') {
+          throw new Error(recovery.errorClass || 'reconciliation_status_active');
+        }
+        const verificationRun = await execute(buildSafetyMonitorCommand());
+        if (verificationRun.error && Number(verificationRun.error.code) !== 2) throw new Error('process_error');
+        result = parseSafetyMonitorOutput(verificationRun.stdout);
+        if (verificationRun.error && result.status !== 'blocked') throw new Error('process_error');
+        monitorRun.reconciliation_recovery_succeeded = true;
+        capture(result);
+      }
       if (result.status === 'blocked') {
         if (isVpsDailyLossEntryBlock(result)) {
           return save({
