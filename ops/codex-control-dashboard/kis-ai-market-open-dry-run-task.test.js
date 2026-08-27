@@ -3388,7 +3388,11 @@ test('a paused transient safety failure auto-resumes all previously activated ta
   assert.equal(recovered.catch_up, false);
 });
 
-for (const pauseReason of ['open_order_status_unavailable', 'open_order_status_active']) test(`a paused ${pauseReason} auto-resumes only after a clear safety monitor`, async () => {
+for (const pauseReason of [
+  'open_order_status_unavailable',
+  'open_order_status_active',
+  'unknown_runtime_io_failed',
+]) test(`a paused ${pauseReason} auto-resumes only after a clear safety monitor`, async () => {
   const value = await active({ schedulerRegistered: true, safetyOutput: safetyOutput() });
   const current = value.task.status();
   const tasks = Object.fromEntries(Object.entries(current.tasks).map(([id, item]) => [id, {
@@ -3769,6 +3773,9 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.autoRepair, true);
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.resumable, true);
   assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.autoRepair, false);
+  assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.autoResume, true);
+  assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.resumable, true);
+  assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.scope, 'order');
   for (const errorClass of [
     'model_v3_post_close_promotion_forbidden',
     'hermes_scheduler_attestation_unavailable',
