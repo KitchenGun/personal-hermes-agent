@@ -159,7 +159,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['scheduler_owner_lock_invalid', { persistent: true, scope: 'global' }],
   ['scheduler_owner_lock_stale', { persistent: true, scope: 'global' }],
   ['scheduler_owner_lock_release_failed', { persistent: true, scope: 'global' }],
-  ['legacy_run_lock_active', { persistent: true, scope: 'global' }],
+  ['legacy_run_lock_active', { persistent: true, resumable: true, scope: 'global' }],
   ['model_v1_state_unavailable', { persistent: true, scope: 'global' }],
   ['model_v1_must_be_paused', { persistent: true, scope: 'global' }],
   ['model_v2_state_unavailable', { persistent: true, scope: 'global' }],
