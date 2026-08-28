@@ -2312,6 +2312,29 @@ test('exact IO resume recovers a process error only after the safety monitor is 
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact IO resume recovers a legacy lock pause only after the lock is absent', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'legacy_run_lock_active';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  fs.writeFileSync(value.paths.legacyV1RunLockPath, 'active');
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /legacy_run_lock_active/,
+  );
+
+  fs.unlinkSync(value.paths.legacyV1RunLockPath);
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
 test('exact IO resume recovers a fixed post-close unhandled runtime error', async () => {
   const value = await active();
   const paused = value.task.status();
