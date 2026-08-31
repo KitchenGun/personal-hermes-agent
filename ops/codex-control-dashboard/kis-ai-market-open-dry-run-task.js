@@ -172,6 +172,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['unsafe_output', { resumable: true }],
   ['account_risk_status_active', { persistent: true, resumable: true, autoResume: true, scope: 'order' }],
   ['daily_loss_entry_blocked', { resumable: true }],
+  ['daily_risk_budget_insufficient', { resumable: true }],
   ['intraday_universe_invalid', { resumable: true }],
   ['invalid_failure_evidence', { resumable: true }],
   ['balance_mismatch', { orderRecovery: true }],
@@ -2537,7 +2538,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && !postCloseRefresh
         && parsed.status === 'blocked'
         && parsed.failClosed
-        && parsed.errorClass === 'daily_loss_limit_reached'
+        && ['daily_loss_limit_reached', 'daily_risk_budget_insufficient'].includes(parsed.errorClass)
         && parsed.orderApiCalls === 0
         && parsed.vpsLiveOrders === 0
         && parsed.reconciliations === 0
