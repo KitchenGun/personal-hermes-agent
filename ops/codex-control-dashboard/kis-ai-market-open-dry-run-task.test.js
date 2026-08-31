@@ -2372,6 +2372,28 @@ test('exact IO resume recovers resumable task pauses while the supervisor remain
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact IO resume converts a legacy daily risk pause to disabled pending activation preflight', async () => {
+  const value = await active({
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps', account_risk_status: 'active', error_class: 'daily_loss_entry_blocked',
+    }),
+  });
+  const partial = value.task.status();
+  partial.state = 'ACTIVE';
+  partial.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  partial.tasks[mod.TASKS[4].id].pause_reason = 'daily_risk_budget_insufficient';
+  partial.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(partial));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+  assert.equal(state.retry, false);
+  assert.equal(state.catch_up, false);
+});
+
 test('partial IO resume requires database preflight when any paused task needs it', async () => {
   const options = {};
   const value = await active(options);
@@ -3731,7 +3753,7 @@ test('VPS daily loss blocks entries without pausing supervision or position mana
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'ai_position_held');
 });
 
-test('VPS daily loss rejects a mixed-slot entry without pausing later position management', async () => {
+for (const entryBlock of ['daily_loss_limit_reached', 'daily_risk_budget_insufficient']) test(`VPS ${entryBlock} rejects a mixed-slot entry without pausing later position management`, async () => {
   let orderRuns = 0;
   const error = Object.assign(new Error('Command failed'), { code: 2, killed: false });
   const value = await active({
@@ -3759,7 +3781,7 @@ test('VPS daily loss rejects a mixed-slot entry without pausing later position m
     ]),
     execFile(command, args, options, callback) {
       orderRuns += 1;
-      callback(error, orderGood('blocked', { error_class: 'daily_loss_limit_reached', open_positions: 1 }));
+      callback(error, orderGood('blocked', { error_class: entryBlock, open_positions: 1 }));
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
@@ -3776,7 +3798,7 @@ test('VPS daily loss rejects a mixed-slot entry without pausing later position m
   assert.equal(orderRuns, 1);
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'daily_loss_limit_reached');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, entryBlock);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_api_calls, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
