@@ -117,6 +117,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['unknown_runtime_io_failed', { autoResume: true, resumable: true, orderRecovery: true, scope: 'order' }],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_position_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
+  ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
@@ -1851,23 +1852,43 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== RESUME_AFTER_IO_FIX_APPROVAL) throw new Error('exact_resume_approval_required');
-    const current = loadStrict();
-    const sanitizedReconciliationPause = current.pause_reason === 'sanitized_runtime_error'
-      && current.last_safety_monitor?.execution_owner === 'vps'
-      && current.last_safety_monitor?.reconciliation_status === 'active'
-      && current.order_pause_reason === 'order_submission_unknown';
-    if (current.state !== 'PAUSED'
-      || (!RESUMABLE_PAUSE_REASONS.has(current.pause_reason) && !sanitizedReconciliationPause)) {
-      throw new Error('task_not_resumable');
-    }
     let release;
     try {
       release = acquireExclusiveLock(runLockPath);
+      const current = loadStrict();
+      const pausedTaskReasons = Object.values(current.tasks || {})
+        .filter((taskState) => taskState.state === 'PAUSED')
+        .map((taskState) => taskState.pause_reason)
+        .filter(Boolean);
+      const sanitizedReconciliationPause = current.pause_reason === 'sanitized_runtime_error'
+        && current.last_safety_monitor?.execution_owner === 'vps'
+        && current.last_safety_monitor?.reconciliation_status === 'active'
+        && current.order_pause_reason === 'order_submission_unknown';
+      const globallyResumable = current.state === 'PAUSED'
+        && (RESUMABLE_PAUSE_REASONS.has(current.pause_reason) || sanitizedReconciliationPause);
+      const partiallyResumable = current.state === 'ACTIVE'
+        && pausedTaskReasons.length > 0
+        && pausedTaskReasons.every((reason) => RESUMABLE_PAUSE_REASONS.has(reason));
+      if (!globallyResumable && !partiallyResumable) throw new Error('task_not_resumable');
+      const resumeReasons = globallyResumable ? [current.pause_reason] : pausedTaskReasons;
+      const preflightReason = resumeReasons.includes('database_file_io_failed')
+        ? 'database_file_io_failed'
+        : resumeReasons.find((reason) => PREFLIGHT_RESUMABLE_PAUSE_REASONS.has(reason));
+      const recoverySnapshot = JSON.stringify({
+        state: current.state,
+        pause_reason: current.pause_reason,
+        tasks: Object.fromEntries(TASKS.map((task) => [task.id, {
+          state: current.tasks[task.id]?.state,
+          pause_reason: current.tasks[task.id]?.pause_reason,
+          next_run_at: current.tasks[task.id]?.next_run_at,
+          pending_invocation: current.tasks[task.id]?.pending_invocation,
+        }])),
+      });
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
       if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
-      if (PREFLIGHT_RESUMABLE_PAUSE_REASONS.has(current.pause_reason)) {
+      if (preflightReason) {
         const preflightRun = await execute(buildCommand(TASKS[0].id, { activationPreflight: true }));
         if (preflightRun.error?.killed) throw new Error('timeout');
         if (preflightRun.error && Number(preflightRun.error.code) !== 2) {
@@ -1882,12 +1903,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const freshPreflight = preflight.status === 'success'
           && preflight.failClosed === false
           && preflight.actionType === 'activation_preflight';
-        const sameDayPreflightAlreadyCompleted = current.pause_reason === 'account_risk_evidence_missing'
+        const sameDayPreflightAlreadyCompleted = preflightReason === 'account_risk_evidence_missing'
           && preflight.status === 'no_op'
           && preflight.failClosed === false
           && preflight.actionType === 'idempotent_no_op';
         if (!freshPreflight && !sameDayPreflightAlreadyCompleted) {
-          const fallback = current.pause_reason === 'account_risk_evidence_missing'
+          const fallback = preflightReason === 'account_risk_evidence_missing'
             ? 'account_risk_recovery_preflight_failed'
             : 'database_recovery_preflight_failed';
           throw new Error(preflight.errorClass && preflight.errorClass !== 'none'
@@ -1913,9 +1934,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && safety.account_risk_status === 'active';
       if (safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
+      const latest = loadStrict();
+      const latestSnapshot = JSON.stringify({
+        state: latest.state,
+        pause_reason: latest.pause_reason,
+        tasks: Object.fromEntries(TASKS.map((task) => [task.id, {
+          state: latest.tasks[task.id]?.state,
+          pause_reason: latest.tasks[task.id]?.pause_reason,
+          next_run_at: latest.tasks[task.id]?.next_run_at,
+          pending_invocation: latest.tasks[task.id]?.pending_invocation,
+        }])),
+      });
+      if (latestSnapshot !== recoverySnapshot) throw new Error('resume_state_changed');
+      const postClosePauseReason = current.state === 'PAUSED'
+        ? current.pause_reason
+        : current.tasks[POST_CLOSE_TASK.id]?.pause_reason;
       const postCloseRefreshPending = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
-        && current.last_error_notification?.error_class === sanitizeErrorClass(current.pause_reason)
-        && current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === current.pause_reason
+        && current.last_error_notification?.error_class === sanitizeErrorClass(postClosePauseReason)
+        && current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === postClosePauseReason
         && current.tasks[ORDER_TASK.id]?.activation_artifact_hash != null;
       const tasks = Object.fromEntries(TASKS.map((task) => {
         const prior = current.tasks[task.id] || {};
@@ -1929,7 +1965,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }];
       }));
       return save({
-        ...current,
+        ...latest,
         state: 'ACTIVE',
         pause_reason: undefined,
         resumed_at: resumedAt.toISOString(),

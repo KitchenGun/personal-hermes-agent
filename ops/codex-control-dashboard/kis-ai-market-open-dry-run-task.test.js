@@ -2350,6 +2350,77 @@ test('exact IO resume recovers a fixed post-close unhandled runtime error', asyn
   assert.equal(state.resume_reason, 'io_fix_verified');
 });
 
+test('exact IO resume recovers resumable task pauses while the supervisor remains active', async () => {
+  const value = await active();
+  const partial = value.task.status();
+  partial.state = 'ACTIVE';
+  for (const taskId of [mod.TASKS[0].id, mod.TASKS[1].id]) {
+    partial.tasks[taskId].state = 'PAUSED';
+    partial.tasks[taskId].pause_reason = 'runtime_unhandled_error';
+    partial.tasks[taskId].next_run_at = null;
+  }
+  partial.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  partial.tasks[mod.TASKS[4].id].pause_reason = 'intraday_decision_stale_or_missing';
+  partial.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(partial));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.resume_reason, 'io_fix_verified');
+});
+
+test('partial IO resume requires database preflight when any paused task needs it', async () => {
+  const options = {};
+  const value = await active(options);
+  options.activationPreflightOutput = good(mod.TASKS[0].id, 'no_op', {
+    action_type: 'idempotent_no_op',
+  });
+  const partial = value.task.status();
+  partial.state = 'ACTIVE';
+  partial.tasks[mod.TASKS[0].id].state = 'PAUSED';
+  partial.tasks[mod.TASKS[0].id].pause_reason = 'runtime_unhandled_error';
+  partial.tasks[mod.TASKS[1].id].state = 'PAUSED';
+  partial.tasks[mod.TASKS[1].id].pause_reason = 'database_file_io_failed';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(partial));
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /database_recovery_preflight_failed/,
+  );
+  assert.equal(value.task.status().tasks[mod.TASKS[1].id].state, 'PAUSED');
+});
+
+test('partial IO resume never overwrites a concurrent scheduler state change', async () => {
+  let resumePhase = false;
+  let value;
+  value = await active({
+    async runtimeHealthCheck() {
+      if (resumePhase) {
+        const changed = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+        changed.tasks[mod.TASKS[1].id].state = 'PAUSED';
+        changed.tasks[mod.TASKS[1].id].pause_reason = 'scheduler_lock_active';
+        fs.writeFileSync(value.paths.statePath, JSON.stringify(changed));
+      }
+      return true;
+    },
+  });
+  const partial = value.task.status();
+  partial.state = 'ACTIVE';
+  partial.tasks[mod.TASKS[0].id].state = 'PAUSED';
+  partial.tasks[mod.TASKS[0].id].pause_reason = 'runtime_unhandled_error';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(partial));
+  resumePhase = true;
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /resume_state_changed/,
+  );
+  assert.equal(value.task.status().tasks[mod.TASKS[1].id].pause_reason, 'scheduler_lock_active');
+});
+
 test('exact IO resume preserves a post-close shadow refresh without enabling orders', async () => {
   const value = await active();
   const paused = value.task.status();
@@ -3828,6 +3899,8 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.orderRecovery, true);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.resumable, true);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
   assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
@@ -3894,6 +3967,26 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(nextState.state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
+  assert.equal(orderRuns, 0);
+});
+
+test('missing intraday decision degrades one slot without pausing the order task', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    llmExecutor: async () => { throw new Error('intraday_decision_stale_or_missing'); },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'intraday_decision_stale_or_missing');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(orderRuns, 0);
 });
 
