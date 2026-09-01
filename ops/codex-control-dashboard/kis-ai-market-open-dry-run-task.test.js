@@ -560,6 +560,38 @@ test('post-close shadow refresh reuses the existing order task and never invokes
   assert.equal(Object.keys(after.tasks).length, 5);
 });
 
+test('post-close backfill transport failure defers refresh without pausing or retrying', async () => {
+  let refreshRuns = 0;
+  const value = await active({
+    shadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    shadowRefreshOutput: orderGood('blocked', {
+      error_class: 'model_v3_backfill_transport_unavailable',
+      artifact_hash: null,
+    }),
+    onShadowRefresh() { refreshRuns += 1; },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const due = '2026-07-21T07:20:00.000Z';
+  const current = value.task.status();
+  current.tasks[mod.TASKS[4].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(due) });
+  const orderTask = after.tasks[mod.TASKS[4].id];
+
+  assert.equal(refreshRuns, 1);
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(orderTask.state, 'ACTIVE');
+  assert.equal(orderTask.pending_invocation, null);
+  assert.equal(orderTask.refresh_only_pending, true);
+  assert.equal(orderTask.last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(orderTask.last_run.error_class, 'model_v3_backfill_transport_unavailable');
+  assert.equal(orderTask.last_run.fail_closed, false);
+  assert.equal(orderTask.last_run.no_same_slot_retry, true);
+  assert.equal(orderTask.next_run_at, '2026-07-22T07:20:00.000Z');
+});
+
 test('post-close refresh command is attested and exposes no order approval', () => {
   const dueKey = `${mod.TASKS[4].id}:2026-07-21:16:20`;
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '3'.repeat(32), dueKey });
@@ -3965,6 +3997,7 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.resumable, true);
+  assert.equal(mod.ERROR_POLICY.model_v3_backfill_transport_unavailable.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
   assert.equal(mod.sanitizeErrorClass('Bearer private-token'), 'sanitized_runtime_error');
