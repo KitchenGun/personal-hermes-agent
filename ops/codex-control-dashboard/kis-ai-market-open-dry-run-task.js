@@ -141,6 +141,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['model_v3_refresh_failed', { autoRepair: true }],
   ['model_v3_shadow_failed', { autoRepair: true }],
   ['model_v3_shadow_batch_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_transport_unavailable', { slotDegradeOnly: true }],
   ['model_v3_backfill_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_shadow_execution_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_artifact_load_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
@@ -2548,6 +2549,33 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.vpsLiveOrders === 0
         && parsed.reconciliations === 0
         && parsed.orderSymbol === null;
+      const postCloseBackfillTransportNoOp = task.kind === 'order'
+        && postCloseRefresh
+        && parsed.status === 'blocked'
+        && parsed.failClosed
+        && ERROR_POLICY[parsed.errorClass]?.slotDegradeOnly === true
+        && parsed.orderApiCalls === 0
+        && parsed.vpsLiveOrders === 0
+        && parsed.reconciliations === 0;
+      if (postCloseBackfillTransportNoOp) {
+        const postNotificationTask = postNotificationState.tasks[taskId];
+        return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
+          ...postNotificationTask,
+          state: 'ACTIVE',
+          pause_reason: undefined,
+          consecutive_transport_failures: 0,
+          pending_invocation: null,
+          refresh_only_pending: true,
+          next_run_at: nextRunAt(REFRESH_ONLY_ORDER_TASK, dueTime),
+          last_run: {
+            ...lastRun,
+            status: 'no_op',
+            action_type: 'transport_degraded_no_op',
+            fail_closed: false,
+            no_same_slot_retry: true,
+          },
+        } } });
+      }
       if (dailyLossEntryOnlyBlock) {
         const postNotificationTask = postNotificationState.tasks[taskId];
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
