@@ -308,7 +308,7 @@ function fixture(options = {}) {
       if (typeof options.onDecisionContext === 'function') {
         options.onDecisionContext({ command, args, execOptions });
       }
-      callback(null, typeof options.decisionContextOutput === 'function'
+      callback(options.decisionContextError || null, typeof options.decisionContextOutput === 'function'
         ? options.decisionContextOutput(execOptions.env.KIS_HERMES_DUE_KEY)
         : options.decisionContextOutput || decisionContext(execOptions.env.KIS_HERMES_DUE_KEY));
       return;
@@ -2360,7 +2360,7 @@ test('exact IO resume recovers resumable task pauses while the supervisor remain
     partial.tasks[taskId].next_run_at = null;
   }
   partial.tasks[mod.TASKS[4].id].state = 'PAUSED';
-  partial.tasks[mod.TASKS[4].id].pause_reason = 'intraday_decision_stale_or_missing';
+  partial.tasks[mod.TASKS[4].id].pause_reason = 'decision_context_process_error';
   partial.tasks[mod.TASKS[4].id].next_run_at = null;
   fs.writeFileSync(value.paths.statePath, JSON.stringify(partial));
 
@@ -2995,6 +2995,48 @@ test('one transient decision-context failure skips the slot and consecutive two 
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'http_transport_failed');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.consecutive_transport_failures, 2);
   assert.equal(llmCalls, 0);
+  assert.equal(orderRuns, 0);
+});
+
+test('decision-context child timeout degrades one slot without pausing or invoking orders', async () => {
+  let decisionContextTimeout = null;
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextError: Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }),
+    onDecisionContext({ execOptions }) { decisionContextTimeout = execOptions.timeout; },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(decisionContextTimeout, mod.DECISION_CONTEXT_TIMEOUT_MS);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'decision_context_timeout');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:20:00\.000Z$/);
+  assert.equal(orderRuns, 0);
+});
+
+test('non-timeout decision-context process failure remains fail-closed', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextError: Object.assign(new Error('process failed'), { code: 1, killed: false }),
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'decision_context_process_error');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(orderRuns, 0);
 });
 
