@@ -62,6 +62,7 @@ const POLL_INTERVAL_MS = 60_000;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const LLM_RESPONSE_TIMEOUT_MS = 120_000;
+const DECISION_CONTEXT_TIMEOUT_MS = 120_000;
 const LLM_MODEL_ID = 'gpt-5.6-terra';
 const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   contract_version: 'runtime_contract_v1',
@@ -129,7 +130,8 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['invalid_report_message', { autoRepair: true, resumable: true }],
   ['report_sender_missing', { autoRepair: true }],
   ['report_delivery_failed', { autoRepair: true }],
-  ['decision_context_process_error', { autoRepair: true }],
+  ['decision_context_process_error', { autoRepair: true, resumable: true }],
+  ['decision_context_timeout', { slotDegradeOnly: true }],
   ['decision_context_failed', { autoRepair: true, orderRecovery: true }],
   ['invalid_decision_context', { autoRepair: true }],
   ['intraday_position_signal_missing', { autoRepair: true, orderRecovery: true }],
@@ -930,6 +932,7 @@ function buildDecisionContextCommand(schedulerToken, invocationDueKey) {
       KIS_HERMES_SCHEDULER_TOKEN: schedulerToken,
       KIS_HERMES_DUE_KEY: invocationDueKey,
     },
+    timeoutMs: DECISION_CONTEXT_TIMEOUT_MS,
   };
 }
 
@@ -1471,7 +1474,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       throw new Error('llm_verdict_contract_unavailable');
     }
     const contextRun = await execute(buildDecisionContextCommand(schedulerToken, slotId));
-    if (contextRun.error && Number(contextRun.error.code) !== 2) throw new Error('decision_context_process_error');
+    if (contextRun.error && Number(contextRun.error.code) !== 2) {
+      throw new Error(contextRun.error.killed ? 'decision_context_timeout' : 'decision_context_process_error');
+    }
     const context = parseDecisionContextOutput(contextRun.stdout, slotId, runtimeContract);
     if (context.blocked) throw new Error(context.errorClass);
     if (context.candidates.length === 0) {
@@ -1819,7 +1824,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       execFile(command.command, command.args, {
         cwd: command.cwd,
         env: { ...process.env, ...(command.env || {}) },
-        timeout: execTimeoutMs,
+        timeout: command.timeoutMs || execTimeoutMs,
         maxBuffer,
       }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
     });
@@ -2878,7 +2883,7 @@ module.exports = {
   ORDER_ATTESTATION_DIR,
   APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, DEFAULT_SCHEDULER_OWNER_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
-  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
+  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, DECISION_CONTEXT_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
   REQUIRED_RUNTIME_CONTRACT, ERROR_POLICY, loadRuntimeContract, TASKS,
   parseKisAiMarketOpenOutput, parseKisVpsAutonomousOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
   parseAiVerdict, parseDecisionContextOutput, parseSafetyMonitorOutput, buildSanitizedAiPacket,
