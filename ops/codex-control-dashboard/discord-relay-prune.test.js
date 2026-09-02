@@ -10,6 +10,8 @@ process.env.DISCORD_NOTIFY_IDLE_INTERVAL_MS = '60000';
 process.env.DISCORD_NOTIFY_ERROR_INTERVAL_MS = '30000';
 process.env.DISCORD_FETCH_TIMEOUT_MS = '15000';
 process.env.DISCORD_STATE_FETCH_TIMEOUT_MS = '10000';
+process.env.DISCORD_ALLOWED_USER_IDS = '123456789012345678';
+process.env.KIS_DISCORD_CHANNEL_ID = '1512691418605420634';
 
 delete require.cache[require.resolve('./discord-relay')];
 const relay = require('./discord-relay');
@@ -102,9 +104,39 @@ function testAdaptivePollingState() {
   assert.equal(relay.__test.statusPollDelayMs({ status: 'error' }), relay.__test.intervals.error);
 }
 
+function testKisRecoveryButtonContract() {
+  const incidentId = 'a'.repeat(64);
+  assert.deepEqual(
+    relay.__test.parseKisRecoveryCustomId(`kis-recovery:approve:${incidentId}`),
+    { action: 'approve', incidentId },
+  );
+  assert.deepEqual(
+    relay.__test.parseKisRecoveryCustomId(`kis-recovery:deny:${incidentId}`),
+    { action: 'deny', incidentId },
+  );
+  assert.equal(relay.__test.parseKisRecoveryCustomId(`kis-recovery:approve:${'a'.repeat(63)}`), null);
+  const components = relay.__test.recoveryComponents([{
+    type: 1,
+    components: [
+      { type: 2, style: 3, custom_id: `kis-recovery:approve:${incidentId}` },
+      { type: 2, style: 4, custom_id: `kis-recovery:deny:${incidentId}` },
+    ],
+  }]);
+  assert.equal(components[0].components[0].label, '복구');
+  assert.equal(components[0].components[1].label, '중단 유지');
+  assert.throws(() => relay.__test.recoveryComponents([{
+    type: 1,
+    components: [
+      { type: 2, custom_id: `kis-recovery:approve:${incidentId}` },
+      { type: 2, custom_id: `kis-recovery:deny:${'b'.repeat(64)}` },
+    ],
+  }]), /invalid recovery components/);
+}
+
 testPrunesOnlyOldTerminalTasks();
 testSavePrunesBeforeAtomicWrite();
 testAdaptivePollingState();
 testFetchTimeoutExport();
 testDeliveryClaimPersistsAcrossRepeatedCalls();
+testKisRecoveryButtonContract();
 console.log('discord relay prune tests passed');

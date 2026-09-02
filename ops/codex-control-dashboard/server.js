@@ -2399,6 +2399,7 @@ async function sendKisReportViaDiscordRelay(message) {
   return discordRelay.sendDiscordRelayMessage({
     targetChannelId,
     content: message.content,
+    components: message.components,
     deliveryLayer: message.deliveryLayer,
     idempotencyKey: message.idempotencyKey,
   });
@@ -2646,11 +2647,41 @@ async function apiKisPredictionV2Validation(req, res) {
   errJson(res, 404, 'not found');
 }
 
-function apiKisAiMarketOpenDryRun(req, res) {
+async function apiKisAiMarketOpenDryRun(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'GET' && url.pathname === '/api/kis/ai-market-open-dry-run/status') {
     okJson(res, { ok: true, ...kisAiMarketOpenDryRunRuntime.status() });
     return;
+  }
+  const incidentMatch = url.pathname.match(/^\/api\/kis\/ai-market-open-dry-run\/incidents\/([a-f0-9]{64})(?:\/(approve|deny))?$/);
+  if (incidentMatch) {
+    assertSharedSecret(req);
+    const incidentId = incidentMatch[1];
+    const action = incidentMatch[2] || 'status';
+    if (req.method === 'GET' && action === 'status') {
+      okJson(res, { ok: true, incident: kisAiMarketOpenDryRunRuntime.incidentStatus(incidentId) });
+      return;
+    }
+    if (req.method === 'POST') {
+      if (!['approve', 'deny'].includes(action)) throw new HttpError(405, 'incident mutation action required');
+      const body = await readJson(req);
+      const userId = cleanText(body.user_id, 40);
+      const channelId = cleanText(body.channel_id, 40);
+      const interactionId = cleanText(body.interaction_id || body.message_id, 40);
+      const command = cleanText(body.command, 160);
+      try { assertKisEmergencyStopOperator(userId); }
+      catch { throw new HttpError(403, 'discord user is not allowed'); }
+      if (channelId !== KIS_DISCORD_CHANNEL_ID) throw new HttpError(403, 'discord channel is not allowed');
+      if (!/^\d{16,24}$/.test(interactionId)) throw new HttpError(400, 'discord interaction id is invalid');
+      const expected = `복구 ${action === 'approve' ? '승인' : '거절'} ${incidentId}`;
+      if (command !== expected) throw new HttpError(400, 'exact incident command required');
+      if (!discordInteractionReplayGuard.claim(interactionId)) throw new HttpError(409, 'discord interaction already handled');
+      const incident = action === 'approve'
+        ? await kisAiMarketOpenDryRunRuntime.approveIncident({ incidentId, approval: command, invokedBy: `discord:${userId}` })
+        : kisAiMarketOpenDryRunRuntime.denyIncident({ incidentId, denial: command, invokedBy: `discord:${userId}` });
+      okJson(res, { ok: true, incident });
+      return;
+    }
   }
   errJson(res, 404, 'not found');
 }
@@ -2715,7 +2746,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.url.startsWith('/api/kis/ai-market-open-dry-run')) {
-      apiKisAiMarketOpenDryRun(req, res);
+      await apiKisAiMarketOpenDryRun(req, res);
       return;
     }
     if (req.url.startsWith('/api/kis/report')) {
