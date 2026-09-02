@@ -215,6 +215,10 @@ const DISCORD_ERROR_CLASSES = new Set(Object.keys(ERROR_POLICY));
 
 const AUTO_REPAIRABLE_ERROR_CLASSES = new Set(Object.entries(ERROR_POLICY)
   .filter(([, policy]) => policy.autoRepair).map(([errorClass]) => errorClass));
+const INCIDENT_STATES = new Set([
+  'awaiting_approval', 'repairing', 'testing', 'resolved', 'denied', 'escalated', 'stale',
+]);
+const INCIDENT_LEDGER_LIMIT = 100;
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
   'database_open', 'database_begin', 'database_commit', 'client_initialize', 'auth_token_request',
@@ -1517,7 +1521,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
 
   function disabledState() {
-    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, refresh_only_pending: false, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
+    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, incidents: {}, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, refresh_only_pending: false, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
   }
   function loadStrict() {
     try {
@@ -1530,6 +1534,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       value.canonical_task_id = CANONICAL_TASK_ID;
       value.task_owner = TASK_OWNER;
+      if (value.incidents === undefined) value.incidents = {};
+      if (!value.incidents || typeof value.incidents !== 'object' || Array.isArray(value.incidents)) {
+        throw new Error('state_contract_invalid');
+      }
       if (!value.tasks[ORDER_TASK.id]) {
         value.tasks[ORDER_TASK.id] = {
           state: 'DISABLED', schedule: ORDER_TASK.schedule, next_run_at: null,
@@ -1580,8 +1588,193 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   function save(value) {
     if (value.tasks?.[ORDER_TASK.id]?.state === 'ACTIVE') delete value.order_pause_reason;
+    if (value.incidents === undefined) value.incidents = {};
     atomicWrite(statePath, value);
     return value;
+  }
+  function incidentStateHash(current, taskId, errorClass) {
+    const taskState = current.tasks?.[taskId] || {};
+    return crypto.createHash('sha256').update(JSON.stringify({
+      task_id: taskId,
+      error_class: errorClass,
+      scheduler_state: current.state,
+      pause_reason: current.pause_reason || null,
+      task_state: taskState.state || null,
+      task_pause_reason: taskState.pause_reason || null,
+      due_key: taskState.last_due_at || null,
+      failure_fingerprint: taskState.last_run?.failure_fingerprint || null,
+      pending_invocation: taskState.pending_invocation || null,
+    })).digest('hex');
+  }
+  function incidentId(current, taskId, errorClass, lastRun = {}) {
+    const taskState = current.tasks?.[taskId] || {};
+    const fingerprint = safeText(lastRun.failure_fingerprint || '', 64)
+      || crypto.createHash('sha256').update(JSON.stringify({
+        completed_at: lastRun.completed_at || null,
+        failure_phase: lastRun.failure_phase || null,
+        failure_exception_type: lastRun.failure_exception_type || null,
+        error_class: errorClass,
+      })).digest('hex');
+    return crypto.createHash('sha256').update([
+      taskId, String(taskState.last_due_at || ''), errorClass, fingerprint,
+    ].join(':')).digest('hex');
+  }
+  function incidentScope(current, errorClass) {
+    if (errorClass === 'preflight_or_reconciliation_invalid') {
+      return 'reconcile_paused_once';
+    }
+    if (['pending_order_reconciliation', 'reconciliation_status_active', 'order_submission_unknown'].includes(errorClass)) {
+      return 'reconcile_paused_once';
+    }
+    if (['database_file_io_failed', 'account_risk_evidence_missing'].includes(errorClass)) {
+      return 'verified_io_resume';
+    }
+    if (['daily_loss_entry_blocked', 'daily_risk_budget_insufficient'].includes(errorClass)) {
+      return 'classification_only';
+    }
+    return AUTO_REPAIRABLE_ERROR_CLASSES.has(errorClass) ? 'isolated_code_repair' : 'manual_diagnosis';
+  }
+  function recordIncident(current, taskId, errorClass, lastRun = {}) {
+    const id = incidentId(current, taskId, errorClass, lastRun);
+    const stateHash = incidentStateHash(current, taskId, errorClass);
+    const prior = current.incidents?.[id];
+    const entry = prior && prior.state_hash === stateHash ? prior : {
+      incident_id: id,
+      task_id: taskId,
+      error_class: errorClass,
+      state_hash: stateHash,
+      scope: incidentScope(current, errorClass),
+      status: 'awaiting_approval',
+      observed_at: now().toISOString(),
+      updated_at: now().toISOString(),
+      attempts: 0,
+    };
+    const incidents = { ...(current.incidents || {}), [id]: entry };
+    const ids = Object.keys(incidents).sort((left, right) => (
+      String(incidents[left].updated_at).localeCompare(String(incidents[right].updated_at))
+    ));
+    for (const staleId of ids.slice(0, Math.max(0, ids.length - INCIDENT_LEDGER_LIMIT))) delete incidents[staleId];
+    return { state: save({ ...current, incidents }), incident: entry };
+  }
+  function incidentStatus(id) {
+    const entry = loadStrict().incidents?.[id];
+    if (!entry || !INCIDENT_STATES.has(entry.status)) throw new Error('incident_not_found');
+    return entry;
+  }
+  function denyIncident({ incidentId: id, denial, invokedBy = 'unknown' } = {}) {
+    if (denial !== `복구 거절 ${id}`) throw new Error('exact_incident_denial_required');
+    const current = loadStrict();
+    const entry = current.incidents?.[id];
+    if (!entry || entry.status !== 'awaiting_approval') throw new Error('incident_not_awaiting_approval');
+    const denied = { ...entry, status: 'denied', denied_by: safeText(invokedBy, 80), updated_at: now().toISOString() };
+    save({ ...current, incidents: { ...current.incidents, [id]: denied } });
+    return denied;
+  }
+  async function runApprovedReconciliation() {
+    const recoveryRun = await execute(buildReconciliationRecoveryCommand());
+    if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('reconciliation_recovery_process_error');
+    const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
+    if (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered') {
+      throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
+    }
+    const safetyRun = await execute(buildSafetyMonitorCommand());
+    if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
+    const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+    if (safety.status !== 'success' || safety.execution_owner !== 'vps'
+      || safety.process_lock !== 'clear' || safety.kill_state !== 'clear'
+      || safety.open_order_status !== 'clear' || safety.reconciliation_status !== 'clear'
+      || safety.account_risk_status !== 'clear') {
+      throw new Error(safety.error_class || 'safety_monitor_not_clear');
+    }
+    return recovery;
+  }
+  async function approveIncident({ incidentId: id, approval, invokedBy = 'unknown' } = {}) {
+    if (approval !== `복구 승인 ${id}`) throw new Error('exact_incident_approval_required');
+    let current = loadStrict();
+    let entry = current.incidents?.[id];
+    if (!entry) throw new Error('incident_not_found');
+    const currentScope = incidentScope(current, entry.error_class);
+    const reclassified = entry.status === 'resolved'
+      && entry.scope === 'manual_diagnosis'
+      && currentScope === 'reconcile_paused_once'
+      && current.tasks?.[entry.task_id]?.state === 'PAUSED'
+      && current.tasks?.[entry.task_id]?.pause_reason === entry.error_class;
+    if (entry.status !== 'awaiting_approval' && !reclassified) throw new Error('incident_not_awaiting_approval');
+    if (incidentStateHash(current, entry.task_id, entry.error_class) !== entry.state_hash) {
+      entry = { ...entry, status: 'stale', updated_at: now().toISOString() };
+      save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+      throw new Error('stale_incident_approval');
+    }
+    entry = {
+      ...entry,
+      scope: currentScope,
+      status: 'repairing',
+      approved_by: safeText(invokedBy, 80),
+      approved_at: now().toISOString(),
+      updated_at: now().toISOString(),
+      attempts: Number(entry.attempts || 0) + 1,
+    };
+    save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+    try {
+      let result = { action: entry.scope, changed: false };
+      if (entry.scope === 'reconcile_paused_once') {
+        result = await runApprovedReconciliation();
+        await enableOrderTask({
+          confirm: true,
+          approval: ORDER_ACTIVATION_APPROVAL,
+          invokedBy: `incident:${id}`,
+        });
+      } else if (entry.scope === 'verified_io_resume') {
+        await resumeAfterIoFix({ approval: RESUME_AFTER_IO_FIX_APPROVAL, invokedBy: `incident:${id}` });
+        result = await enableOrderTask({
+          confirm: true,
+          approval: ORDER_ACTIVATION_APPROVAL,
+          invokedBy: `incident:${id}`,
+        });
+      } else if (entry.scope === 'isolated_code_repair') {
+        result = await queueSelfHeal(id, entry.task_id, entry.error_class, current.tasks?.[entry.task_id]?.last_run || {});
+        if (result.queued !== true) throw new Error('repair_orchestration_not_queued');
+      }
+      current = loadStrict();
+      entry = {
+        ...current.incidents[id],
+        scope: entry.scope,
+        status: entry.scope === 'isolated_code_repair' ? 'testing' : 'resolved',
+        result: {
+          action: entry.scope,
+          broker_order_api_calls: Number.isSafeInteger(result?.orderApiCalls) ? result.orderApiCalls : 0,
+          order_reactivated: current.tasks?.[ORDER_TASK.id]?.state === 'ACTIVE',
+        },
+        updated_at: now().toISOString(),
+      };
+      save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+      return entry;
+    } catch (error) {
+      current = loadStrict();
+      entry = {
+        ...current.incidents[id],
+        status: 'escalated',
+        sanitized_error_class: sanitizeErrorClass(error.message),
+        updated_at: now().toISOString(),
+      };
+      save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+      throw error;
+    }
+  }
+  function incidentButtons(id) {
+    return [{
+      type: 1,
+      components: [
+        { type: 2, style: 3, label: '복구', emoji: { name: '✅' }, custom_id: `kis-recovery:approve:${id}` },
+        { type: 2, style: 4, label: '중단 유지', emoji: { name: '✖️' }, custom_id: `kis-recovery:deny:${id}` },
+      ],
+    }];
+  }
+  function blockingIncident(current) {
+    return Object.values(current.incidents || {}).find((incident) => (
+      ['awaiting_approval', 'repairing', 'testing', 'escalated', 'stale'].includes(incident.status)
+      && ['reconcile_paused_once', 'verified_io_resume'].includes(incident.scope)
+    ));
   }
   function stateUnavailableStatus() {
     return { ...disabledState(), state: 'PAUSED', pause_reason: 'state_unavailable', scheduler_faulted: true };
@@ -1715,6 +1908,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         claimed_at: now().toISOString(),
       },
     });
+    const recoveryScope = incidentScope(claim, errorClass);
+    const incidentClaim = ['reconcile_paused_once', 'verified_io_resume'].includes(recoveryScope)
+      ? recordIncident(claim, taskId, errorClass, lastRun)
+      : null;
     const selfHeal = transientOnly
       ? { queued: false, skipped: true, reason: 'transient_slot_no_op' }
       : await queueSelfHeal(notificationKey, taskId, errorClass, lastRun);
@@ -1730,17 +1927,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       `신규 주문: ${transientOnly ? '추가 실행 없음' : (globalPause || orderPause ? '중단' : '안전 조건에 따라 계속')}`,
       `자동 복구: ${transientOnly
         ? (taskId === TASKS[0].id ? '안전 확인 자동 진행 중' : '다음 정규 실행에서 재확인')
-        : (taskId === TASKS[0].id || orderPause) && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(errorClass)
-        ? '안전 확인 자동 진행 중'
+        : incidentClaim ? '아래 버튼에서 선택'
         : (selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요')}`,
     ].join('\n');
     let succeeded = false;
-    const queuedClaim = save({ ...claim, last_self_heal: selfHeal });
+    const queuedClaim = save({ ...(incidentClaim?.state || claim), last_self_heal: selfHeal });
     if (attempted) {
       try {
         const delivery = await reportSender({
           targetChannelId: REPORT_TARGET_CHANNEL_ID,
           content,
+          ...(incidentClaim ? { components: incidentButtons(incidentClaim.incident.incident_id) } : {}),
           deliveryLayer: 'hermes_ai_market_open_error',
         });
         succeeded = delivery?.discord_sent === true;
@@ -1997,6 +2194,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       release = acquireExclusiveLock(runLockPath);
       const current = loadStrict();
       const prior = current.tasks[ORDER_TASK.id];
+      const unresolvedIncident = blockingIncident(current);
+      if (unresolvedIncident && invokedBy !== `incident:${unresolvedIncident.incident_id}`) {
+        throw new Error('incident_approval_required');
+      }
       const recoveredPostCloseFailure = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
         && current.last_error_notification?.error_class
           === sanitizeErrorClass(current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class)
@@ -2653,29 +2854,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         error_class: safeText(value.error_class, 80),
       });
       capture(result);
-      if (result.status === 'blocked' && result.error_class === 'reconciliation_status_active') {
-        if (last?.reconciliation_status === 'active'
-          && last.reconciliation_recovery_attempted === true
-          && last.reconciliation_recovery_succeeded !== true) {
-          throw new Error(last.error_class || 'reconciliation_status_active');
-        }
-        const recoveryRun = await execute(buildReconciliationRecoveryCommand());
-        monitorRun.reconciliation_recovery_attempted = true;
-        if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('process_error');
-        const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
-        if (recoveryRun.error && recovery.status !== 'blocked') throw new Error('process_error');
-        monitorRun.reconciliation_recovery_status = recovery.status;
-        if (recovery.status !== 'success' || recovery.failClosed
-          || recovery.actionType !== 'reconciliation_recovered') {
-          throw new Error(recovery.errorClass || 'reconciliation_status_active');
-        }
-        const verificationRun = await execute(buildSafetyMonitorCommand());
-        if (verificationRun.error && Number(verificationRun.error.code) !== 2) throw new Error('process_error');
-        result = parseSafetyMonitorOutput(verificationRun.stdout);
-        if (verificationRun.error && result.status !== 'blocked') throw new Error('process_error');
-        monitorRun.reconciliation_recovery_succeeded = true;
-        capture(result);
-      }
       if (result.status === 'blocked') {
         if (isVpsDailyLossEntryBlock(result)) {
           return save({
@@ -2754,6 +2932,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const resumeOrder = current.order_activated_at
       && orderTask?.state === 'PAUSED'
       && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(orderTask.pause_reason)
+      && !blockingIncident(current)
       && (orderTask.pause_reason !== 'account_risk_status_active'
         || orderTask.last_run?.execution_owner === 'vps');
     const deferRecoveredOrder = monitorRun.reconciliation_recovery_succeeded === true
@@ -2789,7 +2968,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
       const time = now();
-      if (current.state === 'PAUSED' && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(current.pause_reason)) {
+      if (current.state === 'PAUSED' && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(current.pause_reason)
+        && !blockingIncident(current)) {
         current = await runSafetyMonitor(current, time);
         if (current.last_safety_monitor?.status !== 'success') return current;
         const orderWasActivated = Boolean(current.order_activated_at);
@@ -2864,6 +3044,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   return {
     statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask,
+    incidentStatus, approveIncident, denyIncident,
     approveAggressiveDailyEntryCap, cutoverIntradayProvider, runOnce, start, stop, tick, buildCommand,
   };
 }

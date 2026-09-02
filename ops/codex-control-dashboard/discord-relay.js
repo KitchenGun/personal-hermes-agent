@@ -6,12 +6,15 @@ const TOKEN = process.env.DISCORD_BOT_TOKEN || '';
 const ENDPOINT = process.env.DISCORD_RELAY_ENDPOINT || 'http://127.0.0.1:17640/api/discord/task';
 const RESUME_ENDPOINT = process.env.DISCORD_RESUME_ENDPOINT || 'http://127.0.0.1:17640/api/discord/resume';
 const STATE_ENDPOINT = process.env.DISCORD_STATE_ENDPOINT || 'http://127.0.0.1:17640/api/summary?board=codex-control';
+const KIS_INCIDENT_ENDPOINT = process.env.DISCORD_KIS_INCIDENT_ENDPOINT
+  || 'http://127.0.0.1:17640/api/kis/ai-market-open-dry-run/incidents';
 const STATE_FILE = process.env.DISCORD_RELAY_STATE || path.join(__dirname, 'discord-relay-state.json');
 const SECRET = process.env.DISCORD_SHARED_SECRET || '';
 const STATE_SECRET = process.env.CONTROL_SHARED_SECRET || SECRET;
 const CHANNEL_IDS = csvSet(process.env.DISCORD_CHANNEL_IDS || '');
 const USER_IDS = csvSet(process.env.DISCORD_ALLOWED_USER_IDS || '');
 const GATEWAY_QUEUE_CHANNEL_IDS = csvSet(process.env.DISCORD_GATEWAY_QUEUE_CHANNEL_IDS || '');
+const KIS_CHANNEL_ID = String(process.env.KIS_DISCORD_CHANNEL_ID || '1512691418605420634').trim();
 const MAX_ATTACHMENT_BYTES = Number(process.env.DISCORD_MAX_ATTACHMENT_BYTES || 262144);
 const DISCORD_FETCH_TIMEOUT_MS = Math.max(1000, Number(process.env.DISCORD_FETCH_TIMEOUT_MS || 15000) || 15000);
 const STATE_FETCH_TIMEOUT_MS = Math.max(1000, Number(process.env.DISCORD_STATE_FETCH_TIMEOUT_MS || 10000) || 10000);
@@ -177,10 +180,33 @@ async function discordFetch(path, options = {}) {
   return response.json();
 }
 
-async function sendDiscordMessage(channelId, content, referenceMessageId = '') {
+function recoveryComponents(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length !== 1 || value[0]?.type !== 1
+    || !Array.isArray(value[0].components) || value[0].components.length !== 2) {
+    throw new Error('invalid recovery components');
+  }
+  const buttons = value[0].components;
+  const ids = buttons.map((button) => String(button?.custom_id || ''));
+  const parsed = ids.map((id) => id.match(/^kis-recovery:(approve|deny):([a-f0-9]{64})$/));
+  if (parsed.some((match) => !match) || parsed[0][2] !== parsed[1][2]
+    || parsed[0][1] !== 'approve' || parsed[1][1] !== 'deny') {
+    throw new Error('invalid recovery components');
+  }
+  return [{
+    type: 1,
+    components: [
+      { type: 2, style: 3, label: '복구', emoji: { name: '✅' }, custom_id: ids[0] },
+      { type: 2, style: 4, label: '중단 유지', emoji: { name: '✖️' }, custom_id: ids[1] },
+    ],
+  }];
+}
+
+async function sendDiscordMessage(channelId, content, referenceMessageId = '', components) {
   const payload = {
     content: truncate(content, 1900),
     allowed_mentions: { parse: [] },
+    ...(components ? { components: recoveryComponents(components) } : {}),
   };
   if (referenceMessageId) {
     payload.message_reference = {
@@ -208,7 +234,7 @@ async function sendDiscordRelayMessage(message = {}) {
       delivery_layer: message.deliveryLayer || 'discord_relay',
     };
   }
-  await sendDiscordMessage(targetChannelId, message.content);
+  await sendDiscordMessage(targetChannelId, message.content, '', message.components);
   return {
     discord_sent: true,
     target_channel_id: targetChannelId,
@@ -535,7 +561,76 @@ async function createTaskFromInteraction(interaction) {
   return { created, taskId, title };
 }
 
+function parseKisRecoveryCustomId(value) {
+  const match = String(value || '').match(/^kis-recovery:(approve|deny):([a-f0-9]{64})$/);
+  return match ? { action: match[1], incidentId: match[2] } : null;
+}
+
+async function disableKisRecoveryButtons(interaction) {
+  const components = (interaction?.message?.components || []).map((row) => ({
+    type: 1,
+    components: (row.components || []).map((button) => ({
+      type: 2,
+      style: button.style,
+      label: button.label,
+      emoji: button.emoji,
+      custom_id: button.custom_id,
+      disabled: true,
+    })),
+  }));
+  if (!components.length || !interaction?.message?.id) return;
+  await discordFetch(`/channels/${interaction.channel_id}/messages/${interaction.message.id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ components }),
+  });
+}
+
+async function handleKisRecoveryInteraction(interaction) {
+  const parsed = parseKisRecoveryCustomId(interaction?.data?.custom_id);
+  const user = interactionUser(interaction);
+  const allowed = parsed && KIS_CHANNEL_ID && interaction?.channel_id === KIS_CHANNEL_ID
+    && USER_IDS.size > 0 && USER_IDS.has(user.id);
+  if (!allowed) {
+    await interactionCallback(interaction, {
+      type: 4,
+      data: { flags: 64, content: '이 복구 작업을 실행할 권한이 없습니다.', allowed_mentions: { parse: [] } },
+    });
+    return;
+  }
+  await interactionCallback(interaction, { type: 5, data: { flags: 64 } });
+  const command = `복구 ${parsed.action === 'approve' ? '승인' : '거절'} ${parsed.incidentId}`;
+  try {
+    const response = await fetchWithTimeout(`${KIS_INCIDENT_ENDPOINT}/${parsed.incidentId}/${parsed.action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(SECRET ? { authorization: `Bearer ${SECRET}` } : {}),
+      },
+      body: JSON.stringify({
+        user_id: user.id,
+        channel_id: interaction.channel_id,
+        interaction_id: interaction.id,
+        command,
+      }),
+    }, STATE_FETCH_TIMEOUT_MS);
+    const payload = await response.json();
+    if (!response.ok || !payload?.incident) throw new Error('kis_recovery_blocked');
+    const incident = payload.incident;
+    await disableKisRecoveryButtons(interaction).catch(() => {});
+    const status = parsed.action === 'approve'
+      ? (incident.result?.order_reactivated === true ? '복구 및 정상 재개 완료' : '복구 검증 완료')
+      : '중단 유지';
+    await interactionFollowup(interaction, `[KIS 복구] ${status}`);
+  } catch {
+    await interactionFollowup(interaction, '[KIS 복구] 안전 검증을 통과하지 못해 중단 상태를 유지합니다.').catch(() => {});
+  }
+}
+
 async function handleInteraction(interaction) {
+  if (interaction?.type === 3) {
+    await handleKisRecoveryInteraction(interaction);
+    return;
+  }
   if (interaction?.type !== 2) return;
   if (!SLASH_COMMAND_NAMES.has(interactionCommandName(interaction))) return;
   if (!shouldHandleInteraction(interaction)) {
@@ -1073,6 +1168,9 @@ module.exports = {
     statusPollDelayMs,
     fetchWithTimeout,
     claimDeliveryKey,
+    recoveryComponents,
+    parseKisRecoveryCustomId,
+    handleKisRecoveryInteraction,
     shouldHandle,
     shouldSendQueueOnlyNotice,
     intervals: {

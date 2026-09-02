@@ -3346,7 +3346,7 @@ test('prod account-risk state remains paused after a clear monitor', async () =>
   assert.equal(held.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
 });
 
-test('active reconciliation runs one bounded recovery and verifies clear safety state', async () => {
+test('active reconciliation pauses for button approval without automatic recovery', async () => {
   let recoveryCalls = 0;
   let safetyCalls = 0;
   let orderCalls = 0;
@@ -3354,11 +3354,9 @@ test('active reconciliation runs one bounded recovery and verifies clear safety 
     schedulerRegistered: true,
     safetyOutput() {
       safetyCalls += 1;
-      return safetyCalls === 1
-        ? safetyOutput('blocked', {
-          reconciliation_status: 'active', error_class: 'reconciliation_status_active',
-        })
-        : safetyOutput();
+      return safetyOutput('blocked', {
+        reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+      });
     },
     execFile(command, args, execOptions, callback) {
       if (args.includes('reconcile-paused')) {
@@ -3381,94 +3379,16 @@ test('active reconciliation runs one bounded recovery and verifies clear safety 
 
   const state = await value.task.tick();
 
-  assert.equal(recoveryCalls, 1);
-  assert.equal(safetyCalls, 2);
+  assert.equal(recoveryCalls, 0);
+  assert.equal(safetyCalls, 1);
   assert.equal(orderCalls, 0);
   assert.equal(state.state, 'ACTIVE');
-  assert.equal(state.last_safety_monitor.status, 'success');
-  assert.equal(state.last_safety_monitor.reconciliation_recovery_attempted, true);
-  assert.equal(state.last_safety_monitor.reconciliation_recovery_succeeded, true);
-  assert.equal(state.last_safety_monitor.order_slot_deferred, true);
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T00:20:00.000Z');
-
-  value.setClock('2026-07-21T00:20:00Z');
-  await value.task.tick();
-  assert.equal(orderCalls, 1);
-});
-
-test('failed reconciliation recovery pauses without retrying', async () => {
-  let recoveryCalls = 0;
-  const value = await active({
-    schedulerRegistered: true,
-    safetyOutput: safetyOutput('blocked', {
-      reconciliation_status: 'active', error_class: 'reconciliation_status_active',
-    }),
-    execFile(command, args, execOptions, callback) {
-      if (args.includes('reconcile-paused')) {
-        recoveryCalls += 1;
-        callback(null, orderGood('blocked', {
-          error_class: 'pending_reconciliation_not_found',
-        }));
-        return;
-      }
-      callback(null, good(args[args.indexOf('--task-id') + 1]));
-    },
-  });
-  markOrderActive(value);
-  value.setClock('2026-07-21T00:00:00Z');
-
-  const state = await value.task.tick();
-
-  assert.equal(recoveryCalls, 1);
-  assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'pending_reconciliation_not_found');
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.reconciliation_recovery_attempted, true);
-
-  value.setClock('2026-07-21T00:01:00Z');
-  const held = await value.task.tick();
-  assert.equal(recoveryCalls, 1);
-  assert.equal(held.state, 'ACTIVE');
-  assert.equal(held.tasks[mod.TASKS[4].id].state, 'PAUSED');
-});
-
-test('reconciliation recovery keeps scheduling paused when safety verification remains blocked', async () => {
-  let recoveryCalls = 0;
-  let safetyCalls = 0;
-  const value = await active({
-    schedulerRegistered: true,
-    safetyOutput() {
-      safetyCalls += 1;
-      return safetyCalls === 1
-        ? safetyOutput('blocked', {
-          reconciliation_status: 'active', error_class: 'reconciliation_status_active',
-        })
-        : safetyOutput('blocked', {
-          account_risk_status: 'active', error_class: 'account_risk_status_active',
-        });
-    },
-    execFile(command, args, execOptions, callback) {
-      if (args.includes('reconcile-paused')) {
-        recoveryCalls += 1;
-        callback(null, orderGood('success', {
-          action_type: 'reconciliation_recovered', reconciliations: 1,
-        }));
-        return;
-      }
-      callback(null, good(args[args.indexOf('--task-id') + 1]));
-    },
-  });
-  markOrderActive(value);
-  value.setClock('2026-07-21T00:00:00Z');
-
-  const state = await value.task.tick();
-
-  assert.equal(recoveryCalls, 1);
-  assert.equal(safetyCalls, 2);
-  assert.equal(state.state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'account_risk_status_active');
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.reconciliation_recovery_succeeded, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'reconciliation_status_active');
+  const incident = Object.values(state.incidents)
+    .find((entry) => entry.error_class === 'reconciliation_status_active');
+  assert.equal(incident.status, 'awaiting_approval');
+  assert.equal(incident.scope, 'reconcile_paused_once');
 });
 
 test('repeated transient safety failure pauses only new orders', async () => {
@@ -4111,4 +4031,119 @@ test('missing held-position decision degrades one slot without invoking KIS orde
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(orderRuns, 0);
+});
+
+test('approved reconciliation incident runs once and reactivates orders only after safety clears', async () => {
+  const sent = [];
+  let recoveryCalls = 0;
+  let orderRuns = 0;
+  const value = await active({
+    safetyOutput: safetyOutput(),
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, options, callback) {
+      if (args.includes('safety-monitor')) {
+        callback(null, safetyOutput());
+        return;
+      }
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        callback(null, orderGood('success', {
+          action_type: 'reconciliation_recovered', reconciliations: 1,
+        }));
+        return;
+      }
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) {
+        orderRuns += 1;
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'preflight_or_reconciliation_invalid',
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const before = value.task.status();
+  before.last_safety_monitor = JSON.parse(safetyOutput('blocked', {
+    reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+  }));
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  const incident = Object.values(paused.incidents)
+    .find((entry) => entry.error_class === 'preflight_or_reconciliation_invalid');
+  assert.ok(incident, JSON.stringify(Object.values(paused.incidents)));
+  assert.equal(incident.scope, 'reconcile_paused_once');
+  assert.equal(incident.status, 'awaiting_approval');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].components[0].components.length, 2);
+  assert.match(sent[0].components[0].components[0].custom_id, /^kis-recovery:approve:[a-f0-9]{64}$/);
+
+  value.setClock('2026-07-21T00:11:00Z');
+  const held = await value.task.tick();
+  assert.equal(held.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(held.incidents[incident.incident_id].status, 'awaiting_approval');
+  assert.equal(recoveryCalls, 0);
+
+  const resolved = await value.task.approveIncident({
+    incidentId: incident.incident_id,
+    approval: `복구 승인 ${incident.incident_id}`,
+    invokedBy: 'discord:test-user',
+  });
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(orderRuns, 1, 'the blocked market slot is not retried');
+  assert.equal(resolved.status, 'resolved');
+  assert.equal(resolved.result.broker_order_api_calls, 0);
+  assert.equal(resolved.result.order_reactivated, true);
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  await assert.rejects(value.task.approveIncident({
+    incidentId: incident.incident_id,
+    approval: `복구 승인 ${incident.incident_id}`,
+    invokedBy: 'discord:test-user',
+  }), /incident_not_awaiting_approval/);
+  assert.equal(recoveryCalls, 1);
+});
+
+test('incident recovery stays paused when reconciliation attempts an order submission', async () => {
+  const value = await active({
+    reportSender: async () => ({ discord_sent: true }),
+    execFile(command, args, options, callback) {
+      if (args.includes('reconcile-paused')) {
+        callback(null, orderGood('success', {
+          action_type: 'reconciliation_recovered', reconciliations: 1,
+          order_api_calls: 1, vps_live_orders: 1,
+        }));
+        return;
+      }
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) {
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'preflight_or_reconciliation_invalid',
+        }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const before = value.task.status();
+  before.last_safety_monitor = JSON.parse(safetyOutput('blocked', {
+    reconciliation_status: 'active', error_class: 'reconciliation_status_active',
+  }));
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  const incident = Object.values(paused.incidents)
+    .find((entry) => entry.error_class === 'preflight_or_reconciliation_invalid');
+  assert.ok(incident, JSON.stringify(Object.values(paused.incidents)));
+
+  await assert.rejects(value.task.approveIncident({
+    incidentId: incident.incident_id,
+    approval: `복구 승인 ${incident.incident_id}`,
+  }), /invalid_order_execution_contract|invalid_reconciliation_recovery_contract/);
+  assert.equal(value.task.status().incidents[incident.incident_id].status, 'escalated');
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
 });
