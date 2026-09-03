@@ -216,9 +216,15 @@ const DISCORD_ERROR_CLASSES = new Set(Object.keys(ERROR_POLICY));
 const AUTO_REPAIRABLE_ERROR_CLASSES = new Set(Object.entries(ERROR_POLICY)
   .filter(([, policy]) => policy.autoRepair).map(([errorClass]) => errorClass));
 const INCIDENT_STATES = new Set([
-  'awaiting_approval', 'repairing', 'testing', 'resolved', 'denied', 'escalated', 'stale',
+  'awaiting_approval', 'repairing', 'waiting_recheck', 'testing', 'resolved', 'denied', 'escalated', 'stale',
 ]);
 const INCIDENT_LEDGER_LIMIT = 100;
+const RECONCILIATION_RECHECK_ERRORS = new Set([
+  'reconciliation_provider_timeout', 'reconciliation_transport_unavailable',
+  'reconciliation_pending_visibility', 'reconciliation_order_unfilled',
+]);
+const RECONCILIATION_MAX_ATTEMPTS = 3;
+const RECONCILIATION_APPROVAL_TTL_MS = 10 * 60 * 1000;
 const FAILURE_PHASES = new Set([
   'none', 'strategy_manifest_read', 'calendar_read', 'kill_switch_read', 'lock_acquire',
   'database_open', 'database_begin', 'database_commit', 'client_initialize', 'auth_token_request',
@@ -1015,6 +1021,7 @@ function buildReconciliationRecoveryCommand() {
     command: KIS_VENV_PYTHON,
     args: [
       '-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'reconcile-paused',
+      '--read-only-broker',
       '--confirm', '--approval', 'APPROVE_KIS_HERMES_VPS_RECONCILIATION_RECOVERY_V1',
     ],
     cwd: KIS_REPO,
@@ -1442,6 +1449,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const maxBuffer = Math.min(Number(options.maxBuffer || MAX_BUFFER_BYTES), MAX_BUFFER_BYTES);
   let timer = null;
   let ticking = false;
+  let recoveringIncident = false;
   let schedulerFaulted = false;
   let releaseSchedulerOwnership = null;
   let stateFaultNotificationPromise = null;
@@ -1670,26 +1678,37 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     save({ ...current, incidents: { ...current.incidents, [id]: denied } });
     return denied;
   }
-  async function runApprovedReconciliation() {
-    const recoveryRun = await execute(buildReconciliationRecoveryCommand());
-    if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('reconciliation_recovery_process_error');
-    const recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
-    if (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered') {
-      throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
+  async function runApprovedReconciliation(id) {
+    let recovery = { orderApiCalls: 0 };
+    if (loadStrict().incidents[id].reconciliation_verified !== true) {
+      const recoveryRun = await execute(buildReconciliationRecoveryCommand());
+      if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('reconciliation_recovery_process_error');
+      recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
+      if (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered') {
+        throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
+      }
+      const current = loadStrict();
+      save({ ...current, incidents: { ...current.incidents, [id]: {
+        ...current.incidents[id], reconciliation_verified: true, status: 'waiting_recheck',
+        next_recheck_at: new Date(now().getTime() + POLL_INTERVAL_MS).toISOString(),
+      } } });
     }
-    const safetyRun = await execute(buildSafetyMonitorCommand());
-    if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
-    const safety = parseSafetyMonitorOutput(safetyRun.stdout);
-    if (safety.status !== 'success' || safety.execution_owner !== 'vps'
-      || safety.process_lock !== 'clear' || safety.kill_state !== 'clear'
-      || safety.open_order_status !== 'clear' || safety.reconciliation_status !== 'clear'
-      || safety.account_risk_status !== 'clear') {
-      throw new Error(safety.error_class || 'safety_monitor_not_clear');
+    for (let index = 0; index < 2; index += 1) {
+      const safetyRun = await execute(buildSafetyMonitorCommand());
+      if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
+      const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+      if (safety.status !== 'success' || safety.execution_owner !== 'vps'
+        || safety.process_lock !== 'clear' || safety.kill_state !== 'clear'
+        || safety.open_order_status !== 'clear' || safety.reconciliation_status !== 'clear'
+        || safety.account_risk_status !== 'clear') {
+        throw new Error(safety.error_class || 'safety_monitor_not_clear');
+      }
     }
     return recovery;
   }
-  async function approveIncident({ incidentId: id, approval, invokedBy = 'unknown' } = {}) {
+  async function approveIncident({ incidentId: id, approval, invokedBy = 'unknown' } = {}, recheck = false) {
     if (approval !== `복구 승인 ${id}`) throw new Error('exact_incident_approval_required');
+    if (recoveringIncident || (ticking && !recheck)) throw new Error('incident_recovery_in_progress');
     let current = loadStrict();
     let entry = current.incidents?.[id];
     if (!entry) throw new Error('incident_not_found');
@@ -1699,7 +1718,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       && currentScope === 'reconcile_paused_once'
       && current.tasks?.[entry.task_id]?.state === 'PAUSED'
       && current.tasks?.[entry.task_id]?.pause_reason === entry.error_class;
-    if (entry.status !== 'awaiting_approval' && !reclassified) throw new Error('incident_not_awaiting_approval');
+    const retryableApproval = !recheck && entry.status === 'escalated'
+      && currentScope === 'reconcile_paused_once' && entry.attempts < RECONCILIATION_MAX_ATTEMPTS;
+    const waiting = recheck && entry.status === 'waiting_recheck'
+      && currentScope === 'reconcile_paused_once' && Boolean(entry.approved_at);
+    if (entry.status !== 'awaiting_approval' && !reclassified && !retryableApproval && !waiting) {
+      throw new Error('incident_not_awaiting_approval');
+    }
+    if (waiting && (entry.attempts >= RECONCILIATION_MAX_ATTEMPTS
+      || !Number.isFinite(Date.parse(entry.recheck_expires_at))
+      || now().getTime() >= Date.parse(entry.recheck_expires_at))) {
+      entry = { ...entry, status: 'escalated', sanitized_error_class: 'reconciliation_recheck_expired', updated_at: now().toISOString() };
+      save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+      throw new Error('reconciliation_recheck_expired');
+    }
     if (incidentStateHash(current, entry.task_id, entry.error_class) !== entry.state_hash) {
       entry = { ...entry, status: 'stale', updated_at: now().toISOString() };
       save({ ...current, incidents: { ...current.incidents, [id]: entry } });
@@ -1710,15 +1742,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       scope: currentScope,
       status: 'repairing',
       approved_by: safeText(invokedBy, 80),
-      approved_at: now().toISOString(),
+      approved_at: waiting ? entry.approved_at : now().toISOString(),
+      recheck_expires_at: waiting ? entry.recheck_expires_at : new Date(now().getTime() + RECONCILIATION_APPROVAL_TTL_MS).toISOString(),
       updated_at: now().toISOString(),
       attempts: Number(entry.attempts || 0) + 1,
     };
     save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+    recoveringIncident = true;
     try {
       let result = { action: entry.scope, changed: false };
       if (entry.scope === 'reconcile_paused_once') {
-        result = await runApprovedReconciliation();
+        const release = acquireExclusiveLock(runLockPath);
+        try {
+          assertNoResumeBlockingLocks();
+          if (Object.values(loadStrict().tasks).some((task) => task.pending_invocation)) throw new Error('pending_invocation_active');
+          result = await runApprovedReconciliation(id);
+        } finally { release(); }
         await enableOrderTask({
           confirm: true,
           approval: ORDER_ACTIVATION_APPROVAL,
@@ -1734,6 +1773,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       } else if (entry.scope === 'isolated_code_repair') {
         result = await queueSelfHeal(id, entry.task_id, entry.error_class, current.tasks?.[entry.task_id]?.last_run || {});
         if (result.queued !== true) throw new Error('repair_orchestration_not_queued');
+      } else if (!['classification_only', 'slot_no_op', 'fail_closed_report_only', 'manual_diagnosis'].includes(entry.scope)) {
+        throw new Error('incident_scope_not_supported');
       }
       current = loadStrict();
       entry = {
@@ -1751,15 +1792,25 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       return entry;
     } catch (error) {
       current = loadStrict();
+      const reason = sanitizeErrorClass(error.message);
+      const verified = current.incidents[id].reconciliation_verified === true;
+      const canRecheck = entry.scope === 'reconcile_paused_once'
+        && entry.attempts < RECONCILIATION_MAX_ATTEMPTS
+        && now().getTime() + POLL_INTERVAL_MS < Date.parse(entry.recheck_expires_at)
+        && (RECONCILIATION_RECHECK_ERRORS.has(reason)
+          || (verified && ['timeout', 'open_order_status_unavailable', 'open_order_status_active'].includes(reason)));
       entry = {
         ...current.incidents[id],
-        status: 'escalated',
-        sanitized_error_class: sanitizeErrorClass(error.message),
+        status: canRecheck ? 'waiting_recheck' : 'escalated',
+        sanitized_error_class: reason,
+        next_recheck_at: canRecheck ? new Date(now().getTime() + POLL_INTERVAL_MS).toISOString() : null,
+        result: { action: entry.scope, broker_order_api_calls: 0, order_reactivated: false },
         updated_at: now().toISOString(),
       };
       save({ ...current, incidents: { ...current.incidents, [id]: entry } });
+      if (canRecheck) return entry;
       throw error;
-    }
+    } finally { recoveringIncident = false; }
   }
   function incidentButtons(id) {
     return [{
@@ -1772,7 +1823,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   function blockingIncident(current) {
     return Object.values(current.incidents || {}).find((incident) => (
-      ['awaiting_approval', 'repairing', 'testing', 'escalated', 'stale'].includes(incident.status)
+      ['awaiting_approval', 'repairing', 'waiting_recheck', 'testing', 'escalated', 'stale', 'denied'].includes(incident.status)
       && ['reconcile_paused_once', 'verified_io_resume'].includes(incident.scope)
     ));
   }
@@ -2962,12 +3013,30 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (enforceSchedulerOwnership && typeof releaseSchedulerOwnership !== 'function') {
       throw new Error('scheduler_owner_required');
     }
-    if (ticking || schedulerFaulted) return status();
+    if (ticking || recoveringIncident || schedulerFaulted) return status();
     ticking = true;
     try {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
       const time = now();
+      const waiting = Object.values(current.incidents || {}).find((entry) => entry.status === 'waiting_recheck');
+      if (waiting) {
+        if (Date.parse(waiting.next_recheck_at) > time.getTime()) return current;
+        try {
+          await approveIncident({ incidentId: waiting.incident_id, approval: `복구 승인 ${waiting.incident_id}`, invokedBy: waiting.approved_by }, true);
+        } catch { /* The incident retains the exact blocker; market slots stay paused. */ }
+        const after = loadStrict();
+        const entry = after.incidents[waiting.incident_id];
+        if (entry.status !== 'waiting_recheck' && typeof reportSender === 'function') {
+          const restored = entry.status === 'resolved' && entry.result?.order_reactivated === true;
+          try {
+            await reportSender({ targetChannelId: REPORT_TARGET_CHANNEL_ID, deliveryLayer: 'hermes_ai_market_open_dry_run',
+              content: restored ? '[KIS 복구] 체결·잔고 확인 완료. 다음 정규 실행부터 재개합니다. 주문 재전송 없음.'
+                : `[KIS 복구] 중단 유지: ${sanitizeErrorClass(entry.sanitized_error_class || 'stale_incident_approval')}. 추가 자동 재확인 없음. 주문 재전송 없음.` });
+          } catch { /* Notification failure never repeats recovery. */ }
+        }
+        return after;
+      }
       if (current.state === 'PAUSED' && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(current.pause_reason)
         && !blockingIncident(current)) {
         current = await runSafetyMonitor(current, time);

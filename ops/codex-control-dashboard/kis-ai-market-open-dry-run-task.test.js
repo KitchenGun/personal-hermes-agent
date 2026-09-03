@@ -3361,6 +3361,7 @@ test('active reconciliation pauses for button approval without automatic recover
     execFile(command, args, execOptions, callback) {
       if (args.includes('reconcile-paused')) {
         recoveryCalls += 1;
+        assert.ok(args.includes('--read-only-broker'));
         callback(null, orderGood('success', {
           action_type: 'reconciliation_recovered', reconciliations: 1,
         }));
@@ -4146,4 +4147,161 @@ test('incident recovery stays paused when reconciliation attempts an order submi
   }), /invalid_order_execution_contract|invalid_reconciliation_recovery_contract/);
   assert.equal(value.task.status().incidents[incident.incident_id].status, 'escalated');
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
+async function pendingRecoveryFixture(options = {}) {
+  let recoveryCalls = 0;
+  let orderRuns = 0;
+  const sent = [];
+  const value = await active({
+    ...options,
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, execOptions, callback) {
+      if (args.includes('reconcile-paused')) {
+        recoveryCalls += 1;
+        assert.ok(args.includes('--read-only-broker'));
+        if (options.recoveryCallback) return options.recoveryCallback(callback, recoveryCalls);
+        const reason = options.recoveryReason || 'reconciliation_order_unfilled';
+        callback({ code: 2 }, orderGood('blocked', { error_class: reason }));
+      } else if (args.includes('run-once')) {
+        orderRuns += 1;
+        callback({ code: 2 }, orderGood('blocked', { error_class: 'preflight_or_reconciliation_invalid' }));
+      } else callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  const incident = Object.values(paused.incidents).find((entry) => entry.error_class === 'preflight_or_reconciliation_invalid');
+  assert.ok(incident);
+  return { ...value, sent, incident, calls: () => ({ recoveryCalls, orderRuns }), approve: () => value.task.approveIncident({
+    incidentId: incident.incident_id, approval: `복구 승인 ${incident.incident_id}`, invokedBy: 'discord:operator',
+  }) };
+}
+
+test('approved read-only recovery waits for later ticks and is bounded to three attempts', async () => {
+  const value = await pendingRecoveryFixture();
+  assert.equal((await value.approve()).status, 'waiting_recheck');
+  assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+  await value.task.tick();
+  assert.equal(value.calls().recoveryCalls, 1);
+  value.setClock('2026-07-21T00:11:00Z');
+  await value.task.tick();
+  assert.equal(value.calls().recoveryCalls, 2);
+  value.setClock('2026-07-21T00:12:00Z');
+  const state = await value.task.tick();
+  assert.equal(state.incidents[value.incident.incident_id].status, 'escalated');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  value.setClock('2026-07-21T00:13:00Z');
+  await value.task.tick();
+  assert.deepEqual(value.calls(), { recoveryCalls: 3, orderRuns: 1 });
+  assert.equal(value.sent.filter((message) => message.content.includes('[KIS 복구]')).length, 1);
+});
+
+test('successful reconciliation is checkpointed before a transient safety failure', async () => {
+  let safetyBlocked = false;
+  const value = await pendingRecoveryFixture({
+    safetyOutput: () => safetyBlocked ? safetyOutput('blocked', { error_class: 'timeout', open_order_status: 'unknown' }) : safetyOutput(),
+    recoveryCallback(callback) {
+      safetyBlocked = true;
+      callback(null, orderGood('success', { action_type: 'reconciliation_recovered', reconciliations: 1 }));
+    },
+  });
+  const waiting = await value.approve();
+  assert.equal(waiting.status, 'waiting_recheck');
+  assert.equal(waiting.reconciliation_verified, true);
+  safetyBlocked = false;
+  value.setClock('2026-07-21T00:11:00Z');
+  const resumed = await value.task.tick();
+  assert.equal(resumed.incidents[value.incident.incident_id].status, 'resolved');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+  assert.equal(value.sent.filter((message) => message.content.includes('[KIS 복구]')).length, 1);
+});
+
+test('unknown or inconsistent evidence never schedules an automatic recheck', async () => {
+  for (const recoveryReason of ['reconciliation_evidence_invalid', 'reconciliation_quantity_mismatch', 'reconciliation_auth_failed']) {
+    const value = await pendingRecoveryFixture({ recoveryReason });
+    await assert.rejects(value.approve(), new RegExp(recoveryReason));
+    value.setClock('2026-07-21T00:11:00Z');
+    await value.task.tick();
+    assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+    assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+  }
+});
+
+test('expired and changed approvals stop rechecking without executing recovery', async () => {
+  for (const changed of [false, true]) {
+    const value = await pendingRecoveryFixture();
+    await value.approve();
+    if (changed) {
+      const state = value.task.status();
+      state.tasks[mod.TASKS[4].id].pause_reason = 'order_submission_unknown';
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    }
+    value.setClock(changed ? '2026-07-21T00:11:00Z' : '2026-07-21T00:21:00Z');
+    const state = await value.task.tick();
+    assert.equal(state.incidents[value.incident.incident_id].status, changed ? 'stale' : 'escalated');
+    assert.equal(value.calls().recoveryCalls, 1);
+  }
+});
+
+test('concurrent recovery clicks cannot execute twice and ticks wait for recovery', async () => {
+  let finish;
+  const value = await pendingRecoveryFixture({ recoveryCallback(callback) { finish = callback; } });
+  const pending = value.approve();
+  await assert.rejects(value.approve(), /incident_recovery_in_progress/);
+  await value.task.tick();
+  assert.equal(value.calls().recoveryCalls, 1);
+  finish(null, orderGood('success', { action_type: 'reconciliation_recovered', reconciliations: 1 }));
+  assert.equal((await pending).status, 'resolved');
+});
+
+test('denied incident prevents unattended order reactivation', async () => {
+  const value = await pendingRecoveryFixture();
+  value.task.denyIncident({ incidentId: value.incident.incident_id, denial: `복구 거절 ${value.incident.incident_id}` });
+  value.setClock('2026-07-21T00:11:00Z');
+  const state = await value.task.tick();
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.deepEqual(value.calls(), { recoveryCalls: 0, orderRuns: 1 });
+});
+
+test('checkpoint is restartable before safety begins and restart skips broker recovery', async () => {
+  let recoveryFinished = false;
+  let checkpoint;
+  const value = await pendingRecoveryFixture({
+    safetyOutput: () => {
+      if (!recoveryFinished) return safetyOutput();
+      checkpoint = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).incidents[value.incident.incident_id];
+      return safetyOutput('blocked', { error_class: 'timeout', open_order_status: 'unknown' });
+    },
+    recoveryCallback(callback) {
+      recoveryFinished = true;
+      callback(null, orderGood('success', { action_type: 'reconciliation_recovered', reconciliations: 1 }));
+    },
+  });
+  await value.approve();
+  assert.equal(checkpoint.status, 'waiting_recheck');
+  assert.equal(checkpoint.reconciliation_verified, true);
+  assert.equal(checkpoint.attempts, 1);
+  let repeatedRecovery = 0;
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths,
+    enforceSchedulerOwnership: false,
+    now: () => new Date('2026-07-21T00:11:00Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
+    runtimeHealthCheck: async () => true,
+    sourceParityCheck: () => true,
+    calendarProofResolver: () => calendarProof(true),
+    execFile(command, args, options, callback) {
+      if (args.includes('reconcile-paused')) repeatedRecovery += 1;
+      callback(null, args.includes('safety-monitor') ? safetyOutput()
+        : orderGood('success', { action_type: 'activation_check' }));
+    },
+  });
+  const state = await restarted.tick();
+  assert.equal(state.incidents[value.incident.incident_id].status, 'resolved');
+  assert.equal(state.incidents[value.incident.incident_id].attempts, 2);
+  assert.equal(state.incidents[value.incident.incident_id].recheck_expires_at, checkpoint.recheck_expires_at);
+  assert.equal(repeatedRecovery, 0);
 });

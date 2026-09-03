@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { sanitizeErrorClass } = require('./kis-ai-market-open-dry-run-task');
 
 const API = 'https://discord.com/api/v10';
 const TOKEN = process.env.DISCORD_BOT_TOKEN || '';
@@ -566,6 +567,11 @@ function parseKisRecoveryCustomId(value) {
   return match ? { action: match[1], incidentId: match[2] } : null;
 }
 
+function kisRecoveryErrorClass(payload, error) {
+  return sanitizeErrorClass(payload?.error_class || payload?.sanitized_error_class || payload?.error
+    || error?.message || 'kis_recovery_blocked');
+}
+
 async function disableKisRecoveryButtons(interaction) {
   const components = (interaction?.message?.components || []).map((row) => ({
     type: 1,
@@ -599,6 +605,7 @@ async function handleKisRecoveryInteraction(interaction) {
   }
   await interactionCallback(interaction, { type: 5, data: { flags: 64 } });
   const command = `복구 ${parsed.action === 'approve' ? '승인' : '거절'} ${parsed.incidentId}`;
+  let payload;
   try {
     const response = await fetchWithTimeout(`${KIS_INCIDENT_ENDPOINT}/${parsed.incidentId}/${parsed.action}`, {
       method: 'POST',
@@ -613,16 +620,22 @@ async function handleKisRecoveryInteraction(interaction) {
         command,
       }),
     }, STATE_FETCH_TIMEOUT_MS);
-    const payload = await response.json();
-    if (!response.ok || !payload?.incident) throw new Error('kis_recovery_blocked');
+    payload = await response.json();
+    if (!response.ok || !payload?.incident) throw new Error(kisRecoveryErrorClass(payload));
     const incident = payload.incident;
     await disableKisRecoveryButtons(interaction).catch(() => {});
     const status = parsed.action === 'approve'
-      ? (incident.result?.order_reactivated === true ? '복구 및 정상 재개 완료' : '복구 검증 완료')
+      ? (incident.status === 'waiting_recheck' && incident.result?.order_reactivated === false
+        ? '승인 접수, 체결/잔고 자동 재확인 중'
+        : incident.result?.order_reactivated === true ? '복구 및 정상 재개 완료' : '복구 검증 완료')
       : '중단 유지';
     await interactionFollowup(interaction, `[KIS 복구] ${status}`);
-  } catch {
-    await interactionFollowup(interaction, '[KIS 복구] 안전 검증을 통과하지 못해 중단 상태를 유지합니다.').catch(() => {});
+  } catch (error) {
+    const errorClass = kisRecoveryErrorClass(payload, error);
+    await interactionFollowup(
+      interaction,
+      `[KIS 복구] 복구 요청 처리 실패\n오류 코드: ${errorClass}\n중단 상태를 유지하고 원인을 확인하세요.\n주문 재전송 없음`,
+    ).catch(() => {});
   }
 }
 
@@ -1170,6 +1183,7 @@ module.exports = {
     claimDeliveryKey,
     recoveryComponents,
     parseKisRecoveryCustomId,
+    kisRecoveryErrorClass,
     handleKisRecoveryInteraction,
     shouldHandle,
     shouldSendQueueOnlyNotice,
