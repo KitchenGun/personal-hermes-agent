@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { execFile } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -4228,6 +4229,116 @@ test('unknown or inconsistent evidence never schedules an automatic recheck', as
     assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
     assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
   }
+});
+
+test('recovery subprocess protocol failures are classified without retries or order resume', async () => {
+  for (const { name, stdout, stderr, error, expected } of [
+    {
+      name: 'empty argparse usage', stdout: '', stderr: 'usage: reconcile-paused [-h]\n', error: { code: 2 },
+      expected: 'reconciliation_cli_contract_invalid',
+    },
+    {
+      name: 'empty output', stdout: '', stderr: 'worker stopped\n', error: { code: 2, signal: 'SIGTERM' },
+      expected: 'reconciliation_output_missing',
+    },
+    {
+      name: 'truncated JSON', stdout: '{broken', stderr: '', error: { code: 2, signal: 'unbounded' },
+      expected: 'reconciliation_output_invalid',
+    },
+    {
+      name: 'JSON with surrounding noise', stdout: `before\n${orderGood('success', { action_type: 'reconciliation_recovered', reconciliations: 1 })}\nafter`, stderr: '', error: { code: 2 },
+      expected: 'reconciliation_output_invalid',
+    },
+    {
+      name: 'whitespace-only output', stdout: ' \n\t ', stderr: '', error: { code: 2 },
+      expected: 'reconciliation_output_invalid',
+    },
+  ]) {
+    const value = await pendingRecoveryFixture({
+      recoveryCallback(callback) { callback(error, stdout, stderr); },
+    });
+    await assert.rejects(value.approve(), new RegExp(expected), name);
+    const incident = value.task.status().incidents[value.incident.incident_id];
+    assert.equal(incident.status, 'escalated', name);
+    assert.equal(incident.sanitized_error_class, expected, name);
+    assert.deepEqual(incident.recovery_protocol, {
+      exit_code: 2,
+      signal: Object.hasOwn(os.constants.signals, error.signal) ? error.signal : null,
+      stdout_bytes: Buffer.byteLength(stdout, 'utf8'),
+      stderr_bytes: Buffer.byteLength(stderr, 'utf8'),
+      stdout_empty: stdout.length === 0,
+      stderr_usage: /(?:^|\n)usage:\s/im.test(stderr),
+    }, name);
+    for (const raw of [stdout, stderr]) if (raw) assert.equal(JSON.stringify(incident).includes(raw), false, name);
+    value.setClock('2026-07-21T00:11:00Z');
+    await value.task.tick();
+    assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 }, name);
+    assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED', name);
+  }
+});
+
+test('secret-like recovery stdout keeps the strict unsafe-output guard without protocol evidence', async () => {
+  const stdout = '{"client_secret":"this-output-must-never-be-stored"}';
+  const value = await pendingRecoveryFixture({
+    recoveryCallback(callback) { callback({ code: 2 }, stdout, ''); },
+  });
+  await assert.rejects(value.approve(), /unsafe_order_output/);
+  const incident = value.task.status().incidents[value.incident.incident_id];
+  assert.equal(incident.sanitized_error_class, 'unsafe_order_output');
+  assert.equal(incident.recovery_protocol, undefined);
+  assert.equal(JSON.stringify(incident).includes(stdout), false);
+  assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
+test('a new recovery approval clears stale protocol evidence before a non-protocol failure', async () => {
+  let attempt = 0;
+  const value = await pendingRecoveryFixture({
+    recoveryCallback(callback) {
+      attempt += 1;
+      if (attempt === 1) callback({ code: 2 }, '', 'usage: reconcile-paused [-h]\n');
+      else callback({ code: 2 }, orderGood('blocked', { error_class: 'reconciliation_auth_failed' }));
+    },
+  });
+  await assert.rejects(value.approve(), /reconciliation_cli_contract_invalid/);
+  assert.ok(value.task.status().incidents[value.incident.incident_id].recovery_protocol);
+  await assert.rejects(value.approve(), /reconciliation_auth_failed/);
+  assert.equal(value.task.status().incidents[value.incident.incident_id].recovery_protocol, undefined);
+  assert.deepEqual(value.calls(), { recoveryCalls: 2, orderRuns: 1 });
+});
+
+test('actual child-process recovery boundary classifies empty argparse output', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-recovery-child-'));
+  const script = path.join(root, 'empty-recovery.js');
+  fs.writeFileSync(script, "process.stderr.write('usage: reconcile-paused [-h]\\n'); process.exitCode = 2;");
+  const value = await pendingRecoveryFixture({
+    recoveryCallback(callback) { execFile(process.execPath, [script], callback); },
+  });
+  await assert.rejects(value.approve(), /reconciliation_cli_contract_invalid/);
+  const incident = value.task.status().incidents[value.incident.incident_id];
+  assert.deepEqual(incident.recovery_protocol, {
+    exit_code: 2, signal: null, stdout_bytes: 0, stderr_bytes: 29, stdout_empty: true, stderr_usage: true,
+  });
+  assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
+test('reconciliation command uses the configured KIS worktree with fixed read-only approval', async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-recovery-repo-'));
+  const modulePath = path.join(__dirname, 'kis-ai-market-open-dry-run-task.js');
+  const script = `const command = require(${JSON.stringify(modulePath)}).buildReconciliationRecoveryCommand(); process.stdout.write(JSON.stringify(command));`;
+  const stdout = await new Promise((resolve, reject) => {
+    execFile(process.execPath, ['-e', script], {
+      env: { ...process.env, KIS_TRADING_LAB_REPO_DIR: repoDir },
+    }, (error, value) => (error ? reject(error) : resolve(value)));
+  });
+  const command = JSON.parse(stdout);
+  assert.equal(command.cwd, repoDir);
+  assert.deepEqual(command.args, [
+    '-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'reconcile-paused',
+    '--read-only-broker',
+    '--confirm', '--approval', 'APPROVE_KIS_HERMES_VPS_RECONCILIATION_RECOVERY_V1',
+  ]);
 });
 
 test('expired and changed approvals stop rechecking without executing recovery', async () => {
