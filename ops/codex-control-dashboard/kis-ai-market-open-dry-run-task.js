@@ -4,6 +4,7 @@ const { execFile: defaultExecFile } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
@@ -34,7 +35,7 @@ const INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   intraday_policy_hash: crypto.createHash('sha256').update(INTRADAY_POLICY_VERSION).digest('hex'),
   daily_entry_cap: null,
 });
-const KIS_REPO = '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
+const KIS_REPO = process.env.KIS_TRADING_LAB_REPO_DIR || '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
 const KIS_VENV_PYTHON = '/home/ubuntu/.hermes/venvs/kis-trading-lab/bin/python';
 const VPS_DB_PATH = '/var/lib/kis-trading-lab/kis-vps.sqlite3';
 const STRATEGY_MANIFEST = 'config/adaptive_ai_dry_run_strategy_v1.json';
@@ -473,6 +474,22 @@ function processFailureEvidence(error, stderr) {
       raw || [error?.name, error?.code, error?.signal].join(':'),
     ).digest('hex'),
   });
+}
+
+function reconciliationProtocolError(errorClass, run) {
+  const stdout = String(run.stdout || '');
+  const stderr = String(run.stderr || '');
+  const signal = String(run.error?.signal || '');
+  const error = new Error(errorClass);
+  error.reconciliation_protocol = Object.freeze({
+    exit_code: Number.isFinite(run.error?.code) && Number.isInteger(run.error.code) ? run.error.code : null,
+    signal: Object.hasOwn(os.constants.signals, signal) ? signal : null,
+    stdout_bytes: Buffer.byteLength(stdout, 'utf8'),
+    stderr_bytes: Buffer.byteLength(stderr, 'utf8'),
+    stdout_empty: stdout.length === 0,
+    stderr_usage: /(?:^|\n)usage:\s/im.test(stderr),
+  });
+  return error;
 }
 
 function validateReportList(value, emptyValues, itemPattern, maxItems) {
@@ -1683,7 +1700,23 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (loadStrict().incidents[id].reconciliation_verified !== true) {
       const recoveryRun = await execute(buildReconciliationRecoveryCommand());
       if (recoveryRun.error && Number(recoveryRun.error.code) !== 2) throw new Error('reconciliation_recovery_process_error');
-      recovery = parseKisVpsAutonomousOutput(recoveryRun.stdout, ORDER_TASK.id, runtimeContract);
+      const stdout = String(recoveryRun.stdout || '');
+      if (stdout.length === 0) {
+        throw reconciliationProtocolError(
+          /(?:^|\n)usage:\s/im.test(String(recoveryRun.stderr || ''))
+            ? 'reconciliation_cli_contract_invalid'
+            : 'reconciliation_output_missing',
+          recoveryRun,
+        );
+      }
+      try {
+        recovery = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id, runtimeContract);
+      } catch (error) {
+        if (error.message === 'invalid_order_json') {
+          throw reconciliationProtocolError('reconciliation_output_invalid', recoveryRun);
+        }
+        throw error;
+      }
       if (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered') {
         throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
       }
@@ -1747,6 +1780,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       updated_at: now().toISOString(),
       attempts: Number(entry.attempts || 0) + 1,
     };
+    delete entry.recovery_protocol;
     save({ ...current, incidents: { ...current.incidents, [id]: entry } });
     recoveringIncident = true;
     try {
@@ -1803,6 +1837,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         ...current.incidents[id],
         status: canRecheck ? 'waiting_recheck' : 'escalated',
         sanitized_error_class: reason,
+        ...(error.reconciliation_protocol ? { recovery_protocol: error.reconciliation_protocol } : {}),
         next_recheck_at: canRecheck ? new Date(now().getTime() + POLL_INTERVAL_MS).toISOString() : null,
         result: { action: entry.scope, broker_order_api_calls: 0, order_reactivated: false },
         updated_at: now().toISOString(),
