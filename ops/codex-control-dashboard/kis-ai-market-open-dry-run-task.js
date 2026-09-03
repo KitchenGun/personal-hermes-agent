@@ -1051,6 +1051,12 @@ function isPostCloseRefreshSlot(task, value) {
   return Number(parts.hour) === 16 && Number(parts.minute) === 20;
 }
 
+function isPostCloseRecoveryWindow(task, value) {
+  if (task.id !== ORDER_TASK.id) return false;
+  const parts = seoulParts(value);
+  return Number(parts.hour) === 16 && Number(parts.minute) < 20;
+}
+
 function parseCutoverOutput(stdout) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_cutover_output');
@@ -1753,9 +1759,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       && current.tasks?.[entry.task_id]?.pause_reason === entry.error_class;
     const retryableApproval = !recheck && entry.status === 'escalated'
       && currentScope === 'reconcile_paused_once' && entry.attempts < RECONCILIATION_MAX_ATTEMPTS;
+    const completionReapproval = !recheck && entry.status === 'escalated'
+      && currentScope === 'reconcile_paused_once'
+      && Number(entry.attempts || 0) === RECONCILIATION_MAX_ATTEMPTS
+      && entry.reconciliation_verified === true
+      && entry.completion_reapproval_used !== true;
     const waiting = recheck && entry.status === 'waiting_recheck'
       && currentScope === 'reconcile_paused_once' && Boolean(entry.approved_at);
-    if (entry.status !== 'awaiting_approval' && !reclassified && !retryableApproval && !waiting) {
+    if (entry.status !== 'awaiting_approval' && !reclassified && !retryableApproval && !completionReapproval && !waiting) {
       throw new Error('incident_not_awaiting_approval');
     }
     if (waiting && (entry.attempts >= RECONCILIATION_MAX_ATTEMPTS
@@ -1779,6 +1790,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       recheck_expires_at: waiting ? entry.recheck_expires_at : new Date(now().getTime() + RECONCILIATION_APPROVAL_TTL_MS).toISOString(),
       updated_at: now().toISOString(),
       attempts: Number(entry.attempts || 0) + 1,
+      ...(completionReapproval ? { completion_reapproval_used: true } : {}),
     };
     delete entry.recovery_protocol;
     save({ ...current, incidents: { ...current.incidents, [id]: entry } });
@@ -2284,6 +2296,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (unresolvedIncident && invokedBy !== `incident:${unresolvedIncident.incident_id}`) {
         throw new Error('incident_approval_required');
       }
+      const checkpointVerifiedPostCloseRecovery = unresolvedIncident
+        && invokedBy === `incident:${unresolvedIncident.incident_id}`
+        && unresolvedIncident.task_id === ORDER_TASK.id
+        && unresolvedIncident.scope === 'reconcile_paused_once'
+        && unresolvedIncident.reconciliation_verified === true
+        && isPostCloseRecoveryWindow(ORDER_TASK, now());
       const recoveredPostCloseFailure = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
         && current.last_error_notification?.error_class
           === sanitizeErrorClass(current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class)
@@ -2311,6 +2329,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         || (prior.state === 'DISABLED' && prior.refresh_only_pending === true)
         || disabledAfterRefreshFailure
         || (prior.state === 'DISABLED' && recoveredPostCloseFailure)
+        || checkpointVerifiedPostCloseRecovery
       )
         && parsed.status === 'blocked'
         && parsed.failClosed === true
@@ -2329,7 +2348,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         throw new Error('artifact_recovery_hash_changed');
       }
       if (!activationReady && !waitingForPostCloseRefresh) {
-        throw new Error(`order_activation_check_failed:${parsed.errorClass}`);
+        throw new Error(parsed.errorClass && parsed.errorClass !== 'none'
+          ? parsed.errorClass
+          : 'order_activation_check_failed');
       }
       if (error && !waitingForPostCloseRefresh) {
         throw new Error('order_activation_check_process_error');

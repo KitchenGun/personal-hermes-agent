@@ -354,9 +354,12 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('vps-autonomous-order') && args.includes('activation-check')) {
+      const activationCheckOutput = typeof options.activationCheckOutput === 'function'
+        ? options.activationCheckOutput()
+        : options.activationCheckOutput;
       callback(
         options.activationCheckError || null,
-        options.activationCheckOutput || orderGood('success', { action_type: 'activation_check' }),
+        activationCheckOutput || orderGood('success', { action_type: 'activation_check' }),
       );
       return;
     }
@@ -1500,7 +1503,7 @@ test('unresolved ambiguous submission keeps the order task paused', async () => 
 
   await assert.rejects(
     value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
-    /order_activation_check_failed/,
+    /^Error: pending_order_reconciliation$/,
   );
   const after = value.task.status().tasks[mod.TASKS[4].id];
   assert.equal(after.state, 'PAUSED');
@@ -1519,9 +1522,20 @@ test('explicit enable parses safe exit two output and preserves the exact blocke
 
   await assert.rejects(
     value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
-    /order_activation_check_failed:pending_order_reconciliation/,
+    /^Error: pending_order_reconciliation$/,
   );
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('explicit enable does not surface none as an activation error', async () => {
+  const value = await active({
+    activationCheckOutput: orderGood('success', { action_type: 'no_candidate_no_op' }),
+  });
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /^Error: order_activation_check_failed$/,
+  );
 });
 
 test('explicit enable rejects a concurrent state transition instead of overwriting it', async () => {
@@ -4218,6 +4232,113 @@ test('successful reconciliation is checkpointed before a transient safety failur
   assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
   assert.equal(value.sent.filter((message) => message.content.includes('[KIS 복구]')).length, 1);
+});
+
+test('post-close checkpoint completion uses refresh-only activation without broker recovery', async () => {
+  let safetyCalls = 0;
+  let activationCheckOutput = orderGood('success', { action_type: 'activation_check' });
+  const value = await pendingRecoveryFixture({
+    safetyOutput: () => { safetyCalls += 1; return safetyOutput(); },
+    activationCheckOutput: () => activationCheckOutput,
+  });
+  activationCheckOutput = orderGood('blocked', {
+      action_type: 'paused', error_class: 'model_v3_prediction_batch_incomplete',
+  });
+  const checkpointed = value.task.status();
+  checkpointed.incidents[value.incident.incident_id] = {
+    ...checkpointed.incidents[value.incident.incident_id],
+    status: 'escalated', attempts: 3, reconciliation_verified: true,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(checkpointed));
+  value.setClock('2026-07-21T07:06:00Z');
+
+  const completed = await value.approve();
+
+  assert.equal(completed.status, 'resolved');
+  assert.equal(completed.attempts, 4);
+  assert.equal(completed.completion_reapproval_used, true);
+  assert.equal(value.calls().recoveryCalls, 0);
+  assert.equal(safetyCalls, 2);
+  const orderTask = value.task.status().tasks[mod.TASKS[4].id];
+  assert.equal(orderTask.state, 'ACTIVE');
+  assert.equal(orderTask.refresh_only_pending, true);
+  assert.equal(orderTask.last_run.order_api_calls, 0);
+});
+
+test('verified checkpoint completion activates after 16:20 when the batch is ready', async () => {
+  const value = await pendingRecoveryFixture();
+  const checkpointed = value.task.status();
+  checkpointed.incidents[value.incident.incident_id] = {
+    ...checkpointed.incidents[value.incident.incident_id],
+    status: 'escalated', attempts: 3, reconciliation_verified: true,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(checkpointed));
+  value.setClock('2026-07-21T07:25:00Z');
+
+  const completed = await value.approve();
+
+  assert.equal(completed.status, 'resolved');
+  assert.equal(completed.attempts, 4);
+  assert.equal(completed.completion_reapproval_used, true);
+  assert.equal(value.calls().recoveryCalls, 0);
+  const orderTask = value.task.status().tasks[mod.TASKS[4].id];
+  assert.equal(orderTask.state, 'ACTIVE');
+  assert.equal(orderTask.refresh_only_pending, false);
+});
+
+test('checkpoint refresh-only completion rejects wrong incidents and unverified checkpoints', async () => {
+  const unverified = await pendingRecoveryFixture();
+  const unverifiedState = unverified.task.status();
+  unverifiedState.incidents[unverified.incident.incident_id] = {
+    ...unverifiedState.incidents[unverified.incident.incident_id],
+    status: 'escalated', attempts: 3, reconciliation_verified: false,
+  };
+  fs.writeFileSync(unverified.paths.statePath, JSON.stringify(unverifiedState));
+  unverified.setClock('2026-07-21T07:06:00Z');
+  await assert.rejects(unverified.approve(), /incident_not_awaiting_approval/);
+  assert.deepEqual(unverified.calls(), { recoveryCalls: 0, orderRuns: 1 });
+
+  const value = await pendingRecoveryFixture();
+  const state = value.task.status();
+  state.incidents[value.incident.incident_id] = {
+    ...state.incidents[value.incident.incident_id],
+    status: 'repairing', attempts: 3, reconciliation_verified: true,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:06:00Z');
+  await assert.rejects(value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL, invokedBy: 'incident:wrong',
+  }), /incident_approval_required/);
+  assert.deepEqual(value.calls(), { recoveryCalls: 0, orderRuns: 1 });
+});
+
+test('a fifth approval is denied after one checkpoint completion reapproval', async () => {
+  let activationCheckOutput = orderGood('success', { action_type: 'activation_check' });
+  const value = await pendingRecoveryFixture({
+    activationCheckOutput: () => activationCheckOutput,
+  });
+  activationCheckOutput = orderGood('blocked', {
+      action_type: 'paused', error_class: 'model_v3_prediction_batch_incomplete',
+  });
+  const checkpointed = value.task.status();
+  checkpointed.incidents[value.incident.incident_id] = {
+    ...checkpointed.incidents[value.incident.incident_id],
+    status: 'escalated', attempts: 3, reconciliation_verified: true,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(checkpointed));
+  value.setClock('2026-07-21T07:06:00Z');
+  await value.approve();
+
+  await assert.rejects(value.approve(), /incident_not_awaiting_approval/);
+  assert.deepEqual(value.calls(), { recoveryCalls: 0, orderRuns: 1 });
+  const exhausted = value.task.status();
+  exhausted.incidents[value.incident.incident_id] = {
+    ...exhausted.incidents[value.incident.incident_id],
+    status: 'escalated', completion_reapproval_used: false,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(exhausted));
+  await assert.rejects(value.approve(), /incident_not_awaiting_approval/);
+  assert.deepEqual(value.calls(), { recoveryCalls: 0, orderRuns: 1 });
 });
 
 test('unknown or inconsistent evidence never schedules an automatic recheck', async () => {
