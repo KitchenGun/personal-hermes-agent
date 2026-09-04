@@ -4123,6 +4123,66 @@ test('approved reconciliation incident runs once and reactivates orders only aft
   assert.equal(recoveryCalls, 1);
 });
 
+test('order not fully filled uses the existing reconciliation recovery buttons', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, options, callback) {
+      if (args.includes('run-once')) {
+        callback({ code: 2 }, orderGood('blocked', { error_class: 'order_not_fully_filled' }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  const incident = Object.values(paused.incidents)
+    .find((entry) => entry.error_class === 'order_not_fully_filled');
+
+  assert.equal(incident.scope, 'reconcile_paused_once');
+  assert.equal(incident.status, 'awaiting_approval');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].components[0].components[0].label, '복구');
+});
+
+test('scheduler tick adds recovery buttons to an already-notified reconciliation pause', async () => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  markOrderActive(value);
+  const state = value.task.status();
+  const order = state.tasks[mod.TASKS[4].id];
+  const completedAt = '2026-09-04T03:10:01.000Z';
+  Object.assign(order, {
+    state: 'PAUSED', pause_reason: 'order_not_fully_filled', next_run_at: null,
+    last_due_at: '2026-09-04T03:10:00.000Z',
+    last_run: { status: 'blocked', action_type: 'paused', error_class: 'order_not_fully_filled', completed_at: completedAt },
+  });
+  state.order_pause_reason = 'order_not_fully_filled';
+  state.incidents = {};
+  state.last_error_notification = {
+    key: crypto.createHash('sha256').update([
+      mod.TASKS[4].id, order.last_due_at, completedAt, 'order_not_fully_filled',
+    ].join(':')).digest('hex'),
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-09-04T03:11:00.000Z');
+
+  const repaired = await value.task.tick();
+  const incident = Object.values(repaired.incidents)
+    .find((entry) => entry.error_class === 'order_not_fully_filled');
+
+  assert.equal(incident.scope, 'reconcile_paused_once');
+  assert.equal(incident.status, 'awaiting_approval');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].components[0].components[0].label, '복구');
+});
+
 test('incident recovery stays paused when reconciliation attempts an order submission', async () => {
   const value = await active({
     reportSender: async () => ({ discord_sent: true }),
