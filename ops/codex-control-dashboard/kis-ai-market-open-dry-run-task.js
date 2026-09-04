@@ -1654,7 +1654,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (errorClass === 'preflight_or_reconciliation_invalid') {
       return 'reconcile_paused_once';
     }
-    if (['pending_order_reconciliation', 'reconciliation_status_active', 'order_submission_unknown'].includes(errorClass)) {
+    if (['pending_order_reconciliation', 'reconciliation_status_active', 'order_submission_unknown', 'order_not_fully_filled'].includes(errorClass)) {
       return 'reconcile_paused_once';
     }
     if (['database_file_io_failed', 'account_risk_evidence_missing'].includes(errorClass)) {
@@ -1991,7 +1991,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       String(lastRun?.completed_at || ''),
       errorClass,
     ].join(':')).digest('hex');
-    if (pausedState.last_error_notification?.key === notificationKey) return pausedState;
+    const recoveryScope = incidentScope(pausedState, errorClass);
+    const recoveryIncidentExists = Object.values(pausedState.incidents || {}).some((incident) => (
+      incident.task_id === taskId
+      && incident.error_class === errorClass
+      && incident.state_hash === incidentStateHash(pausedState, taskId, errorClass)
+      && ['reconcile_paused_once', 'verified_io_resume'].includes(incident.scope)
+    ));
+    if (pausedState.last_error_notification?.key === notificationKey
+      && (!['reconcile_paused_once', 'verified_io_resume'].includes(recoveryScope) || recoveryIncidentExists)) {
+      return pausedState;
+    }
 
     const attempted = sendAllowed && typeof reportSender === 'function';
     const claim = save({
@@ -2006,7 +2016,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         claimed_at: now().toISOString(),
       },
     });
-    const recoveryScope = incidentScope(claim, errorClass);
     const incidentClaim = ['reconcile_paused_once', 'verified_io_resume'].includes(recoveryScope)
       ? recordIncident(claim, taskId, errorClass, lastRun)
       : null;
@@ -3075,6 +3084,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
       const time = now();
+      const pausedOrder = current.tasks?.[ORDER_TASK.id];
+      if (pausedOrder?.state === 'PAUSED'
+        && pausedOrder.pause_reason === 'order_not_fully_filled'
+        && !blockingIncident(current)) {
+        return notifyPause(current, ORDER_TASK.id, pausedOrder.pause_reason, pausedOrder.last_run || {});
+      }
       const waiting = Object.values(current.incidents || {}).find((entry) => entry.status === 'waiting_recheck');
       if (waiting) {
         if (Date.parse(waiting.next_recheck_at) > time.getTime()) return current;
