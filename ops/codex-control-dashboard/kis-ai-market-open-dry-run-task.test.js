@@ -4346,7 +4346,46 @@ test('verified checkpoint completion activates after 16:20 when the batch is rea
   assert.equal(orderTask.refresh_only_pending, false);
 });
 
-test('checkpoint refresh-only completion rejects wrong incidents and unverified checkpoints', async () => {
+test('exhausted recovery completes when KIS reports no pending reconciliation and safety is clear', async () => {
+  const value = await pendingRecoveryFixture({ recoveryReason: 'pending_reconciliation_not_found' });
+  const state = value.task.status();
+  state.incidents[value.incident.incident_id] = {
+    ...state.incidents[value.incident.incident_id],
+    status: 'escalated', attempts: 3, reconciliation_verified: false,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  const completed = await value.approve();
+
+  assert.equal(completed.status, 'resolved');
+  assert.equal(completed.reconciliation_verified, true);
+  assert.equal(completed.completion_reapproval_used, true);
+  assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'ACTIVE');
+});
+
+test('already-resolved recovery cannot reactivate orders after reported broker I/O', async () => {
+  for (const unsafeCounts of [{ order_api_calls: 1 }, { vps_live_orders: 1 }]) {
+    const value = await pendingRecoveryFixture({
+      recoveryCallback(callback) {
+        callback({ code: 2 }, orderGood('blocked', {
+          error_class: 'pending_reconciliation_not_found', ...unsafeCounts,
+        }));
+      },
+    });
+    const state = value.task.status();
+    state.incidents[value.incident.incident_id] = {
+      ...state.incidents[value.incident.incident_id],
+      status: 'escalated', attempts: 3, reconciliation_verified: false,
+    };
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+    await assert.rejects(value.approve(), /pending_reconciliation_not_found/);
+    assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+  }
+});
+
+test('checkpoint completion rejects wrong incidents and unresolved broker evidence', async () => {
   const unverified = await pendingRecoveryFixture();
   const unverifiedState = unverified.task.status();
   unverifiedState.incidents[unverified.incident.incident_id] = {
@@ -4355,8 +4394,8 @@ test('checkpoint refresh-only completion rejects wrong incidents and unverified 
   };
   fs.writeFileSync(unverified.paths.statePath, JSON.stringify(unverifiedState));
   unverified.setClock('2026-07-21T07:06:00Z');
-  await assert.rejects(unverified.approve(), /incident_not_awaiting_approval/);
-  assert.deepEqual(unverified.calls(), { recoveryCalls: 0, orderRuns: 1 });
+  await assert.rejects(unverified.approve(), /reconciliation_order_unfilled/);
+  assert.deepEqual(unverified.calls(), { recoveryCalls: 1, orderRuns: 1 });
 
   const value = await pendingRecoveryFixture();
   const state = value.task.status();
