@@ -1723,14 +1723,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
         throw error;
       }
-      if (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered') {
+      const alreadyResolved = recovery.status === 'blocked'
+        && recovery.failClosed === true
+        && recovery.errorClass === 'pending_reconciliation_not_found'
+        && recovery.orderApiCalls === 0
+        && recovery.vpsLiveOrders === 0;
+      if (!alreadyResolved
+        && (recovery.status !== 'success' || recovery.failClosed || recovery.actionType !== 'reconciliation_recovered')) {
         throw new Error(recovery.errorClass || 'reconciliation_recovery_failed');
       }
-      const current = loadStrict();
-      save({ ...current, incidents: { ...current.incidents, [id]: {
-        ...current.incidents[id], reconciliation_verified: true, status: 'waiting_recheck',
-        next_recheck_at: new Date(now().getTime() + POLL_INTERVAL_MS).toISOString(),
-      } } });
+      if (!alreadyResolved) {
+        const current = loadStrict();
+        save({ ...current, incidents: { ...current.incidents, [id]: {
+          ...current.incidents[id], reconciliation_verified: true, status: 'waiting_recheck',
+          next_recheck_at: new Date(now().getTime() + POLL_INTERVAL_MS).toISOString(),
+        } } });
+      }
     }
     for (let index = 0; index < 2; index += 1) {
       const safetyRun = await execute(buildSafetyMonitorCommand());
@@ -1742,6 +1750,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         || safety.account_risk_status !== 'clear') {
         throw new Error(safety.error_class || 'safety_monitor_not_clear');
       }
+    }
+    const current = loadStrict();
+    if (current.incidents[id].reconciliation_verified !== true) {
+      save({ ...current, incidents: { ...current.incidents, [id]: {
+        ...current.incidents[id], reconciliation_verified: true,
+      } } });
     }
     return recovery;
   }
@@ -1762,7 +1776,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const completionReapproval = !recheck && entry.status === 'escalated'
       && currentScope === 'reconcile_paused_once'
       && Number(entry.attempts || 0) === RECONCILIATION_MAX_ATTEMPTS
-      && entry.reconciliation_verified === true
       && entry.completion_reapproval_used !== true;
     const waiting = recheck && entry.status === 'waiting_recheck'
       && currentScope === 'reconcile_paused_once' && Boolean(entry.approved_at);
