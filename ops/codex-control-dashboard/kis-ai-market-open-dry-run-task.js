@@ -2962,6 +2962,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function runSafetyMonitor(current, checkedAt) {
     const last = current.last_safety_monitor;
     if (!safetyMonitorEnabled || sameMinute(last?.checked_at, checkedAt)) return current;
+    const parts = seoulParts(checkedAt);
+    const officialTradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+    try {
+      const proof = calendarProofResolver(officialTradeDate);
+      const orderTask = current.tasks[ORDER_TASK.id];
+      if (proof.isTradingDay === false && orderTask?.state === 'ACTIVE'
+        && !orderTask.pending_invocation && !blockingIncident(current)) return current;
+    } catch { /* Unknown calendar coverage must continue through the fail-closed monitor. */ }
     const monitorRun = { checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false };
     let result;
     try {
@@ -3058,10 +3066,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       return notifyPause(paused, notificationTaskId, reason, paused.tasks[notificationTaskId].last_run);
     }
     const orderTask = current.tasks[ORDER_TASK.id];
+    const incident = blockingIncident(current);
+    const autoResolvedIncident = incident?.scope === 'verified_io_resume'
+      && incident.task_id === ORDER_TASK.id
+      && incident.error_class === orderTask?.pause_reason
+      && ERROR_POLICY[incident.error_class]?.autoResume === true;
     const resumeOrder = current.order_activated_at
       && orderTask?.state === 'PAUSED'
       && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(orderTask.pause_reason)
-      && !blockingIncident(current)
+      && (!incident || autoResolvedIncident)
       && (orderTask.pause_reason !== 'account_risk_status_active'
         || orderTask.last_run?.execution_owner === 'vps');
     const deferRecoveredOrder = monitorRun.reconciliation_recovery_succeeded === true
@@ -3070,6 +3083,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     return save({
       ...current,
       ...(resumeOrder ? { order_pause_reason: undefined } : {}),
+      ...(autoResolvedIncident ? { incidents: {
+        ...current.incidents,
+        [incident.incident_id]: {
+          ...incident,
+          status: 'resolved',
+          result: {
+            action: 'safety_monitor_auto_recovered',
+            broker_order_api_calls: 0,
+            order_reactivated: true,
+          },
+          updated_at: checkedAt.toISOString(),
+        },
+      } } : {}),
       consecutive_safety_monitor_failures: 0,
       last_safety_monitor: deferRecoveredOrder
         ? { ...monitorRun, order_slot_deferred: true }
