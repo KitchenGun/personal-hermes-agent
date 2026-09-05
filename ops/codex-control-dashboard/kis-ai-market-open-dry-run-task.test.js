@@ -4043,6 +4043,9 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'llm_response_timeout');
+  const durations = state.tasks[mod.TASKS[4].id].last_run.stage_duration_ms;
+  assert.deepEqual(Object.keys(durations).sort(), ['decision_context', 'llm']);
+  assert.ok(Object.values(durations).every((value) => Number.isFinite(value) && value >= 0));
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
   const nextDueAt = new Date('2026-07-21T00:20:00Z');
@@ -4052,6 +4055,46 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(nextState.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
   assert.equal(orderRuns, 0);
+});
+
+test('stage durations measure only executed phases and same-slot replay does not repeat work', async () => {
+  let calls = 0;
+  const value = await active({
+    decisionContextOutput: (slotId) => decisionContext(slotId, []),
+    llmExecutor: async () => { throw new Error('must not run'); },
+    execFile(command, args, options, callback) {
+      calls += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  const durations = state.tasks[mod.TASKS[4].id].last_run.stage_duration_ms;
+  assert.deepEqual(Object.keys(durations).sort(), ['decision_context', 'kis_cli']);
+  assert.ok(Object.values(durations).every((item) => Number.isFinite(item) && item >= 0));
+  assert.equal(calls, 1);
+  const replay = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(calls, 1);
+  assert.deepEqual(replay.tasks[mod.TASKS[4].id].last_run.stage_duration_ms, durations);
+});
+
+test('process failure preserves numeric phase timing without persisting process output', async () => {
+  const value = await active({
+    execFile(command, args, options, callback) {
+      callback(Object.assign(new Error('private failure'), { code: 1 }), 'PRIVATE_STDOUT', 'PRIVATE_STDERR');
+    },
+  });
+  const dueAt = new Date('2026-07-21T00:00:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt });
+  const lastRun = state.tasks[mod.TASKS[0].id].last_run;
+  assert.equal(lastRun.error_class, 'process_error');
+  assert.deepEqual(Object.keys(lastRun.stage_duration_ms).sort(), ['kis_cli', 'universe_refresh']);
+  assert.ok(Number.isFinite(lastRun.stage_duration_ms.kis_cli));
+  assert.ok(lastRun.stage_duration_ms.kis_cli >= 0);
+  assert.doesNotMatch(JSON.stringify(lastRun), /PRIVATE_STDOUT|PRIVATE_STDERR|private failure/);
 });
 
 test('missing intraday decision degrades one slot without pausing the order task', async () => {

@@ -1505,11 +1505,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }
   }
 
-  async function createAiVerdictFile(taskId, slotId, dueTime, schedulerToken) {
+  async function createAiVerdictFile(taskId, slotId, dueTime, schedulerToken, stageDurations) {
     if (typeof llmExecutor !== 'function' || typeof verdictDir !== 'string' || verdictDir.length === 0) {
       throw new Error('llm_verdict_contract_unavailable');
     }
-    const contextRun = await execute(buildDecisionContextCommand(schedulerToken, slotId));
+    const contextRun = await execute(buildDecisionContextCommand(schedulerToken, slotId), stageDurations, 'decision_context');
     if (contextRun.error && Number(contextRun.error.code) !== 2) {
       throw new Error(contextRun.error.killed ? 'decision_context_timeout' : 'decision_context_process_error');
     }
@@ -1528,9 +1528,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let timeout;
     const timed = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('llm_response_timeout')), LLM_RESPONSE_TIMEOUT_MS); });
     let response;
+    const llmStarted = process.hrtime.bigint();
     try {
       response = await Promise.race([Promise.resolve(llmExecutor({ model: LLM_MODEL_ID, timeoutMs: LLM_RESPONSE_TIMEOUT_MS, packet })), timed]);
-    } finally { clearTimeout(timeout); }
+    } finally {
+      clearTimeout(timeout);
+      stageDurations.llm = Number(process.hrtime.bigint() - llmStarted) / 1e6;
+    }
     const responseValue = typeof response === 'string' ? (() => { try { return JSON.parse(response); } catch { throw new Error('invalid_ai_verdict'); } })() : response;
     if (now().getTime() >= dueTime.getTime() + (10 * 60_000)) throw new Error('late_ai_verdict');
     const serialized = parseAiVerdict(responseValue, packet, runtimeContract);
@@ -2137,15 +2141,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       },
     };
   }
-  function execute(command) {
-    return new Promise((resolve) => {
+  async function execute(command, stageDurations = null, phase = null) {
+    const started = process.hrtime.bigint();
+    try { return await new Promise((resolve) => {
       execFile(command.command, command.args, {
         cwd: command.cwd,
         env: { ...process.env, ...(command.env || {}) },
         timeout: command.timeoutMs || execTimeoutMs,
         maxBuffer,
       }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
-    });
+    }); } finally {
+      if (stageDurations) stageDurations[phase] = Number(process.hrtime.bigint() - started) / 1e6;
+    }
   }
   async function activate({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== ACTIVATION_APPROVAL) throw new Error('exact_activation_approval_required');
@@ -2514,7 +2521,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }
     let taskState = current.tasks[taskId];
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE') return current;
+    const stageDurations = {};
     const pauseForTask = async (state, reason, lastRun, options) => {
+      lastRun = { ...lastRun, stage_duration_ms: { ...stageDurations } };
       try {
         const policy = ERROR_POLICY[sanitizeErrorClass(reason)] || {};
         const paused = policy.scope === 'global'
@@ -2536,6 +2545,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
     };
     const handleTransientFailure = async (state, reason, lastRun) => {
+      lastRun = { ...lastRun, stage_duration_ms: { ...stageDurations } };
       const latestTask = state.tasks[taskId];
       const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
       lastRun.consecutive_transport_failures = consecutive;
@@ -2611,7 +2621,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (requiresAiVerdict) {
         try {
-          const verdict = await createAiVerdictFile(taskId, key, dueTime, schedulerToken);
+          const verdict = await createAiVerdictFile(taskId, key, dueTime, schedulerToken, stageDurations);
           verdictPath = verdict?.path || null;
           promptHash = verdict?.promptHash || '';
           decisionContextCandidateCount = verdict?.candidateCount || 0;
@@ -2646,6 +2656,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
             status: 'no_op', action_type: 'transport_degraded_no_op',
             error_class: reason, fail_closed: true, retry: false,
+            stage_duration_ms: { ...stageDurations },
           };
           if (ERROR_POLICY[reason]?.slotDegradeOnly === true) {
             const latest = loadStrict();
@@ -2666,7 +2677,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let weeklyUniverse = null;
       let independentShadowRefresh = null;
       if (isWeeklyUniverseRefreshDue(task, dueTime)) {
-        const weekly = await execute(buildWeeklyUniverseCommand());
+        const weekly = await execute(buildWeeklyUniverseCommand(), stageDurations, 'universe_refresh');
         if (weekly.error && Number(weekly.error.code) !== 2) {
           weeklyUniverse = {
             status: 'blocked', actionType: 'weekly_universe_refresh', isoWeek: 'unknown',
@@ -2686,7 +2697,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const command = buildCommand(taskId, { schedulerToken, dueKey: key, verdictPath, promptHash });
-      const { error, stdout, stderr } = await execute(command);
+      const { error, stdout, stderr } = await execute(command, stageDurations, 'kis_cli');
       if (error && Number(error.code) !== 2) {
         const errorClass = error.killed ? 'timeout' : 'process_error';
         const lastRun = {
@@ -2712,7 +2723,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
       }
       if (task.id === POST_CLOSE_TASK.id && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
-        const refresh = await execute(buildIndependentShadowRefreshCommand());
+        const refresh = await execute(buildIndependentShadowRefreshCommand(), stageDurations, 'shadow_refresh');
         if (refresh.error && Number(refresh.error.code) !== 2) {
           independentShadowRefresh = {
             status: 'blocked', actionType: 'paused', predictionsInserted: 0,
@@ -2811,6 +2822,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         });
       }
       let lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
+      lastRun.stage_duration_ms = { ...stageDurations };
       if (weeklyUniverse) {
         Object.assign(lastRun, {
           weekly_universe_status: weeklyUniverse.status,
