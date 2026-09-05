@@ -61,6 +61,32 @@ Forbidden in responses:
 
 ## Acceptance
 
+### KIS per-order review (record only)
+
+The shared-secret-protected POST `/api/kis/ai-market-open-dry-run/order-reviews`
+accepts an `order` with exact fields: `environment` (`vps` or `prod`),
+`account_ref` (opaque SHA-256 reference, never an account number), `account_alias`
+(human-readable nonnumeric alias), `symbol`, `name`, `side` (`buy` or `sell`),
+`quantity`, and `limit_price_krw` (positive safe integers).
+
+The existing Discord relay displays the exact terms and confirm/deny buttons.
+Review expires after 60 seconds and is bound to its order hash and Discord
+message ID. The callback requires the existing operator/channel allowlists,
+shared secret, and interaction replay guard. A second click, changed terms,
+clock rollback, or unconfirmed delivery does not record a new decision. A
+delivery timeout is not retried. Review data uses a separate `.order-review.json`
+sidecar and exclusive lock with the existing atomic-write/lock helpers, so an
+older scheduler snapshot cannot overwrite a decision. An uncertain callback
+result is distinguished from a confirmed rejection; follow-up notification
+failure never changes a recorded receipt into a failed decision.
+
+Confirmation only records `confirmed`: both `order_submitted` and
+`execution_authorized` remain false. No broker, account API, scheduler, recovery,
+cutover, or activation action is invoked. The automatic proposal producer and
+live-order submission are not connected. Existing trading policy is unchanged;
+this endpoint is not an order-approval bypass. Deploy separately after review;
+fake-sender tests do not prove live Discord delivery.
+
 Run `ops/codex-control-dashboard/dashboard-smoke.sh` after deployment.
 
 Expected checks:
