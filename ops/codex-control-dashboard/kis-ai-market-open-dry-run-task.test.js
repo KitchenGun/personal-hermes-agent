@@ -403,6 +403,56 @@ function markOrderActive(value) {
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
 }
 
+test('order review receipt survives reload and never activates or executes a task', async () => {
+  let sends = 0;
+  let commands = 0;
+  const value = fixture({
+    execFile() { commands += 1; throw new Error('no subprocess allowed'); },
+    reportSender: async (message) => {
+      sends += 1;
+      assert.match(message.content, /주문은 제출하지 않습니다/);
+      return { discord_sent: true, message_id: '123456789012345670' };
+    },
+  });
+  value.task.prepareDisabled();
+  const before = value.task.status();
+  const proposal = { environment: 'prod', account_ref: 'a'.repeat(64), account_alias: '주식 전용',
+    symbol: '005930', name: '삼성전자', side: 'buy', quantity: 2, limit_price_krw: 70000 };
+  const receipt = await value.task.requestOrderReview(proposal);
+  await assert.rejects(value.task.requestOrderReview(proposal), /order_review_pending_or_recent/);
+  const reloaded = mod.createKisAiMarketOpenDryRunTask({ ...value.paths,
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT, now: () => new Date('2026-07-20T23:59:30Z') });
+  const input = { id: receipt.id, action: 'confirm', messageId: '123456789012345670',
+    userId: '123456789012345671', interactionId: '123456789012345672', channelId: '1512691418605420634' };
+  const decided = reloaded.decideOrderReview(input);
+  assert.equal(decided.status, 'confirmed');
+  assert.equal(decided.order_submitted, false);
+  assert.equal(decided.execution_authorized, false);
+  // A stale scheduler snapshot must not roll a confirmed review back to pending.
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  assert.throws(() => reloaded.decideOrderReview(input), /already_decided/);
+  assert.equal(reloaded.status().state, before.state);
+  assert.deepEqual(reloaded.status().tasks, before.tasks);
+  assert.equal(commands, 0);
+  assert.equal(sends, 1);
+});
+
+test('ambiguous order review delivery never retries or accepts confirmation', async () => {
+  let sends = 0;
+  const value = fixture({ reportSender: async () => { sends += 1; return { discord_sent: true }; } });
+  value.task.prepareDisabled();
+  const proposal = { environment: 'vps', account_ref: 'a'.repeat(64), account_alias: '주식 전용',
+    symbol: '005930', name: '삼성전자', side: 'sell', quantity: 1, limit_price_krw: 70000 };
+  await assert.rejects(value.task.requestOrderReview(proposal), /delivery_unconfirmed/);
+  const saved = JSON.parse(fs.readFileSync(`${value.paths.statePath}.order-review.json`, 'utf8'));
+  assert.equal(saved.delivery_status, 'claimed');
+  assert.throws(() => value.task.decideOrderReview({ id: saved.id, action: 'confirm',
+    messageId: '123456789012345670', userId: '123456789012345671',
+    interactionId: '123456789012345672', channelId: '1512691418605420634' }), /message_mismatch/);
+  await assert.rejects(value.task.requestOrderReview(proposal), /pending_or_recent/);
+  assert.equal(sends, 1);
+});
+
 test('exact activation approval enables four dry-run schedules and keeps order disabled', async () => {
   const value = fixture();
   value.task.prepareDisabled();

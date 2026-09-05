@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const orderReview = require('./kis-order-review');
 
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const RESUME_AFTER_IO_FIX_APPROVAL = 'APPROVE_KIS_HERMES_AI_DRY_RUN_RESUME_AFTER_IO_FIX_V1';
@@ -1956,6 +1957,44 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }
   }
   function prepareDisabled() { return save(disabledState()); }
+  const orderReviewPath = `${statePath}.order-review.json`;
+  function readOrderReview() {
+    try {
+      const review = JSON.parse(fs.readFileSync(orderReviewPath, 'utf8'));
+      if (!review || !Number.isFinite(Date.parse(review.expires_at))) throw new Error('invalid review');
+      return review;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw new Error('order_review_state_invalid');
+    }
+  }
+  async function requestOrderReview(order) {
+    loadStrict();
+    const release = acquireExclusiveLock(`${orderReviewPath}.lock`);
+    try {
+      const previous = readOrderReview();
+      if (previous && Date.parse(previous.expires_at) > now().getTime()) throw new Error('order_review_pending_or_recent');
+      if (typeof reportSender !== 'function') throw new Error('report_sender_missing');
+      const review = orderReview.createReview(order, now());
+      atomicWrite(orderReviewPath, review);
+      try {
+        const delivery = await reportSender(orderReview.reviewMessage(review));
+        if (delivery?.discord_sent !== true || delivery.duplicate_suppressed === true
+          || !/^\d{16,24}$/.test(delivery.message_id || '')) throw new Error('order_review_delivery_unconfirmed');
+        atomicWrite(orderReviewPath, { ...review, delivery_status: 'sent', message_id: delivery.message_id });
+      } catch { throw new Error('order_review_delivery_unconfirmed'); }
+      return { id: review.id, status: 'pending', order_submitted: false, execution_authorized: false };
+    } finally { release(); }
+  }
+  function decideOrderReview(input) {
+    loadStrict();
+    const release = acquireExclusiveLock(`${orderReviewPath}.lock`);
+    try {
+      const review = orderReview.decideReview(readOrderReview(), input, now());
+      atomicWrite(orderReviewPath, review);
+      return { id: review.id, status: review.status, order_submitted: false, execution_authorized: false };
+    } finally { release(); }
+  }
   function assertLegacyPaused() {
     readPausedLegacyState(legacyV1StatePath, 'model_v1');
     readPausedLegacyState(legacyV2StatePath, 'model_v2');
@@ -3224,6 +3263,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   return {
     statePath, status, prepareDisabled, activate, resumeAfterIoFix, enableOrderTask,
     incidentStatus, approveIncident, denyIncident,
+    requestOrderReview, decideOrderReview,
     approveAggressiveDailyEntryCap, cutoverIntradayProvider, runOnce, start, stop, tick, buildCommand,
   };
 }
