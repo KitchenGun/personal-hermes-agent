@@ -3310,6 +3310,28 @@ test('one-minute safety monitor keeps supervision active and pauses only orders 
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
 });
 
+test('official non-trading days do not query account risk or pause an active order task', async () => {
+  let safetyCalls = 0;
+  let tradingDay = true;
+  const value = await active({
+    schedulerRegistered: true,
+    calendarProofResolver: () => calendarProof(tradingDay),
+    safetyOutput() {
+      safetyCalls += 1;
+      return safetyOutput('blocked', { error_class: 'account_risk_evidence_missing' });
+    },
+  });
+  markOrderActive(value);
+  tradingDay = false;
+  value.setClock('2026-09-05T00:29:00Z');
+
+  const state = await value.task.tick();
+
+  assert.equal(safetyCalls, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(Object.values(state.incidents).length, 0);
+});
+
 test('VPS account-risk state pauses new orders while supervision remains active', async () => {
   const options = {
     schedulerRegistered: true,
@@ -3337,6 +3359,35 @@ test('VPS account-risk state pauses new orders while supervision remains active'
   assert.equal(recovered.tasks[mod.TASKS[4].id].pause_reason, undefined);
   assert.equal(recovered.retry, false);
   assert.equal(recovered.catch_up, false);
+});
+
+test('clear account risk resolves its recovery incident and reactivates orders', async () => {
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      execution_owner: 'vps', account_risk_status: 'unknown',
+      open_order_status: 'unknown', error_class: 'account_risk_evidence_missing',
+    }),
+  };
+  const value = await active(options);
+  markOrderActive(value);
+  value.setClock('2026-07-21T00:01:00Z');
+  await value.task.tick();
+  value.setClock('2026-07-21T00:02:00Z');
+  const paused = await value.task.tick();
+  const incident = Object.values(paused.incidents)
+    .find((entry) => entry.error_class === 'account_risk_evidence_missing');
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(incident.status, 'awaiting_approval');
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:03:00Z');
+  const recovered = await value.task.tick();
+
+  assert.equal(recovered.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(recovered.incidents[incident.incident_id].status, 'resolved');
+  assert.equal(recovered.incidents[incident.incident_id].result.order_reactivated, true);
+  assert.equal(recovered.incidents[incident.incident_id].result.broker_order_api_calls, 0);
 });
 
 test('prod account-risk state remains paused after a clear monitor', async () => {
