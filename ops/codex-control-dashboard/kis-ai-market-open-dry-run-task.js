@@ -180,6 +180,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['intraday_universe_invalid', { resumable: true }],
   ['invalid_failure_evidence', { resumable: true }],
   ['balance_mismatch', { orderRecovery: true }],
+  ['order_rejected', { persistent: true, orderRecovery: true, scope: 'order' }],
   ['order_not_fully_filled', { orderRecovery: true }],
   ['invalid_order_output_contract', { orderRecovery: true }],
   ['unsafe_order_count', { orderRecovery: true }],
@@ -753,7 +754,7 @@ function parseKisVpsAutonomousOutput(
     || !(value.order_name === null || (typeof value.order_name === 'string' && ORDER_NAME_RE.test(value.order_name)))
     || !(value.order_side === null || ['buy', 'sell'].includes(value.order_side))
     || !(value.lifecycle_status === null
-      || ['submitted', 'accepted', 'partial_fill', 'filled', 'cancelled', 'liquidated', 'unknown'].includes(value.lifecycle_status))
+      || ['submitted', 'accepted', 'rejected', 'partial_fill', 'filled', 'cancelled', 'liquidated', 'unknown'].includes(value.lifecycle_status))
     || !Array.isArray(value.decision_reason_codes) || value.decision_reason_codes.length > 5
     || value.decision_reason_codes.some((code) => !AI_REASON_CODES.has(code))
     || !(value.notification_idempotency_key === null
@@ -831,7 +832,7 @@ function buildOrderLifecycleMessage(parsed) {
   if (!parsed?.notificationIdempotencyKey) return null;
   const side = parsed.orderSide === 'buy' ? '매수' : '매도';
   const status = {
-    submitted: '제출', accepted: '접수', partial_fill: '부분체결', filled: '완전체결',
+    submitted: '제출', accepted: '접수', rejected: '거절 (접수되지 않음)', partial_fill: '부분체결', filled: '완전체결',
     cancelled: '취소', liquidated: '청산', unknown: '제출상태 확인 중',
   }[parsed.lifecycleStatus];
   const quantity = parsed.lifecycleStatus === 'partial_fill'
@@ -2338,6 +2339,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
+      if (prior.pause_reason === 'order_rejected') {
+        const safetyRun = await execute(buildSafetyMonitorCommand());
+        if (safetyRun.error) throw new Error('safety_monitor_process_error');
+        const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+        if (safety.status !== 'success' || safety.execution_owner !== 'vps'
+          || safety.process_lock !== 'clear' || safety.kill_state !== 'clear'
+          || safety.open_order_status !== 'clear' || safety.reconciliation_status !== 'clear'
+          || safety.account_risk_status !== 'clear') {
+          throw new Error(safety.error_class === 'none' ? 'safety_monitor_not_clear' : safety.error_class);
+        }
+      }
       const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
       if (error && Number(error.code) !== 2) throw new Error('order_activation_check_process_error');
       const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id, runtimeContract);

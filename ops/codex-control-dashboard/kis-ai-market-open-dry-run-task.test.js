@@ -1409,6 +1409,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'llm_candidate_limit_exceeded',
     'http_transport_failed',
     'balance_mismatch',
+    'order_rejected',
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
@@ -1441,6 +1442,35 @@ test('explicit enable check reactivates an order task paused for known reconcili
     assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
     assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, undefined);
     assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+  }
+});
+
+test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
+  for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
+    { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
+    { execution_owner: 'prod' }]) {
+    let safetyReads = 0;
+    let orderRuns = 0;
+    const value = await active({
+      safetyOutput: () => { safetyReads += 1; return safetyOutput('success', extra || {}); },
+      execFile(c, a, o, cb) { orderRuns += 1; cb(null, orderGood()); },
+    });
+    const paused = value.task.status();
+    paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+    paused.tasks[mod.TASKS[4].id].pause_reason = 'order_rejected';
+    paused.tasks[mod.TASKS[4].id].next_run_at = null;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+    const resume = () => value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    if (extra) {
+      await assert.rejects(resume);
+      assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+    } else {
+      const state = await resume();
+      assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+      assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+    }
+    assert.equal(safetyReads, 1);
+    assert.equal(orderRuns, 0);
   }
 });
 
@@ -3145,6 +3175,31 @@ test('order lifecycle notification is once-only and delivery failure never retri
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_duplicate_suppressed, true);
   assert.equal(sent.length, 1);
   assert.equal(orderRuns, 2);
+});
+
+test('broker rejection reports rejection once and keeps orders paused without retry', async () => {
+  const sent = [];
+  let orderRuns = 0;
+  const output = orderGood('blocked', {
+    error_class: 'order_rejected', order_api_calls: 1, vps_live_orders: 1,
+    order_symbol: '005930', order_name: '삼성전자', order_side: 'buy', requested_quantity: 1,
+    filled_quantity: 0, unfilled_quantity: 0, lifecycle_status: 'rejected',
+    decision_reason_codes: ['MOMENTUM_CONFIRMATION'], notification_idempotency_key: 'd'.repeat(64),
+  });
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, output); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'order_rejected');
+  assert.equal(orderRuns, 1);
+  const messages = sent.filter((message) => message.idempotencyKey === 'd'.repeat(64));
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].content, /상태: 거절 \(접수되지 않음\)/);
+  assert.doesNotMatch(messages[0].content, /상태: 접수/);
 });
 
 test('intraday AI verdict is bounded, passed by path only, and deleted after KIS completes', async () => {
