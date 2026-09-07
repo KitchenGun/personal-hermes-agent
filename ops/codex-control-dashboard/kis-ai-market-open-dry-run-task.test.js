@@ -1410,6 +1410,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'http_transport_failed',
     'balance_mismatch',
     'order_rejected',
+    'duplicate_order_blocked',
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
@@ -1446,6 +1447,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
 });
 
 test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
+  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked']) {
   for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
     { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
     { execution_owner: 'prod' }]) {
@@ -1457,7 +1459,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
     });
     const paused = value.task.status();
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
-    paused.tasks[mod.TASKS[4].id].pause_reason = 'order_rejected';
+    paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
     paused.tasks[mod.TASKS[4].id].next_run_at = null;
     fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
     const resume = () => value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
@@ -1471,6 +1473,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
     }
     assert.equal(safetyReads, 1);
     assert.equal(orderRuns, 0);
+  }
   }
 });
 
@@ -3175,6 +3178,27 @@ test('order lifecycle notification is once-only and delivery failure never retri
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_duplicate_suppressed, true);
   assert.equal(sent.length, 1);
   assert.equal(orderRuns, 2);
+});
+
+test('duplicate-entry no-op keeps subsequent slots active without order notifications', async () => {
+  const sent = [];
+  let runs = 0;
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(c, a, o, cb) {
+      runs += 1;
+      cb(null, orderGood('no_op', { action_type: 'idempotent_no_op', daily_entry_count: 1 }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  for (const time of ['2026-07-21T00:10:00Z', '2026-07-21T00:20:00Z']) {
+    value.setClock(time);
+    const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(time) });
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_api_calls, 0);
+  }
+  assert.equal(runs, 2);
+  assert.equal(sent.length, 0);
 });
 
 test('broker rejection reports rejection once and keeps orders paused without retry', async () => {

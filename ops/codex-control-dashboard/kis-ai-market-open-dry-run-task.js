@@ -181,6 +181,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['invalid_failure_evidence', { resumable: true }],
   ['balance_mismatch', { orderRecovery: true }],
   ['order_rejected', { persistent: true, orderRecovery: true, scope: 'order' }],
+  ['duplicate_order_blocked', { persistent: true, orderRecovery: true, scope: 'order' }],
   ['order_not_fully_filled', { orderRecovery: true }],
   ['invalid_order_output_contract', { orderRecovery: true }],
   ['unsafe_order_count', { orderRecovery: true }],
@@ -2339,7 +2340,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (prior.pause_reason === 'order_rejected') {
+      if (['order_rejected', 'duplicate_order_blocked'].includes(prior.pause_reason)) {
         const safetyRun = await execute(buildSafetyMonitorCommand());
         if (safetyRun.error) throw new Error('safety_monitor_process_error');
         const safety = parseSafetyMonitorOutput(safetyRun.stdout);
