@@ -1411,6 +1411,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'balance_mismatch',
     'order_rejected',
     'duplicate_order_blocked',
+    'intraday_prediction_attestation_mismatch',
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
@@ -1433,7 +1434,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
     paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
     paused.tasks[mod.TASKS[4].id].next_run_at = null;
-    if (pauseReason === 'model_v3_artifact_attestation_mismatch') {
+    if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch'].includes(pauseReason)) {
       paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
     }
     fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
@@ -1447,7 +1448,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
 });
 
 test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
-  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked']) {
+  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch']) {
   for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
     { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
     { execution_owner: 'prod' }]) {
@@ -1461,6 +1462,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
     paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
     paused.tasks[mod.TASKS[4].id].next_run_at = null;
+    paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
     fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
     const resume = () => value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
     if (extra) {
@@ -1478,6 +1480,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
 });
 
 test('artifact mismatch recovery refuses to rotate the attested artifact', async () => {
+  for (const pauseReason of ['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch']) {
   const value = await active({
     activationCheckOutput: orderGood('success', {
       action_type: 'activation_check', artifact_hash: 'b'.repeat(64),
@@ -1485,7 +1488,7 @@ test('artifact mismatch recovery refuses to rotate the attested artifact', async
   });
   const paused = value.task.status();
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
-  paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_artifact_attestation_mismatch';
+  paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
   paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
   fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
@@ -1495,6 +1498,7 @@ test('artifact mismatch recovery refuses to rotate the attested artifact', async
     /artifact_recovery_hash_changed/,
   );
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+  }
 });
 
 test('attestation contract recovery requires runtime source parity', async () => {
