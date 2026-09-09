@@ -83,6 +83,7 @@ const MAX_AI_CANDIDATES = REQUIRED_RUNTIME_CONTRACT.slot_review_limit;
 const MIN_VPS_CUTOVER_DAYS = 20;
 const MIN_RECONCILED_ROUND_TRIPS = 30;
 const AI_DECISION_ACTIONS = new Set(['ENTER', 'EXIT', 'HOLD', 'HOLD_OVERNIGHT', 'REJECT']);
+const HELD_POSITION_ACTIONS = new Set(['EXIT', 'HOLD', 'HOLD_OVERNIGHT']);
 const AI_CONFIDENCE_BUCKETS = new Set(['low', 'medium', 'high']);
 const AI_REASON_CODES = new Set([
   'DATA_QUALITY', 'MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH', 'EVENT_RISK',
@@ -119,6 +120,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['unknown_runtime_io_failed', { autoResume: true, resumable: true, orderRecovery: true, scope: 'order' }],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_position_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
+  ['llm_held_position_action_invalid', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
@@ -901,6 +903,7 @@ function buildSanitizedAiPacket({ slotId, context, runtimeContract = REQUIRED_RU
     event_metadata: context.event_metadata,
     decision_contract: {
       actions: [...AI_DECISION_ACTIONS].sort(),
+      held_position_actions: [...HELD_POSITION_ACTIONS].sort(),
       confidence_buckets: [...AI_CONFIDENCE_BUCKETS].sort(),
       reason_codes: [...AI_REASON_CODES].sort(),
       max_candidates: runtimeContract.slot_review_limit,
@@ -939,6 +942,10 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
       || new Set(decision.reason_codes).size !== decision.reason_codes.length
       || decision.reason_codes.some((code) => !AI_REASON_CODES.has(code))) {
       throw new Error('invalid_ai_verdict');
+    }
+    if (packet.decision_contract.required_position_symbols.includes(decision.symbol)
+      && !HELD_POSITION_ACTIONS.has(decision.action)) {
+      throw new Error('llm_held_position_action_invalid');
     }
     symbols.add(decision.symbol);
   }
@@ -2341,7 +2348,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch'].includes(prior.pause_reason)) {
+      if (['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid'].includes(prior.pause_reason)) {
         const safetyRun = await execute(buildSafetyMonitorCommand());
         if (safetyRun.error) throw new Error('safety_monitor_process_error');
         const safety = parseSafetyMonitorOutput(safetyRun.stdout);

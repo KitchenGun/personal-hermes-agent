@@ -1448,7 +1448,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
 });
 
 test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
-  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch']) {
+  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid']) {
   for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
     { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
     { execution_owner: 'prod' }]) {
@@ -3000,6 +3000,19 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   const heldContext = mod.parseDecisionContextOutput(JSON.stringify(held), slotId);
   const heldPacket = mod.buildSanitizedAiPacket({ slotId, context: heldContext });
   assert.deepEqual(heldPacket.decision_contract.required_position_symbols, ['005930']);
+  assert.deepEqual(heldPacket.decision_contract.held_position_actions, ['EXIT', 'HOLD', 'HOLD_OVERNIGHT']);
+  for (const action of ['ENTER', 'REJECT']) {
+    assert.throws(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
+      symbol: '005930', action, target_weight_pct: action === 'ENTER' ? 10 : 0,
+      confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+    }]), heldPacket), /llm_held_position_action_invalid/);
+  }
+  for (const action of heldPacket.decision_contract.held_position_actions) {
+    assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
+      symbol: '005930', action, target_weight_pct: 0,
+      confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+    }]), heldPacket));
+  }
   assert.throws(() => mod.parseAiVerdict(aiVerdict(heldPacket), heldPacket), /llm_position_decision_missing/);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
     symbol: '005930', action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'medium',
@@ -4157,7 +4170,8 @@ test('missing intraday decision degrades one slot without pausing the order task
   assert.equal(orderRuns, 0);
 });
 
-test('missing held-position decision degrades one slot without invoking KIS orders', async () => {
+for (const invalidAction of [null, 'ENTER', 'REJECT']) {
+test(`held-position verdict ${invalidAction || 'missing'} degrades one slot without invoking KIS orders`, async () => {
   let orderRuns = 0;
   const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
   const held = JSON.parse(decisionContext(slotId, ['005930', '000660']));
@@ -4166,7 +4180,10 @@ test('missing held-position decision degrades one slot without invoking KIS orde
   held.risk_aggregate.open_positions = 1;
   const value = await active({
     decisionContextOutput: JSON.stringify(held),
-    llmExecutor: async ({ packet }) => aiVerdict(packet),
+    llmExecutor: async ({ packet }) => aiVerdict(packet, invalidAction ? [{
+      symbol: '005930', action: invalidAction, target_weight_pct: invalidAction === 'ENTER' ? 10 : 0,
+      confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+    }] : []),
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
@@ -4177,11 +4194,13 @@ test('missing held-position decision degrades one slot without invoking KIS orde
 
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'llm_position_decision_missing');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class,
+    invalidAction ? 'llm_held_position_action_invalid' : 'llm_position_decision_missing');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(orderRuns, 0);
 });
+}
 
 test('approved reconciliation incident runs once and reactivates orders only after safety clears', async () => {
   const sent = [];
