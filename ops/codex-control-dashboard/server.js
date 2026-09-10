@@ -2649,6 +2649,32 @@ async function apiKisPredictionV2Validation(req, res) {
 
 async function apiKisAiMarketOpenDryRun(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const reviewMatch = url.pathname.match(/^\/api\/kis\/ai-market-open-dry-run\/order-reviews(?:\/([a-f0-9]{64})\/(confirm|deny))?$/);
+  if (reviewMatch) {
+    assertSharedSecret(req);
+    if (req.method !== 'POST') throw new HttpError(405, 'order review POST required');
+    const body = await readJson(req);
+    if (!reviewMatch[1]) {
+      const review = await kisAiMarketOpenDryRunRuntime.requestOrderReview(body.order);
+      okJson(res, { ok: true, review });
+      return;
+    }
+    const userId = body.user_id;
+    const channelId = body.channel_id;
+    const interactionId = body.interaction_id;
+    const messageId = body.message_id;
+    try { assertKisEmergencyStopOperator(userId); }
+    catch { throw new HttpError(403, 'discord user is not allowed'); }
+    if (channelId !== KIS_DISCORD_CHANNEL_ID) throw new HttpError(403, 'discord channel is not allowed');
+    if (![userId, interactionId, messageId].every((value) => typeof value === 'string' && /^\d{16,24}$/.test(value))) {
+      throw new HttpError(400, 'discord identity is invalid');
+    }
+    if (!discordInteractionReplayGuard.claim(interactionId)) throw new HttpError(409, 'discord interaction already handled');
+    const review = kisAiMarketOpenDryRunRuntime.decideOrderReview({ id: reviewMatch[1], action: reviewMatch[2],
+      userId, channelId, interactionId, messageId });
+    okJson(res, { ok: true, review });
+    return;
+  }
   if (req.method === 'GET' && url.pathname === '/api/kis/ai-market-open-dry-run/status') {
     okJson(res, { ok: true, ...kisAiMarketOpenDryRunRuntime.status() });
     return;

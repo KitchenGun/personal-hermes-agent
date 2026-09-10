@@ -50,6 +50,110 @@ function recoveryButtonPatch(calls) {
   return JSON.parse(patch.options.body).components;
 }
 
+test('order review buttons record confirmation separately from recovery', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/order-reviews/')) return response({ review: {
+      id: 'a'.repeat(64), status: 'confirmed', order_submitted: false, execution_authorized: false,
+    } });
+    return response({});
+  };
+  try {
+    await relay.__test.handleKisOrderReviewInteraction(interaction({
+      data: { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+    }));
+  } finally { global.fetch = originalFetch; }
+  assert.equal(calls.filter((call) => call.url.includes('/order-reviews/')).length, 1);
+  assert.equal(calls.filter((call) => call.url.includes('/incidents/')).length, 0);
+  const body = JSON.parse(calls.find((call) => call.url.includes('/order-reviews/')).options.body);
+  assert.equal(body.message_id, '123456789012345681');
+  assert.equal(body.interaction_id, '123456789012345679');
+  assert.match(followupContent(calls), /주문 제출 없음/);
+});
+
+test('order review denies wrong user or channel before contacting the backend', async () => {
+  for (const changes of [{ channel_id: '123456789012345699' }, { user: { id: '123456789012345699' }, member: null }]) {
+    const calls = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, options = {}) => { calls.push({ url: String(url), options }); return response({}); };
+    try {
+      await relay.__test.handleKisOrderReviewInteraction(interaction({ ...changes,
+        data: { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+      }));
+    } finally { global.fetch = originalFetch; }
+    assert.equal(calls.length, 1);
+    assert.match(JSON.parse(calls[0].options.body).data.content, /권한이 없습니다/);
+  }
+});
+
+test('order review response loss is unknown, not reported as a rejected decision', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/order-reviews/')) throw new Error('timeout');
+    return response({});
+  };
+  try {
+    await relay.__test.handleKisOrderReviewInteraction(interaction({
+      data: { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+    }));
+  } finally { global.fetch = originalFetch; }
+  assert.match(followupContent(calls), /처리 결과 미확인/);
+  assert.doesNotMatch(followupContent(calls), /처리되지 않았|요청이 거절/);
+  assert.equal(calls.filter((call) => call.url.includes('/order-reviews/')).length, 1);
+});
+
+test('order review valid receipt is preserved when the success notification fails', async () => {
+  let followups = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (String(url).includes('/order-reviews/')) return response({ review: {
+      id: 'a'.repeat(64), status: 'confirmed', order_submitted: false, execution_authorized: false,
+    } });
+    if (String(url).includes('/webhooks/')) { followups += 1; throw new Error('timeout'); }
+    return response({});
+  };
+  try {
+    const result = await relay.__test.handleKisOrderReviewInteraction(interaction({
+      data: { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+    }));
+    assert.equal(result.status, 'confirmed');
+    assert.equal(result.execution_authorized, false);
+  } finally { global.fetch = originalFetch; }
+  assert.equal(followups, 1);
+});
+
+test('order review distinguishes client rejection from an ambiguous server failure', async () => {
+  for (const status of [409, 500]) {
+    const calls = [];
+    const originalFetch = global.fetch;
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      if (String(url).includes('/order-reviews/')) return response({ error: 'order_review_state_invalid' }, status);
+      return response({});
+    };
+    try {
+      await relay.__test.handleKisOrderReviewInteraction(interaction({
+        data: { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+      }));
+    } finally { global.fetch = originalFetch; }
+    assert.match(followupContent(calls), status === 409 ? /요청이 거절되었습니다/ : /처리 결과 미확인/);
+  }
+});
+
+test('order review components reject mixed namespaces and normalize labels', () => {
+  const components = [{ type: 1, components: [
+    { custom_id: `kis-order-review:confirm:${'a'.repeat(64)}` },
+    { custom_id: `kis-order-review:deny:${'a'.repeat(64)}` },
+  ] }];
+  assert.equal(relay.__test.recoveryComponents(components)[0].components[0].label, '주문안 확인');
+  components[0].components[1].custom_id = `kis-recovery:deny:${'a'.repeat(64)}`;
+  assert.throws(() => relay.__test.recoveryComponents(components), /invalid recovery components/);
+});
+
 test('allowed recovery button sends one exact incident approval', async () => {
   const calls = [];
   const originalFetch = global.fetch;

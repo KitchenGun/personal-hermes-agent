@@ -189,16 +189,16 @@ function recoveryComponents(value) {
   }
   const buttons = value[0].components;
   const ids = buttons.map((button) => String(button?.custom_id || ''));
-  const parsed = ids.map((id) => id.match(/^kis-recovery:(approve|deny):([a-f0-9]{64})$/));
-  if (parsed.some((match) => !match) || parsed[0][2] !== parsed[1][2]
-    || parsed[0][1] !== 'approve' || parsed[1][1] !== 'deny') {
+  const parsed = ids.map((id) => id.match(/^(kis-recovery|kis-order-review):(approve|confirm|deny):([a-f0-9]{64})$/));
+  if (parsed.some((match) => !match) || parsed[0][3] !== parsed[1][3] || parsed[0][1] !== parsed[1][1]
+    || parsed[0][2] !== (parsed[0][1] === 'kis-recovery' ? 'approve' : 'confirm') || parsed[1][2] !== 'deny') {
     throw new Error('invalid recovery components');
   }
   return [{
     type: 1,
     components: [
-      { type: 2, style: 3, label: '복구', emoji: { name: '✅' }, custom_id: ids[0] },
-      { type: 2, style: 4, label: '중단 유지', emoji: { name: '✖️' }, custom_id: ids[1] },
+      { type: 2, style: 3, label: parsed[0][1] === 'kis-recovery' ? '복구' : '주문안 확인', emoji: { name: '✅' }, custom_id: ids[0] },
+      { type: 2, style: 4, label: parsed[0][1] === 'kis-recovery' ? '중단 유지' : '거절', emoji: { name: '✖️' }, custom_id: ids[1] },
     ],
   }];
 }
@@ -216,7 +216,7 @@ async function sendDiscordMessage(channelId, content, referenceMessageId = '', c
       fail_if_not_exists: false,
     };
   }
-  await discordFetch(`/channels/${channelId}/messages`, {
+  return discordFetch(`/channels/${channelId}/messages`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
@@ -235,9 +235,10 @@ async function sendDiscordRelayMessage(message = {}) {
       delivery_layer: message.deliveryLayer || 'discord_relay',
     };
   }
-  await sendDiscordMessage(targetChannelId, message.content, '', message.components);
+  const sent = await sendDiscordMessage(targetChannelId, message.content, '', message.components);
   return {
     discord_sent: true,
+    message_id: sent?.id || null,
     target_channel_id: targetChannelId,
     delivery_layer: message.deliveryLayer || 'discord_relay',
   };
@@ -639,8 +640,50 @@ async function handleKisRecoveryInteraction(interaction) {
   }
 }
 
+async function handleKisOrderReviewInteraction(interaction) {
+  const parsed = String(interaction?.data?.custom_id || '').match(/^kis-order-review:(confirm|deny):([a-f0-9]{64})$/);
+  const user = interactionUser(interaction);
+  if (!parsed || interaction.channel_id !== KIS_CHANNEL_ID || !USER_IDS.has(user.id)) {
+    await interactionCallback(interaction, { type: 4, data: {
+      flags: 64, content: '이 주문안을 확인할 권한이 없습니다.', allowed_mentions: { parse: [] },
+    } });
+    return;
+  }
+  await interactionCallback(interaction, { type: 5, data: { flags: 64 } });
+  let rejection = null;
+  try {
+    const endpoint = KIS_INCIDENT_ENDPOINT.replace(/\/incidents\/?$/, '/order-reviews');
+    const response = await fetchWithTimeout(`${endpoint}/${parsed[2]}/${parsed[1]}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(SECRET ? { authorization: `Bearer ${SECRET}` } : {}) },
+      body: JSON.stringify({ user_id: user.id, channel_id: interaction.channel_id,
+        interaction_id: interaction.id, message_id: interaction.message?.id }),
+    }, STATE_FETCH_TIMEOUT_MS);
+    const payload = await response.json();
+    const expected = parsed[1] === 'confirm' ? 'confirmed' : 'denied';
+    if (!response.ok) {
+      const errorClass = sanitizeErrorClass(payload?.error_class || payload?.error || 'order_review_rejected');
+      if (response.status >= 400 && response.status < 500) rejection = errorClass;
+      throw new Error(errorClass);
+    }
+    if (payload?.review?.id !== parsed[2] || payload.review.status !== expected
+      || payload.review.order_submitted !== false || payload.review.execution_authorized !== false) {
+      throw new Error('order_review_invalid_receipt');
+    }
+    await disableKisRecoveryButtons(interaction).catch(() => {});
+    await interactionFollowup(interaction, `[KIS 주문안] ${expected === 'confirmed' ? '확인 기록 저장 완료' : '거절 완료'}\n주문 제출 없음. 자동매매 활성화 없음.`).catch(() => {});
+    return payload.review;
+  } catch (error) {
+    const status = rejection ? `요청이 거절되었습니다: ${rejection}` : `처리 결과 미확인: ${sanitizeErrorClass(error.message)}`;
+    await interactionFollowup(interaction, `[KIS 주문안] ${status}\n주문 제출 및 자동 재시도 없음.`).catch(() => {});
+  }
+}
+
 async function handleInteraction(interaction) {
   if (interaction?.type === 3) {
+    if (String(interaction?.data?.custom_id || '').startsWith('kis-order-review:')) {
+      await handleKisOrderReviewInteraction(interaction);
+      return;
+    }
     await handleKisRecoveryInteraction(interaction);
     return;
   }
@@ -1185,6 +1228,7 @@ module.exports = {
     parseKisRecoveryCustomId,
     kisRecoveryErrorClass,
     handleKisRecoveryInteraction,
+    handleKisOrderReviewInteraction,
     shouldHandle,
     shouldSendQueueOnlyNotice,
     intervals: {
