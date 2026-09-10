@@ -19,7 +19,11 @@ function buildPrompt(packet) {
     'Choose only symbols present in candidates and return one raw JSON object with no markdown.',
     'Use exactly slot_id, model_id, prompt_hash, decisions.',
     'Each decision must use symbol, action, target_weight_pct, confidence_bucket, reason_codes.',
-    'Respect the decision_contract exactly. When minimum_vps_entry_decisions is 1, choose exactly one eligible_entry as ENTER with positive target_weight_pct; KIS risk veto remains final.',
+    'Respect the decision_contract exactly; KIS risk veto remains final. Never force a trade.',
+    'For eligible_entry candidates, ml_action is advisory, not an instruction to sell an unheld position or a prohibition on ENTER. For held positions use only held_position_actions.',
+    'Assess market_evidence: returns and relative strength are fractional returns, volume/value ratios compare recent increments to prior increments, and volatility is a fractional magnitude. Timestamps identify the evidence cutoff; null means unavailable, never zero.',
+    'Use the supplied momentum, relative strength, volume, VWAP and market context to assess the model scores independently. expected_net_return is a directional proxy, not a calibrated or cost-adjusted profit forecast.',
+    'Use reason_codes supported by the supplied evidence. Do not infer missing news or data. An omitted candidate is not a HOLD decision.',
     'When minimum_vps_entry_decisions is 0 and evidence is weak, use HOLD or REJECT.',
     `INPUT_JSON=${JSON.stringify(packet)}`,
   ].join('\n');
