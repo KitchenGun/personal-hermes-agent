@@ -50,6 +50,18 @@ function recoveryButtonPatch(calls) {
   return JSON.parse(patch.options.body).components;
 }
 
+function statusSnapshot(status = 'resolved', taskState = 'ACTIVE', reason = null, state = 'ACTIVE') {
+  return {
+    state,
+    incidents: { ['a'.repeat(64)]: { status, task_id: 'order-task', result: { order_reactivated: true } } },
+    tasks: { 'order-task': { state: taskState, pause_reason: reason } },
+  };
+}
+
+function recoveryRequests(calls) {
+  return calls.filter((call) => call.url.includes('/api/kis/ai-market-open-dry-run/'));
+}
+
 test('allowed recovery button sends one exact incident approval', async () => {
   const calls = [];
   const originalFetch = global.fetch;
@@ -74,7 +86,7 @@ test('allowed recovery button sends one exact incident approval', async () => {
   assert.match(followupContent(calls), /복구 및 정상 재개 완료/);
 });
 
-test('blocked safe error reports its exact error class without resending orders', async () => {
+test('unavailable incident status does not claim a current pause or resend recovery', async () => {
   const calls = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, options = {}) => {
@@ -90,7 +102,96 @@ test('blocked safe error reports its exact error class without resending orders'
   const content = followupContent(calls);
   assert.match(content, /오류 코드: incident_not_awaiting_approval/);
   assert.match(content, /주문 재전송 없음/);
-  assert.equal(calls.filter((call) => call.url.includes('/incidents/')).length, 1);
+  assert.match(content, /현재 상태를 확인하지 못했습니다/);
+  assert.doesNotMatch(content, /중단 상태를 유지|정상 재개 완료/);
+  assert.deepEqual(recoveryRequests(calls).map((call) => call.options.method), ['POST', 'GET']);
+});
+
+for (const action of ['approve', 'deny']) test(`old ${action} button reads an automatically resolved incident without repeating recovery`, async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/incidents/')) return response({ error: 'incident_not_awaiting_approval' }, 409);
+    if (String(url).endsWith('/status')) return response(statusSnapshot());
+    return response({});
+  };
+  try {
+    await relay.__test.handleKisRecoveryInteraction(interaction({ data: { custom_id: `kis-recovery:${action}:${'a'.repeat(64)}` } }));
+  } finally { global.fetch = originalFetch; }
+  assert.match(followupContent(calls), /이미 해결되었습니다/);
+  assert.match(followupContent(calls), /현재 대상 작업: ACTIVE/);
+  assert.match(followupContent(calls), /현재 운영: ACTIVE/);
+  assert.match(followupContent(calls), /복구 재실행 없음/);
+  assert.doesNotMatch(followupContent(calls), /처리 실패|중단 유지|정상 재개 완료/);
+  assert.deepEqual(recoveryRequests(calls).map((call) => call.options.method), ['POST', 'GET']);
+  const read = recoveryRequests(calls)[1];
+  assert.equal(read.url, 'http://127.0.0.1:17640/api/kis/ai-market-open-dry-run/status');
+  assert.equal(read.options.headers.authorization, 'Bearer test-secret');
+  assert.ok(read.options.signal instanceof AbortSignal);
+  assert.equal(recoveryButtonPatch(calls)[0].components.every((button) => button.disabled), true);
+});
+
+test('resolved incident uses the current pause, not its historical successful recovery result', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/incidents/')) return response({ error: 'incident_not_awaiting_approval' }, 409);
+    if (String(url).endsWith('/status')) return response(statusSnapshot('resolved', 'PAUSED', 'order_submission_unknown', 'PAUSED'));
+    return response({});
+  };
+  try { await relay.__test.handleKisRecoveryInteraction(interaction()); }
+  finally { global.fetch = originalFetch; }
+  assert.match(followupContent(calls), /현재 대상 작업: PAUSED/);
+  assert.match(followupContent(calls), /현재 운영: PAUSED/);
+  assert.match(followupContent(calls), /현재 원인: order_submission_unknown/);
+  assert.doesNotMatch(followupContent(calls), /정상 재개 완료|현재 대상 작업: ACTIVE/);
+});
+
+test('a second click during recovery shows in-progress status without a second execution', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/incidents/')) return response({ error: 'incident_recovery_in_progress' }, 409);
+    if (String(url).endsWith('/status')) return response(statusSnapshot('waiting_recheck', 'PAUSED'));
+    return response({});
+  };
+  try { await relay.__test.handleKisRecoveryInteraction(interaction()); }
+  finally { global.fetch = originalFetch; }
+  assert.match(followupContent(calls), /안전 재확인 중/);
+  assert.doesNotMatch(followupContent(calls), /복구 검증 완료|정상 재개 완료/);
+  assert.deepEqual(recoveryRequests(calls).map((call) => call.options.method), ['POST', 'GET']);
+});
+
+test('malformed or secret-like current status is not echoed', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes('/incidents/')) return response({ error: 'incident_not_awaiting_approval' }, 409);
+    if (String(url).endsWith('/status')) return response(statusSnapshot('resolved', 'Bearer private-token', 'Bearer private-token'));
+    return response({});
+  };
+  try { await relay.__test.handleKisRecoveryInteraction(interaction()); }
+  finally { global.fetch = originalFetch; }
+  assert.match(followupContent(calls), /현재 대상 작업: UNKNOWN/);
+  assert.match(followupContent(calls), /sanitized_runtime_error/);
+  assert.doesNotMatch(followupContent(calls), /Bearer|private-token|정상 재개 완료/);
+});
+
+test('interaction replay rejection does not perform a recovery status fallback', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    return String(url).includes('/incidents/')
+      ? response({ error: 'discord_interaction_already_handled' }, 409) : response({});
+  };
+  try { await relay.__test.handleKisRecoveryInteraction(interaction()); }
+  finally { global.fetch = originalFetch; }
+  assert.equal(recoveryRequests(calls).length, 1);
 });
 
 test('secret-like recovery error is masked', async () => {
@@ -178,4 +279,14 @@ test('wrong channel is denied before the incident endpoint', async () => {
     global.fetch = originalFetch;
   }
   assert.equal(calls.some((url) => url.includes('/incidents/')), false);
+});
+
+test('wrong operator cannot read recovery status or execute recovery', async () => {
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => { calls.push({ url: String(url), options }); return response({}); };
+  try {
+    await relay.__test.handleKisRecoveryInteraction(interaction({ member: { user: { id: '999999999999999999' } } }));
+  } finally { global.fetch = originalFetch; }
+  assert.equal(recoveryRequests(calls).length, 0);
 });
