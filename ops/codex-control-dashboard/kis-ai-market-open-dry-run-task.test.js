@@ -174,6 +174,116 @@ function blockedDiagnostic() {
   return JSON.stringify(value);
 }
 
+function marketEvidence() {
+  return {
+    schema_version: 'intraday_market_evidence_v1',
+    decision_time: '2026-07-21T09:10:03+09:00',
+    data_cutoff_at: '2026-07-21T09:10:01+09:00',
+    values: {
+      return_10m: .01, return_20m: .02, stock_vs_market_10m: .005, stock_vs_sector_10m: .004,
+      volume_ratio_10m: 1.8, trading_value_ratio: 2.1, vwap_distance: .003,
+      market_return_10m: .005, realized_volatility_20m: .002,
+    },
+  };
+}
+
+test('market evidence is bounded, point-in-time and included in the prompt hash', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const input = JSON.parse(decisionContext(slotId, Array.from({ length: 20 }, (_, i) => String(i).padStart(6, '0'))));
+  for (const c of input.candidates) c.market_evidence = marketEvidence();
+  const build = () => mod.buildSanitizedAiPacket({
+    slotId, context: mod.parseDecisionContextOutput(JSON.stringify(input), slotId),
+  });
+  const packet = build();
+  assert.deepEqual(packet.candidates[0].market_evidence, marketEvidence());
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) < 64 * 1024);
+  input.candidates[0].market_evidence.values.return_10m = -.01;
+  assert.notEqual(build().prompt_hash, packet.prompt_hash);
+  input.candidates[0].market_evidence.values.return_10m = null;
+  assert.equal(build().candidates[0].market_evidence.values.return_10m, null);
+  delete input.candidates[0].market_evidence;
+  assert.equal(build().candidates[0].market_evidence, null);
+  for (const mutate of [
+    (v) => { v.values.current_price = 70000; },
+    (v) => { v.values.return_10m = 'untrusted text'; },
+    (v) => { v.values.volume_ratio_10m = -1; },
+    (v) => { v.data_cutoff_at = '2026-07-21T09:10:04+09:00'; },
+    (v) => { v.decision_time = '2026-07-21T09:11:00'; },
+    (v) => { v.decision_time = '2026-07-21T09:20:00+09:00'; },
+    (v) => { v.decision_time = v.data_cutoff_at = '2026-07-20T09:10:00+09:00'; },
+  ]) {
+    input.candidates[0].market_evidence = marketEvidence();
+    mutate(input.candidates[0].market_evidence);
+    assert.throws(build, /invalid_ai_candidates/);
+  }
+});
+
+test('validated verdict aggregates persist on no-op without counting a duplicate slot', async () => {
+  const symbols = ['005930', '000660', '005380', '035720'];
+  let calls = 0;
+  const value = await active({
+    decisionContextOutput: decisionContext(`${mod.TASKS[4].id}:2026-07-21:09:10`, symbols),
+    llmExecutor: async ({ packet }) => aiVerdict(packet, [
+      { symbol: symbols[0], action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
+      { symbol: symbols[1], action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
+      { symbol: symbols[2], action: 'ENTER', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['MOMENTUM_CONFIRMATION'] },
+    ]),
+    execFile(command, args, options, callback) {
+      calls += 1;
+      callback(null, orderGood('no_op', { action_type: 'llm_entry_not_authorized_no_op' }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:10:10Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  const stored = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).tasks[mod.TASKS[4].id];
+  const summary = stored.last_run.llm_verdict_summary;
+  assert.deepEqual(summary.actions, { ENTER: 1, EXIT: 0, HOLD: 1, HOLD_OVERNIGHT: 0, REJECT: 1 });
+  assert.equal(summary.omitted_candidate_count, 1);
+  assert.equal(summary.zero_weight_enter_count, 1);
+  assert.deepEqual(summary.reason_codes, { RISK_REDUCTION: 2, MOMENTUM_CONFIRMATION: 1 });
+  assert.equal(stored.llm_daily_summary.slot_count, 1);
+  assert.equal(stored.llm_daily_summary.trade_date, '2026-07-21');
+  assert.doesNotMatch(JSON.stringify(summary), /005930|target_weight|account|prompt|quantity/);
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  assert.equal(calls, 1);
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].llm_daily_summary.slot_count, 1);
+});
+
+test('verdict audit accumulates within a day, resets next day and survives downstream failure', async () => {
+  const value = await active({
+    llmExecutor: async ({ packet }) => aiVerdict(packet, [{
+      symbol: '005930', action: 'ENTER', target_weight_pct: 10,
+      confidence_bucket: 'medium', reason_codes: ['MOMENTUM_CONFIRMATION'],
+    }]),
+    execFile(command, args, options, callback) {
+      callback(null, 'not-json');
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const original = value.task.status();
+  for (const [instant, expectedSlots] of [
+    ['2026-07-21T00:10:00Z', 1], ['2026-07-21T00:20:00Z', 2], ['2026-07-22T00:10:00Z', 1],
+  ]) {
+    const current = value.task.status();
+    const prior = current.tasks[mod.TASKS[4].id];
+    // A new independently scheduled test slot, retaining only the persisted audit from the prior run.
+    current.tasks[mod.TASKS[4].id] = {
+      ...original.tasks[mod.TASKS[4].id], next_run_at: instant,
+      llm_daily_summary: prior.llm_daily_summary,
+    };
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+    value.setClock(instant);
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(instant) });
+    const task = result.tasks[mod.TASKS[4].id];
+    assert.equal(task.state, 'PAUSED');
+    assert.equal(task.llm_daily_summary.slot_count, expectedSlots);
+    assert.equal(task.llm_daily_summary.actions.ENTER, expectedSlots);
+    assert.equal(task.llm_last_verdict_summary.actions.ENTER, 1);
+    assert.equal(task.llm_daily_summary.trade_date, instant.slice(0, 10));
+  }
+});
+
 function aiVerdict(packet, decisions = []) {
   return { slot_id: packet.slot_id, model_id: mod.LLM_MODEL_ID, prompt_hash: packet.prompt_hash, decisions };
 }

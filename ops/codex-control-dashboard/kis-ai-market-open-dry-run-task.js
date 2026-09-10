@@ -854,6 +854,33 @@ function buildOrderLifecycleMessage(parsed) {
   ].join('\n');
 }
 
+function normalizedMarketEvidence(value) {
+  if (value == null) return null; // Legacy producer: missing evidence is not a zero signal.
+  const names = [
+    'return_10m', 'return_20m', 'stock_vs_market_10m', 'stock_vs_sector_10m',
+    'volume_ratio_10m', 'trading_value_ratio', 'vwap_distance',
+    'market_return_10m', 'realized_volatility_20m',
+  ];
+  const keys = ['schema_version', 'decision_time', 'data_cutoff_at', 'values'];
+  const timestamp = (text) => typeof text === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(text)
+    && Number.isFinite(Date.parse(text));
+  if (typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== keys.length || keys.some((key) => !Object.hasOwn(value, key))
+    || value.schema_version !== 'intraday_market_evidence_v1'
+    || !timestamp(value.decision_time) || !timestamp(value.data_cutoff_at)
+    || Date.parse(value.data_cutoff_at) > Date.parse(value.decision_time)
+    || !value.values || Array.isArray(value.values) || typeof value.values !== 'object'
+    || Object.keys(value.values).length !== names.length
+    || names.some((name) => !Object.hasOwn(value.values, name)
+      || (value.values[name] !== null && !Number.isFinite(value.values[name])))
+    || ['volume_ratio_10m', 'trading_value_ratio', 'realized_volatility_20m']
+      .some((name) => value.values[name] !== null && value.values[name] < 0)) {
+    throw new Error('invalid_ai_candidates');
+  }
+  return Object.freeze({ ...value, values: Object.freeze({ ...value.values }) });
+}
+
 function normalizedAiCandidates(value = [], runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   if (!Array.isArray(value) || value.length > runtimeContract.slot_review_limit) throw new Error('invalid_ai_candidates');
   const expectedKeys = new Set([
@@ -866,7 +893,7 @@ function normalizedAiCandidates(value = [], runtimeContract = REQUIRED_RUNTIME_C
   }
   return value.map((item) => {
     if (!item || Array.isArray(item) || typeof item !== 'object'
-      || Object.keys(item).length !== expectedKeys.size
+      || Object.keys(item).some((key) => !expectedKeys.has(key) && key !== 'market_evidence')
       || [...expectedKeys].some((key) => !Object.prototype.hasOwnProperty.call(item, key))
       || !['held_position', 'eligible_entry'].includes(item.role)
       || !['position', 'primary', 'watch'].includes(item.review_tier)
@@ -882,7 +909,7 @@ function normalizedAiCandidates(value = [], runtimeContract = REQUIRED_RUNTIME_C
       || Math.abs((item.prob_up + item.prob_flat + item.prob_down) - 1) > 0.000001) {
       throw new Error('invalid_ai_candidates');
     }
-    return Object.freeze({ ...item });
+    return Object.freeze({ ...item, market_evidence: normalizedMarketEvidence(item.market_evidence) });
   });
 }
 
@@ -892,6 +919,13 @@ function buildSanitizedAiPacket({ slotId, context, runtimeContract = REQUIRED_RU
   }
   if (!context || Array.isArray(context) || typeof context !== 'object') throw new Error('invalid_decision_context');
   const candidates = normalizedAiCandidates(context.candidates, runtimeContract);
+  const [, day, hour, minute] = slotId.split(':');
+  const slotStart = Date.parse(`${day}T${hour}:${minute}:00+09:00`);
+  if (candidates.some((item) => item.market_evidence
+    && (Date.parse(item.market_evidence.decision_time) < slotStart
+      || Date.parse(item.market_evidence.decision_time) >= slotStart + 10 * 60_000))) {
+    throw new Error('invalid_ai_candidates');
+  }
   const packet = {
     schema_version: 'kis_llm_decision_v1',
     slot_id: slotId,
@@ -957,6 +991,37 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
     throw new Error('unsafe_ai_verdict');
   }
   return serialized;
+}
+
+function summarizeAiVerdict(verdict, candidateCount) {
+  const actions = Object.fromEntries([...AI_DECISION_ACTIONS].map((action) => [action, 0]));
+  const reasonCodes = {};
+  let zeroWeightEnter = 0;
+  for (const decision of verdict.decisions) {
+    actions[decision.action] += 1;
+    if (decision.action === 'ENTER' && decision.target_weight_pct === 0) zeroWeightEnter += 1;
+    for (const reason of decision.reason_codes) reasonCodes[reason] = (reasonCodes[reason] || 0) + 1;
+  }
+  return {
+    candidate_count: candidateCount, decision_count: verdict.decisions.length,
+    omitted_candidate_count: candidateCount - verdict.decisions.length,
+    zero_weight_enter_count: zeroWeightEnter, actions, reason_codes: reasonCodes,
+  };
+}
+
+function accumulateAiSummary(previous, slotId, summary) {
+  if (previous?.last_slot_id === slotId) return previous;
+  const tradeDate = slotId.split(':')[1];
+  const prior = previous?.trade_date === tradeDate ? previous : {};
+  const total = { trade_date: tradeDate, last_slot_id: slotId, slot_count: (prior.slot_count || 0) + 1 };
+  for (const key of ['candidate_count', 'decision_count', 'omitted_candidate_count', 'zero_weight_enter_count']) {
+    total[key] = (prior[key] || 0) + summary[key];
+  }
+  for (const key of ['actions', 'reason_codes']) {
+    total[key] = { ...(prior[key] || {}) };
+    for (const [name, count] of Object.entries(summary[key])) total[key][name] = (total[key][name] || 0) + count;
+  }
+  return total;
 }
 
 function buildDecisionContextCommand(schedulerToken, invocationDueKey) {
@@ -1558,6 +1623,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       candidateCount: context.candidates.length,
       llmInvoked: true,
       verdictStatus: 'validated',
+      summary: summarizeAiVerdict(JSON.parse(serialized), context.candidates.length),
     });
   }
 
@@ -2620,6 +2686,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let decisionContextCandidateCount = 0;
     let llmInvoked = false;
     let llmVerdictStatus = requiresAiVerdict ? 'pending' : 'not_required';
+    let llmVerdictSummary = null;
     try {
       const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
         ? REFRESH_ONLY_ORDER_TASK : task;
@@ -2638,6 +2705,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           decisionContextCandidateCount = verdict?.candidateCount || 0;
           llmInvoked = verdict?.llmInvoked === true;
           llmVerdictStatus = verdict?.verdictStatus || 'invalid';
+          llmVerdictSummary = verdict?.summary || null;
 
           const contextState = loadStrict();
           const contextTask = contextState.tasks[taskId];
@@ -2658,6 +2726,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           };
           save({ ...contextState, tasks: { ...contextState.tasks, [taskId]: {
             ...contextTask, pending_invocation: pendingInvocation,
+            ...(llmVerdictSummary ? {
+              llm_last_verdict_summary: { slot_id: key, ...llmVerdictSummary },
+              llm_daily_summary: accumulateAiSummary(contextTask.llm_daily_summary, key, llmVerdictSummary),
+            } : {}),
           } } });
           atomicWrite(attestationPath, pendingInvocation);
         }
@@ -2878,6 +2950,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           decision_context_candidate_count: decisionContextCandidateCount,
           llm_invoked: llmInvoked,
           llm_verdict_status: llmVerdictStatus,
+          llm_verdict_summary: llmVerdictSummary,
         });
         const lifecycleDelivery = await notifyOrderLifecycle(latest, parsed, lastRun);
         lastRun = lifecycleDelivery.lastRun;
