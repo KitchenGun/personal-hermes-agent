@@ -632,9 +632,45 @@ async function handleKisRecoveryInteraction(interaction) {
     await interactionFollowup(interaction, `[KIS 복구] ${status}`);
   } catch (error) {
     const errorClass = kisRecoveryErrorClass(payload, error);
+    if (['incident_not_awaiting_approval', 'incident_recovery_in_progress', 'stale_incident_approval'].includes(errorClass)) {
+      try {
+        const statusUrl = new URL(KIS_INCIDENT_ENDPOINT);
+        if (!statusUrl.pathname.endsWith('/incidents')) throw new Error('incident_status_unavailable');
+        statusUrl.pathname = statusUrl.pathname.replace(/\/incidents$/, '/status');
+        const response = await fetch(statusUrl.toString(), {
+          method: 'GET',
+          headers: { ...(SECRET ? { authorization: `Bearer ${SECRET}` } : {}) },
+          signal: AbortSignal.timeout(5000),
+        });
+        const current = await response.json();
+        const incident = current?.incidents?.[parsed.incidentId];
+        const messages = {
+          resolved: '이 요청은 이미 해결되었습니다.',
+          denied: '이미 중단 유지로 처리된 요청입니다.',
+          stale: '현재 상태와 맞지 않는 이전 요청입니다. 최신 알림을 확인하세요.',
+          repairing: '기존 복구가 진행 중입니다.',
+          waiting_recheck: '승인된 복구의 안전 재확인 중입니다.',
+          testing: '기존 복구의 검증이 진행 중입니다.',
+        };
+        if (!response.ok || !Object.hasOwn(messages, incident?.status)) throw new Error('incident_status_unavailable');
+        const task = current.tasks?.[incident.task_id];
+        const runtimeState = ['ACTIVE', 'PAUSED', 'DISABLED'].includes(current.state)
+          ? current.state : 'UNKNOWN';
+        const taskState = ['ACTIVE', 'PAUSED', 'DISABLED', 'COMPLETED'].includes(task?.state)
+          ? task.state : 'UNKNOWN';
+        const reason = task?.pause_reason || current.pause_reason;
+        const reasonText = reason ? `\n현재 원인: ${sanitizeErrorClass(reason)}` : '';
+        await disableKisRecoveryButtons(interaction).catch(() => {});
+        await interactionFollowup(interaction,
+          `[KIS 복구] ${messages[incident.status]}\n현재 운영: ${runtimeState}\n현재 대상 작업: ${taskState}${reasonText}\n복구 재실행 없음 · 주문 재전송 없음`);
+        return;
+      } catch {
+        // A failed status read must not claim that an old recovery result is current.
+      }
+    }
     await interactionFollowup(
       interaction,
-      `[KIS 복구] 복구 요청 처리 실패\n오류 코드: ${errorClass}\n중단 상태를 유지하고 원인을 확인하세요.\n주문 재전송 없음`,
+      `[KIS 복구] 복구 요청 처리 실패\n오류 코드: ${errorClass}\n현재 상태를 확인하지 못했습니다. 최신 운영 상태를 확인하세요.\n주문 재전송 없음`,
     ).catch(() => {});
   }
 }
