@@ -3000,7 +3000,65 @@ test('state-fault claim I/O failure remains fail-closed without an unhandled ale
   }
 });
 
-const report = '[KIS VPS 모의투자 일일 결과]\n기준일: 2026-07-21\n오늘 체결: 매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주\n현재 보유: 삼성전자(005930) 2주\n오늘 실현손익: +1,000원 (현금 증감 기준)\nAI 검증: 판단 3건 / 모델 변경 0회\n운영 상태: 정상\n실전계좌: 주문 없음';
+const report = '[KIS VPS 모의투자 일일 결과]\n기준일: 2026-07-21\n오늘 체결: 매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주\n현재 보유: 삼성전자(005930) 2주\n오늘 실현손익: +1,000원 (현금 증감 기준)\nAI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회\n운영 상태: 정상\n실전계좌: 주문 없음';
+
+test('current KIS producer message passes the Hermes consumer without broker or DB access', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async () => {
+  const script = `import ast, json, pathlib, sys
+tree = ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+producer = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_run_daily_report')
+message = next(n for n in producer.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'message' for t in n.targets))
+scope = json.loads(sys.argv[2])
+exec(compile(ast.Module(body=[message], type_ignores=[]), '<report-contract>', 'exec'), {'__builtins__': {}}, scope)
+print(json.dumps(scope['message']))
+`;
+  const scope = {
+    trade_date: '2026-07-21', trade_text: '없음', holding_text: '없음',
+    pnl_text: '0원 (매도 체결 없음)', operating_text: '정상',
+    counts: { decisions: 3, trained_runs: 1, scheduled_promotions: 0 },
+  };
+  const python = process.env.KIS_REPORT_TEST_PYTHON || 'python3';
+  const stdout = await new Promise((resolve, reject) => execFile(python,
+    ['-c', script, process.env.KIS_REPORT_PRODUCER_SOURCE, JSON.stringify(scope)],
+    { timeout: 10000, maxBuffer: 65536, windowsHide: true },
+    (error, output) => error ? reject(error) : resolve(output)));
+  const message = JSON.parse(stdout);
+  const parsed = mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
+    decisions: 3, report_message: message,
+  }), mod.TASKS[3].id, () => calendarProof());
+  assert.equal(parsed.reportMessage, message);
+});
+
+test('daily report validates current learning counts and preserves legacy compatibility', () => {
+  const currentLine = 'AI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회';
+  for (const line of [
+    currentLine,
+    'AI 검증: 판단 3건 / 학습 0회 / 모델 승격 예정 0회',
+    'AI 검증: 판단 3건 / 학습 2회 / 모델 승격 예정 1회',
+    'AI 검증: 판단 3건 / 모델 변경 0회',
+    'AI 검증: 판단 3건 / 게이트 2회 / 모델 변경 1회',
+  ]) {
+    const message = report.replace(currentLine, line);
+    const result = mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
+      decisions: 3, report_message: message,
+    }), mod.TASKS[3].id, () => calendarProof());
+    assert.equal(result.reportMessage, message);
+  }
+  for (const line of [
+    'AI 검증: 판단 3건 / 학습 -1회 / 모델 승격 예정 0회',
+    'AI 검증: 판단 3건 / 학습 0회 / 모델 승격 예정 1회',
+    'AI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 -1회',
+    'AI 검증: 판단 3건 / 학습 1.5회 / 모델 승격 예정 0회',
+    'AI 검증: 판단 3건 / 학습 9007199254740992회 / 모델 승격 예정 0회',
+    'AI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회 secret',
+    'AI 검증: 판단 3건 / 게이트 9007199254740992회 / 모델 변경 0회',
+  ]) {
+    assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
+      decisions: 3, report_message: report.replace(currentLine, line),
+    }), mod.TASKS[3].id, () => calendarProof()), /invalid_report_message/);
+  }
+});
 
 test('daily report uses existing sender exactly once and stores status only', async () => {
   const sent = [];

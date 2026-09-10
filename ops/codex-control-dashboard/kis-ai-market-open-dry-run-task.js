@@ -508,7 +508,9 @@ function validateReportList(value, emptyValues, itemPattern, maxItems) {
 function validateReportMessage(value, officialTradeDate, decisions, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   const reportMessage = String(value || '');
   const lines = reportMessage.split('\n');
-  const decisionMatch = /^AI 검증: 판단 (\d+)건 \/ 모델 변경 0회$/.exec(lines[5] || '');
+  const learningMatch = /^AI 검증: 판단 (\d+)건 \/ 학습 (\d+)회 \/ 모델 승격 예정 (\d+)회$/.exec(lines[5] || '');
+  const decisionMatch = learningMatch
+    || /^AI 검증: 판단 (\d+)건(?: \/ 게이트 (\d+)회)? \/ 모델 변경 (\d+)회$/.exec(lines[5] || '');
   if (reportMessage.length > 600 || lines.length !== 8
     || lines[0] !== '[KIS VPS 모의투자 일일 결과]'
     || lines[1] !== `기준일: ${officialTradeDate}`
@@ -516,7 +518,9 @@ function validateReportMessage(value, officialTradeDate, decisions, runtimeContr
     || !lines[3].startsWith('현재 보유: ')
     || !lines[4].startsWith('오늘 실현손익: ')
     || decisionMatch === null
+    || decisionMatch.slice(1).some((count) => count !== undefined && !Number.isSafeInteger(Number(count)))
     || Number(decisionMatch[1]) !== decisions
+    || (learningMatch !== null && Number(learningMatch[3]) > Number(learningMatch[2]))
     || !/^운영 상태: (?:정상|확인 필요 [1-9]\d*건)$/.test(lines[6])
     || lines[7] !== '실전계좌: 주문 없음') throw new Error('invalid_report_message');
   validateReportList(lines[2].slice('오늘 체결: '.length), new Set(['없음', '확인 불가 (주문 원장 없음)']), VPS_FILL_ITEM_RE, 10);
