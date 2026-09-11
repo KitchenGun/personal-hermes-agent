@@ -61,6 +61,19 @@ Forbidden in responses:
 
 ## Acceptance
 
+### KIS execution timing
+
+KIS task `last_run.stage_duration_ms` contains monotonic elapsed milliseconds
+for executed phases only: `decision_context`, `llm`, `universe_refresh`,
+`kis_cli`, and `shadow_refresh`. A missing phase was not measured; it is not
+a zero-duration observation. Process and LLM failures retain completed timing
+measurements without persisting stdout, stderr, prompts, or account values.
+
+These durations measure subprocess or LLM waits, not individual broker calls,
+token usage, notification delivery, or end-to-end task latency. They do not
+change deadlines, recovery, schedules, order approvals, or activation gates.
+Compare equivalent tasks and phases before claiming a speed improvement.
+
 Run `ops/codex-control-dashboard/dashboard-smoke.sh` after deployment.
 
 Expected checks:
