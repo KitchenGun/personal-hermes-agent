@@ -409,6 +409,7 @@ function fixture(options = {}) {
   let clock = new Date('2026-07-20T23:59:00Z');
   const taskExec = options.execFile || ((c, a, o, cb) => cb(null, good(a[a.indexOf('--task-id') + 1])));
   const execFile = (command, args, execOptions, callback) => {
+    if (typeof options.onExec === 'function') options.onExec({ command, args, execOptions });
     if (args.includes('safety-monitor')) {
       callback(options.safetyError || null, typeof options.safetyOutput === 'function'
         ? options.safetyOutput()
@@ -559,6 +560,9 @@ test('order command uses VM venv and exposes no per-run approval', () => {
     finalSlot.args,
     ['-m', 'kis_trading_lab', 'vps-autonomous-order', '--action', 'run-once'],
   );
+  const diagnosticCommand = mod.buildDiagnosticCommand();
+  assert.equal(diagnosticCommand.command, mod.KIS_VENV_PYTHON);
+  assert.deepEqual(diagnosticCommand.args, ['-m', 'kis_trading_lab', 'ai-quote-transport-diagnose-once']);
 });
 
 test('post-close candidate refresh uses the existing bounded KIS shadow path', () => {
@@ -2491,6 +2495,117 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
   assert.equal(new Date(state.tasks[mod.TASKS[1].id].next_run_at).getTime() > new Date('2026-07-21T00:11:00Z').getTime(), true);
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
+});
+
+test('manual production-transition hold resumes only dry-run tasks after clear VPS safety checks', async () => {
+  let activationPreflights = 0;
+  const commands = [];
+  const value = await active({
+    onActivationPreflight() { activationPreflights += 1; },
+    onExec(command) { commands.push(command); },
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'operator_prod_transition_preparation';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+  assert.equal(activationPreflights, 1);
+  assert.equal(commands.slice(1).every(({ args }) => (
+    args.includes('ai-quote-transport-diagnose-once') || args.includes('safety-monitor')
+  )), true);
+  assert.equal(state.incidents && Object.values(state.incidents).every((incident) => incident.status === 'resolved'), true);
+});
+
+test('manual production-transition hold rejects pending work, blocking incidents, non-clear safety, and prod ownership', async () => {
+  const blockedSafety = [
+    ...['process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status']
+      .map((key) => safetyOutput('blocked', { [key]: 'active', error_class: `${key}_active` })),
+    safetyOutput('success', { execution_owner: 'prod' }),
+  ];
+  for (const setup of ['pending', 'incident', ...blockedSafety]) {
+    const value = await active({ safetyOutput: typeof setup === 'string' && setup.startsWith('{') ? setup : undefined });
+    const paused = value.task.status();
+    paused.state = 'PAUSED'; paused.pause_reason = 'operator_prod_transition_preparation';
+    for (const item of Object.values(paused.tasks)) {
+      item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+    }
+    if (setup === 'pending') paused.tasks[mod.TASKS[0].id].pending_invocation = { due_key: 'pending' };
+    if (setup === 'incident') paused.incidents.manual_hold = {
+      incident_id: 'manual_hold', status: 'awaiting_approval', scope: 'verified_io_resume',
+    };
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+    await assert.rejects(
+      value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+      setup === 'pending' ? /pending_invocation_active/ : setup === 'incident' ? /incident_approval_required/
+        : /safety_monitor_not_clear|(?:process_lock|kill_state|open_order_status|reconciliation_status|account_risk_status)_active/,
+    );
+    assert.equal(value.task.status().state, 'PAUSED');
+  }
+});
+
+test('manual production-transition hold rejects unknown, non-resolved, and missing incident ledgers', async () => {
+  for (const incidents of [
+    { unknown_scope: { status: 'awaiting_approval', scope: 'unknown' } },
+    { unknown_status: { status: 'waiting_for_operator', scope: 'verified_io_resume' } },
+    { malformed: null },
+    null,
+    undefined,
+  ]) {
+    const value = await active();
+    const paused = value.task.status();
+    paused.state = 'PAUSED'; paused.pause_reason = 'operator_prod_transition_preparation';
+    for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+    if (incidents === undefined) delete paused.incidents;
+    else paused.incidents = incidents;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+    await assert.rejects(
+      value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+      /incident_approval_required|state_contract_invalid|state_unavailable/,
+    );
+  }
+});
+
+test('manual production-transition hold rejects incident changes made during diagnostics', async () => {
+  let value;
+  value = await active({
+    onExec({ args }) {
+      if (!args.includes('ai-quote-transport-diagnose-once')) return;
+      const changed = value.task.status();
+      changed.incidents.diagnostic_race = { status: 'awaiting_approval', scope: 'unknown' };
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(changed));
+    },
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'operator_prod_transition_preparation';
+  for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /resume_state_changed/,
+  );
+  assert.equal(value.task.status().state, 'PAUSED');
+});
+
+test('manual production-transition hold requires the exact existing resume approval', async () => {
+  const value = await active();
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'operator_prod_transition_preparation';
+  for (const item of Object.values(paused.tasks)) item.state = 'PAUSED';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: 'wrong' }), /exact_resume_approval_required/);
+  assert.equal(value.task.status().state, 'PAUSED');
 });
 
 test('exact IO resume recovers a process error only after the safety monitor is clear', async () => {
