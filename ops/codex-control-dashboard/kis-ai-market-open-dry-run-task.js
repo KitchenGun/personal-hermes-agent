@@ -1339,7 +1339,7 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
 }
 
 function buildDiagnosticCommand() {
-  return { command: 'python3', args: ['-m', 'kis_trading_lab', 'ai-quote-transport-diagnose-once'], cwd: KIS_REPO };
+  return { command: KIS_VENV_PYTHON, args: ['-m', 'kis_trading_lab', 'ai-quote-transport-diagnose-once'], cwd: KIS_REPO };
 }
 
 function parseQuoteTransportDiagnosticOutput(stdout) {
@@ -1645,7 +1645,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       value.canonical_task_id = CANONICAL_TASK_ID;
       value.task_owner = TASK_OWNER;
-      if (value.incidents === undefined) value.incidents = {};
+      if (value.incidents === undefined) {
+        if (value.state === 'PAUSED' && value.pause_reason === 'operator_prod_transition_preparation') {
+          throw new Error('incident_approval_required');
+        }
+        value.incidents = {};
+      }
       if (!value.incidents || typeof value.incidents !== 'object' || Array.isArray(value.incidents)) {
         throw new Error('state_contract_invalid');
       }
@@ -2260,6 +2265,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     try {
       release = acquireExclusiveLock(runLockPath);
       const current = loadStrict();
+      const manualHold = current.state === 'PAUSED'
+        && current.pause_reason === 'operator_prod_transition_preparation'
+        && TASKS.every((task) => current.tasks[task.id]?.state === 'PAUSED');
+      const manualHoldIncidentsClear = (state) => state.incidents
+        && typeof state.incidents === 'object'
+        && !Array.isArray(state.incidents)
+        && Object.values(state.incidents).every((incident) => incident
+          && typeof incident === 'object'
+          && !Array.isArray(incident)
+          && incident.status === 'resolved');
       const pausedTaskReasons = Object.values(current.tasks || {})
         .filter((taskState) => taskState.state === 'PAUSED')
         .map((taskState) => taskState.pause_reason)
@@ -2273,7 +2288,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const partiallyResumable = current.state === 'ACTIVE'
         && pausedTaskReasons.length > 0
         && pausedTaskReasons.every((reason) => RESUMABLE_PAUSE_REASONS.has(reason));
-      if (!globallyResumable && !partiallyResumable) throw new Error('task_not_resumable');
+      if (manualHold && !manualHoldIncidentsClear(current)) throw new Error('incident_approval_required');
+      if (manualHold && Object.values(current.tasks).some((task) => task.pending_invocation !== null)) {
+        throw new Error('pending_invocation_active');
+      }
+      if (!manualHold && !globallyResumable && !partiallyResumable) throw new Error('task_not_resumable');
       const resumeReasons = globallyResumable ? [current.pause_reason] : pausedTaskReasons;
       const preflightReason = resumeReasons.includes('database_file_io_failed')
         ? 'database_file_io_failed'
@@ -2281,6 +2300,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const recoverySnapshot = JSON.stringify({
         state: current.state,
         pause_reason: current.pause_reason,
+        ...(manualHold ? { incidents: current.incidents } : {}),
         tasks: Object.fromEntries(TASKS.map((task) => [task.id, {
           state: current.tasks[task.id]?.state,
           pause_reason: current.tasks[task.id]?.pause_reason,
@@ -2328,6 +2348,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (safetyRun.error?.killed) throw new Error('timeout');
       if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
       const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+      const manualHoldSafetyClear = safety.status === 'success'
+        && safety.execution_owner === 'vps'
+        && safety.process_lock === 'clear'
+        && safety.kill_state === 'clear'
+        && safety.open_order_status === 'clear'
+        && safety.reconciliation_status === 'clear'
+        && safety.account_risk_status === 'clear';
       const vpsDailyLossEntryBlock = safety.status === 'blocked'
         && safety.execution_owner === 'vps'
         && ['account_risk_status_active', 'daily_loss_entry_blocked'].includes(safety.error_class)
@@ -2336,12 +2363,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && safety.open_order_status === 'clear'
         && safety.reconciliation_status === 'clear'
         && safety.account_risk_status === 'active';
-      if (safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
+      if (manualHold && !manualHoldSafetyClear) {
+        throw new Error(safety.error_class === 'none' ? 'safety_monitor_not_clear' : safety.error_class);
+      }
+      if (!manualHold && safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
       const latest = loadStrict();
       const latestSnapshot = JSON.stringify({
         state: latest.state,
         pause_reason: latest.pause_reason,
+        ...(manualHold ? { incidents: latest.incidents } : {}),
         tasks: Object.fromEntries(TASKS.map((task) => [task.id, {
           state: latest.tasks[task.id]?.state,
           pause_reason: latest.tasks[task.id]?.pause_reason,
@@ -2350,6 +2381,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }])),
       });
       if (latestSnapshot !== recoverySnapshot) throw new Error('resume_state_changed');
+      if (manualHold && !manualHoldIncidentsClear(latest)) throw new Error('incident_approval_required');
       const postClosePauseReason = current.state === 'PAUSED'
         ? current.pause_reason
         : current.tasks[POST_CLOSE_TASK.id]?.pause_reason;
@@ -3336,7 +3368,15 @@ async function cli(argv = process.argv.slice(2)) {
   const approval = approvalIndex >= 0 ? argv[approvalIndex + 1] : '';
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
+    : action === 'resume-after-io-fix' ? await (() => {
+      const current = task.status();
+      const manualHold = current.state === 'PAUSED'
+        && current.pause_reason === 'operator_prod_transition_preparation'
+        && TASKS.every((taskDefinition) => current.tasks[taskDefinition.id]?.state === 'PAUSED')
+        && Object.values(current.tasks).every((taskState) => taskState.pending_invocation === null);
+      if (!manualHold) throw new Error('incident_approval_required');
+      return task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' });
+    })()
     : action === 'enable-order' ? await task.enableOrderTask(parseEnableOrderArgs(argv))
     : action === 'cutover-intraday-provider' ? await task.cutoverIntradayProvider({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'approve-daily-entry-cap-five' ? task.approveAggressiveDailyEntryCap({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
