@@ -227,6 +227,7 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
       { symbol: symbols[0], action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
       { symbol: symbols[1], action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
       { symbol: symbols[2], action: 'ENTER', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['MOMENTUM_CONFIRMATION'] },
+      { symbol: symbols[3], action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'] },
     ]),
     execFile(command, args, options, callback) {
       calls += 1;
@@ -238,10 +239,11 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
   await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
   const stored = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).tasks[mod.TASKS[4].id];
   const summary = stored.last_run.llm_verdict_summary;
-  assert.deepEqual(summary.actions, { ENTER: 1, EXIT: 0, HOLD: 1, HOLD_OVERNIGHT: 0, REJECT: 1 });
-  assert.equal(summary.omitted_candidate_count, 1);
+  assert.deepEqual(summary.actions, { ENTER: 1, EXIT: 0, HOLD: 2, HOLD_OVERNIGHT: 0, REJECT: 1 });
+  assert.equal(summary.omitted_candidate_count, 0);
+  assert.equal(summary.response_status, 'validated');
   assert.equal(summary.zero_weight_enter_count, 1);
-  assert.deepEqual(summary.reason_codes, { RISK_REDUCTION: 2, MOMENTUM_CONFIRMATION: 1 });
+  assert.deepEqual(summary.reason_codes, { RISK_REDUCTION: 2, MOMENTUM_CONFIRMATION: 1, NO_EDGE: 1 });
   assert.equal(stored.llm_daily_summary.slot_count, 1);
   assert.equal(stored.llm_daily_summary.trade_date, '2026-07-21');
   assert.doesNotMatch(JSON.stringify(summary), /005930|target_weight|account|prompt|quantity/);
@@ -284,7 +286,13 @@ test('verdict audit accumulates within a day, resets next day and survives downs
   }
 });
 
-function aiVerdict(packet, decisions = []) {
+function aiVerdict(packet, decisions = packet.candidates.map((candidate) => ({
+  symbol: candidate.symbol,
+  action: 'HOLD',
+  target_weight_pct: 0,
+  confidence_bucket: 'low',
+  reason_codes: ['NO_EDGE'],
+}))) {
   return { slot_id: packet.slot_id, model_id: mod.LLM_MODEL_ID, prompt_hash: packet.prompt_hash, decisions };
 }
 
@@ -3263,11 +3271,18 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.equal(packet.candidates.length, 2);
   assert.deepEqual(packet.candidates.map((item) => item.review_tier), ['primary', 'primary']);
   assert.equal(packet.decision_contract.minimum_vps_entry_decisions, 0);
+  assert.deepEqual(packet.decision_contract.required_candidate_symbols, ['005930', '000660']);
   assert.deepEqual(packet.decision_contract.required_position_symbols, []);
-  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [{
-    symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
-    reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
-  }]), packet));
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet, [
+    {
+      symbol: '005930', action: 'ENTER', target_weight_pct: 25, confidence_bucket: 'high',
+      reason_codes: ['MOMENTUM_CONFIRMATION', 'RELATIVE_STRENGTH'],
+    },
+    {
+      symbol: '000660', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low',
+      reason_codes: ['NO_EDGE'],
+    },
+  ]), packet));
   assert.throws(() => mod.parseAiVerdict({ ...aiVerdict(packet), model_id: 'fallback' }, packet), /invalid_ai_verdict/);
   assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005930', action: 'HOLD', target_weight_pct: 1, confidence_bucket: 'high', reason_codes: ['NO_EDGE'],
@@ -3275,6 +3290,17 @@ test('AI verdict packet and response enforce the fixed model and decision contra
   assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
     symbol: '005380', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
   }]), packet), /invalid_ai_verdict/);
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [
+    {
+      symbol: '005930', action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+    },
+    {
+      symbol: '005930', action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+    },
+  ]), packet), /invalid_ai_verdict/);
+  const changedContext = mod.parseDecisionContextOutput(decisionContext(slotId, ['005930']), slotId);
+  const changedPacket = mod.buildSanitizedAiPacket({ slotId, context: changedContext });
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(changedPacket), packet), /invalid_ai_verdict/);
   assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet), packet));
   const held = JSON.parse(decisionContext(slotId, ['005930', '000660']));
   Object.assign(held.candidates[0], { role: 'held_position', review_tier: 'position' });
@@ -3291,20 +3317,197 @@ test('AI verdict packet and response enforce the fixed model and decision contra
     }]), heldPacket), /llm_held_position_action_invalid/);
   }
   for (const action of heldPacket.decision_contract.held_position_actions) {
-    assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
-      symbol: '005930', action, target_weight_pct: 0,
-      confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
-    }]), heldPacket));
+    assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [
+      {
+        symbol: '005930', action, target_weight_pct: 0,
+        confidence_bucket: 'medium', reason_codes: ['NO_EDGE'],
+      },
+      {
+        symbol: '000660', action: 'REJECT', target_weight_pct: 0,
+        confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+      },
+    ]), heldPacket));
   }
-  assert.throws(() => mod.parseAiVerdict(aiVerdict(heldPacket), heldPacket), /llm_position_decision_missing/);
-  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket, [{
-    symbol: '005930', action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'medium',
-    reason_codes: ['NO_EDGE'],
-  }]), heldPacket));
+  assert.throws(() => mod.parseAiVerdict(aiVerdict(heldPacket, []), heldPacket), /llm_position_decision_missing/);
+  assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(heldPacket), heldPacket));
   assert.throws(
     () => mod.parseDecisionContextOutput(decisionContext(slotId, ['005930'], 1), slotId),
     /invalid_decision_context/,
   );
+});
+
+test('AI verdict requires explicit coverage for every bounded candidate', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  for (const candidateCount of [1, 18, 20]) {
+    const symbols = Array.from({ length: candidateCount }, (_, index) => String(index + 1).padStart(6, '0'));
+    const context = mod.parseDecisionContextOutput(decisionContext(slotId, symbols), slotId);
+    const packet = mod.buildSanitizedAiPacket({ slotId, context });
+    assert.doesNotThrow(() => mod.parseAiVerdict(aiVerdict(packet), packet));
+    assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, []), packet), /llm_candidate_decision_missing/);
+    if (candidateCount > 1) {
+      assert.throws(() => mod.parseAiVerdict(aiVerdict(packet, [{
+        symbol: packet.candidates[0].symbol, action: 'HOLD', target_weight_pct: 0,
+        confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+      }]), packet), /llm_candidate_decision_missing/);
+    }
+  }
+});
+
+test('incomplete candidate verdict degrades one slot, records coverage, and never invokes KIS', async () => {
+  const symbols = ['005930', '000660', '005380'];
+  let llmCalls = 0;
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextOutput: (slotId) => decisionContext(slotId, symbols),
+    llmExecutor: async ({ packet }) => {
+      llmCalls += 1;
+      return llmCalls === 1
+        ? aiVerdict(packet, [{
+          symbol: symbols[0], action: 'HOLD', target_weight_pct: 0,
+          confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+        }])
+        : aiVerdict(packet);
+    },
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op', { action_type: 'llm_entry_not_authorized_no_op' }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const firstDueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(firstDueAt);
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
+
+  const firstTask = state.tasks[mod.TASKS[4].id];
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(firstTask.state, 'ACTIVE');
+  assert.equal(firstTask.last_run.error_class, 'llm_candidate_decision_missing');
+  assert.equal(firstTask.last_run.no_same_slot_retry, true);
+  assert.equal(firstTask.last_run.llm_verdict_status, 'incomplete');
+  assert.deepEqual(firstTask.last_run.llm_verdict_summary, {
+    candidate_count: 3,
+    decision_count: 1,
+    omitted_candidate_count: 2,
+    response_status: 'incomplete',
+    zero_weight_enter_count: 0,
+    actions: { ENTER: 0, EXIT: 0, HOLD: 1, HOLD_OVERNIGHT: 0, REJECT: 0 },
+    reason_codes: { NO_EDGE: 1 },
+  });
+  assert.equal(firstTask.llm_daily_summary.incomplete_verdict_count, 1);
+  assert.equal(orderRuns, 0);
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[3].id].state, 'ACTIVE');
+
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
+  assert.equal(llmCalls, 1);
+  assert.equal(orderRuns, 0);
+
+  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  value.setClock(nextDueAt);
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_verdict_status, 'validated');
+  assert.equal(llmCalls, 2);
+  assert.equal(orderRuns, 1);
+});
+
+test('incomplete candidate verdict preserves an external order pause', async () => {
+  const symbols = ['005930', '000660'];
+  let statePath = '';
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextOutput: (slotId) => decisionContext(slotId, symbols),
+    llmExecutor: async ({ packet }) => {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      state.tasks[mod.TASKS[4].id] = {
+        ...state.tasks[mod.TASKS[4].id],
+        state: 'PAUSED',
+        pause_reason: 'external_pause',
+        pending_invocation: null,
+      };
+      fs.writeFileSync(statePath, JSON.stringify(state));
+      return aiVerdict(packet, [{
+        symbol: symbols[0], action: 'HOLD', target_weight_pct: 0,
+        confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+      }]);
+    },
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op'));
+    },
+  });
+  statePath = value.paths.statePath;
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'external_pause');
+  assert.equal(orderRuns, 0);
+});
+
+test('KIS candidate coverage block degrades one slot after zero broker activity', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) {
+        orderRuns += 1;
+        callback({ code: 2 }, orderGood('blocked', { error_class: 'llm_candidate_decision_missing' }));
+        return;
+      }
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  let taskState = state.tasks[mod.TASKS[4].id];
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(taskState.state, 'ACTIVE');
+  assert.equal(taskState.last_run.error_class, 'llm_candidate_decision_missing');
+  assert.equal(taskState.last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(taskState.last_run.no_same_slot_retry, true);
+  assert.equal(taskState.last_run.order_api_calls, 0);
+  assert.equal(taskState.last_run.vps_live_orders, 0);
+  assert.equal(taskState.pending_invocation, null);
+  assert.equal(orderRuns, 1);
+
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(orderRuns, 1);
+  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  value.setClock(nextDueAt);
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
+  taskState = state.tasks[mod.TASKS[4].id];
+  assert.equal(taskState.state, 'ACTIVE');
+  assert.equal(orderRuns, 2);
+});
+
+test('complete REJECT verdict remains a normal no-trade result', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => aiVerdict(packet, packet.candidates.map((candidate) => ({
+      symbol: candidate.symbol, action: 'REJECT', target_weight_pct: 0,
+      confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+    }))),
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op', { action_type: 'llm_entry_not_authorized_no_op' }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'llm_entry_not_authorized_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.llm_verdict_status, 'validated');
+  assert.equal(orderRuns, 1);
 });
 
 test('2026-08-04 09:10 stale decision context pauses before LLM and KIS execution', async () => {
@@ -4361,6 +4564,8 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_position_decision_missing.orderRecovery, true);
+  assert.equal(mod.ERROR_POLICY.llm_candidate_decision_missing.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.llm_candidate_decision_missing.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.resumable, true);
   assert.equal(mod.ERROR_POLICY.model_v3_backfill_transport_unavailable.slotDegradeOnly, true);

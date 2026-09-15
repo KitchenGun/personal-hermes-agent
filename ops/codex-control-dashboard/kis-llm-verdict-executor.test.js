@@ -39,6 +39,7 @@ test('uses fixed Hermes model with safe mode and an empty toolset', async () => 
   assert.equal(calls[0].options.timeout, MAX_TIMEOUT_MS);
   assert.equal(MAX_TIMEOUT_MS, 120_000);
   assert.match(calls[0].args[7], /Do not call tools/);
+  assert.match(calls[0].args[7], /exactly one decision for every supplied candidate/);
   assert.match(calls[0].args[7], /Never force a trade/);
   assert.match(calls[0].args[7], /ml_action is advisory/);
   assert.match(calls[0].args[7], /null means unavailable, never zero/);
