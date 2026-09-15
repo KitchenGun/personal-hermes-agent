@@ -2390,6 +2390,57 @@ test('invalid output and blocked result pause only the failing task while one ti
   }
 });
 
+test('repeated intraday shadow timeouts skip each slot without pausing the task', async () => {
+  let calls = 0;
+  let timeout = true;
+  const value = await active({ execFile(command, args, options, callback) {
+    calls += 1;
+    if (timeout) callback(Object.assign(new Error('timeout'), { killed: true, code: null }), '');
+    else callback(null, good(mod.TASKS[1].id));
+  } });
+  const firstDueAt = new Date('2026-07-21T00:10:11Z');
+  value.setClock(firstDueAt);
+  let state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: firstDueAt });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[1].id].next_run_at, '2026-07-21T00:20:00.000Z');
+
+  const secondDueAt = new Date('2026-07-21T00:20:11Z');
+  value.setClock(secondDueAt);
+  state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: secondDueAt });
+  assert.equal(calls, 2);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].last_run.consecutive_transport_failures, 2);
+  assert.equal(state.tasks[mod.TASKS[1].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[1].id].next_run_at, '2026-07-21T00:30:00.000Z');
+
+  timeout = false;
+  const recoveredDueAt = new Date('2026-07-21T00:30:11Z');
+  value.setClock(recoveredDueAt);
+  state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: recoveredDueAt });
+  assert.equal(calls, 3);
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[1].id].consecutive_transport_failures, 0);
+});
+
+test('repeated supervisor timeouts retain the existing task pause policy', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    callback(Object.assign(new Error('timeout'), { killed: true, code: null }), '');
+  } });
+  const firstDueAt = new Date('2026-07-21T00:00:11Z');
+  value.setClock(firstDueAt);
+  await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: firstDueAt });
+
+  const secondDueAt = new Date('2026-07-22T00:00:11Z');
+  value.setClock(secondDueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: secondDueAt });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[0].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[0].id].pause_reason, 'timeout');
+});
+
 test('supervisor timeout notification identifies automatic safety checks', async () => {
   const sent = [];
   const value = await active({
