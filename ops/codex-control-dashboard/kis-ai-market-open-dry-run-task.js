@@ -120,6 +120,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['unknown_runtime_io_failed', { autoResume: true, resumable: true, orderRecovery: true, scope: 'order' }],
   ['llm_response_timeout', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_position_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
+  ['llm_candidate_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_held_position_action_invalid', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
@@ -947,6 +948,7 @@ function buildSanitizedAiPacket({ slotId, context, runtimeContract = REQUIRED_RU
       max_candidates: runtimeContract.slot_review_limit,
       target_weight_pct: { minimum: 0, maximum: 50, non_enter: 0 },
       minimum_vps_entry_decisions: context.risk_aggregate.minimum_vps_entry_decisions,
+      required_candidate_symbols: candidates.map((item) => item.symbol),
       required_position_symbols: candidates
         .filter((item) => item.role === 'held_position')
         .map((item) => item.symbol),
@@ -965,6 +967,13 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
     throw new Error('invalid_ai_verdict');
   }
   const candidates = new Set(packet.candidates.map((item) => item.symbol));
+  const requiredCandidateSymbols = packet.decision_contract.required_candidate_symbols;
+  if (!Array.isArray(requiredCandidateSymbols)
+    || requiredCandidateSymbols.length !== packet.candidates.length
+    || new Set(requiredCandidateSymbols).size !== requiredCandidateSymbols.length
+    || requiredCandidateSymbols.some((symbol) => !candidates.has(symbol))) {
+    throw new Error('invalid_ai_verdict');
+  }
   const symbols = new Set();
   for (const decision of value.decisions) {
     if (!decision || Array.isArray(decision) || typeof decision !== 'object'
@@ -990,6 +999,9 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
   if (packet.decision_contract.required_position_symbols.some((symbol) => !symbols.has(symbol))) {
     throw new Error('llm_position_decision_missing');
   }
+  if (requiredCandidateSymbols.some((symbol) => !symbols.has(symbol))) {
+    throw new Error('llm_candidate_decision_missing');
+  }
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(serialized)) {
     throw new Error('unsafe_ai_verdict');
@@ -997,20 +1009,40 @@ function parseAiVerdict(value, packet, runtimeContract = REQUIRED_RUNTIME_CONTRA
   return serialized;
 }
 
-function summarizeAiVerdict(verdict, candidateCount) {
+function summarizeAiVerdict(verdict, candidateCount, responseStatus = 'validated') {
   const actions = Object.fromEntries([...AI_DECISION_ACTIONS].map((action) => [action, 0]));
   const reasonCodes = {};
   let zeroWeightEnter = 0;
-  for (const decision of verdict.decisions) {
+  const decisions = Array.isArray(verdict?.decisions) ? verdict.decisions : [];
+  for (const decision of decisions) {
+    if (!decision || typeof decision !== 'object' || !AI_DECISION_ACTIONS.has(decision.action)) continue;
     actions[decision.action] += 1;
     if (decision.action === 'ENTER' && decision.target_weight_pct === 0) zeroWeightEnter += 1;
-    for (const reason of decision.reason_codes) reasonCodes[reason] = (reasonCodes[reason] || 0) + 1;
+    if (!Array.isArray(decision.reason_codes)) continue;
+    for (const reason of decision.reason_codes) {
+      if (AI_REASON_CODES.has(reason)) reasonCodes[reason] = (reasonCodes[reason] || 0) + 1;
+    }
   }
   return {
-    candidate_count: candidateCount, decision_count: verdict.decisions.length,
-    omitted_candidate_count: candidateCount - verdict.decisions.length,
-    zero_weight_enter_count: zeroWeightEnter, actions, reason_codes: reasonCodes,
+    candidate_count: candidateCount,
+    decision_count: decisions.length,
+    omitted_candidate_count: Math.max(candidateCount - decisions.length, 0),
+    response_status: responseStatus,
+    zero_weight_enter_count: zeroWeightEnter,
+    actions,
+    reason_codes: reasonCodes,
   };
+}
+
+function attachAiVerdictFailure(error, candidateCount, responseValue, verdictStatus) {
+  const failure = error instanceof Error ? error : new Error('llm_verdict_contract_unavailable');
+  failure.decisionContextCandidateCount = candidateCount;
+  failure.llmInvoked = true;
+  failure.llmVerdictStatus = verdictStatus;
+  failure.llmVerdictSummary = responseValue === undefined
+    ? null
+    : summarizeAiVerdict(responseValue, candidateCount, verdictStatus);
+  return failure;
 }
 
 function accumulateAiSummary(previous, slotId, summary) {
@@ -1021,6 +1053,10 @@ function accumulateAiSummary(previous, slotId, summary) {
   for (const key of ['candidate_count', 'decision_count', 'omitted_candidate_count', 'zero_weight_enter_count']) {
     total[key] = (prior[key] || 0) + summary[key];
   }
+  const verdictCountKey = summary.response_status === 'validated'
+    ? 'validated_verdict_count'
+    : 'incomplete_verdict_count';
+  total[verdictCountKey] = (prior[verdictCountKey] || 0) + 1;
   for (const key of ['actions', 'reason_codes']) {
     total[key] = { ...(prior[key] || {}) };
     for (const [name, count] of Object.entries(summary[key])) total[key][name] = (total[key][name] || 0) + count;
@@ -1609,10 +1645,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let response;
     try {
       response = await Promise.race([Promise.resolve(llmExecutor({ model: LLM_MODEL_ID, timeoutMs: LLM_RESPONSE_TIMEOUT_MS, packet })), timed]);
+    } catch (error) {
+      throw attachAiVerdictFailure(error, context.candidates.length, undefined, 'failed');
     } finally { clearTimeout(timeout); }
-    const responseValue = typeof response === 'string' ? (() => { try { return JSON.parse(response); } catch { throw new Error('invalid_ai_verdict'); } })() : response;
-    if (now().getTime() >= dueTime.getTime() + (10 * 60_000)) throw new Error('late_ai_verdict');
-    const serialized = parseAiVerdict(responseValue, packet, runtimeContract);
+    let responseValue;
+    try {
+      responseValue = typeof response === 'string' ? JSON.parse(response) : response;
+    } catch {
+      throw attachAiVerdictFailure(new Error('invalid_ai_verdict'), context.candidates.length, undefined, 'incomplete');
+    }
+    if (now().getTime() >= dueTime.getTime() + (10 * 60_000)) {
+      throw attachAiVerdictFailure(new Error('late_ai_verdict'), context.candidates.length, responseValue, 'late');
+    }
+    let serialized;
+    try {
+      serialized = parseAiVerdict(responseValue, packet, runtimeContract);
+    } catch (error) {
+      throw attachAiVerdictFailure(error, context.candidates.length, responseValue, 'incomplete');
+    }
     fs.mkdirSync(verdictDir, { recursive: true, mode: 0o700 });
     const file = path.join(verdictDir, `${crypto.randomBytes(16).toString('hex')}.json`);
     const fd = fs.openSync(file, 'wx', 0o600);
@@ -2707,6 +2757,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const key = dueKey(task, dueTime);
     const postCloseRefresh = isPostCloseRefreshSlot(task, dueTime);
     const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, dueTime) && !postCloseRefresh;
+    const ownsCurrentOrderInvocation = (state, expectedInvocation) => {
+      const currentTask = state.tasks[taskId];
+      return state.state === 'ACTIVE' && currentTask?.state === 'ACTIVE'
+        && currentTask.last_due_at === key
+        && JSON.stringify(currentTask.pending_invocation) === JSON.stringify(expectedInvocation)
+        && currentTask.activation_artifact_hash === taskState.activation_artifact_hash
+        && currentTask.daily_entry_cap_approval_hash === taskState.daily_entry_cap_approval_hash
+        && Object.keys(INTRADAY_PROVIDER_ATTESTATION)
+          .every((keyName) => currentTask[keyName] === taskState[keyName]);
+    };
     let schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
     let pendingInvocation = task.kind === 'order' ? {
       due_key: key,
@@ -2745,13 +2805,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
 
           const contextState = loadStrict();
           const contextTask = contextState.tasks[taskId];
-          if (contextState.state !== 'ACTIVE' || contextTask.state !== 'ACTIVE'
-            || contextTask.last_due_at !== key
-            || JSON.stringify(contextTask.pending_invocation) !== JSON.stringify(pendingInvocation)
-            || contextTask.activation_artifact_hash !== taskState.activation_artifact_hash
-            || contextTask.daily_entry_cap_approval_hash !== taskState.daily_entry_cap_approval_hash
-            || Object.keys(INTRADAY_PROVIDER_ATTESTATION)
-              .some((keyName) => contextTask[keyName] !== taskState[keyName])) {
+          if (!ownsCurrentOrderInvocation(contextState, pendingInvocation)) {
             throw new Error('scheduler_attestation_state_changed');
           }
           schedulerToken = crypto.randomBytes(16).toString('hex');
@@ -2771,20 +2825,37 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
         catch (error) {
           const reason = safeText(error.message, 80);
+          decisionContextCandidateCount = Number.isSafeInteger(error.decisionContextCandidateCount)
+            ? error.decisionContextCandidateCount
+            : decisionContextCandidateCount;
+          llmInvoked = error.llmInvoked === true || llmInvoked;
+          llmVerdictStatus = typeof error.llmVerdictStatus === 'string'
+            ? error.llmVerdictStatus
+            : llmVerdictStatus;
+          llmVerdictSummary = error.llmVerdictSummary || llmVerdictSummary;
           const lastRun = {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
             status: 'no_op', action_type: 'transport_degraded_no_op',
             error_class: reason, fail_closed: true, retry: false,
+            decision_context_candidate_count: decisionContextCandidateCount,
+            llm_invoked: llmInvoked,
+            llm_verdict_status: llmVerdictStatus,
+            llm_verdict_summary: llmVerdictSummary,
           };
           if (ERROR_POLICY[reason]?.slotDegradeOnly === true) {
             const latest = loadStrict();
             const latestTask = latest.tasks[taskId];
+            if (!ownsCurrentOrderInvocation(latest, pendingInvocation)) return latest;
             return save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
               ...latestTask,
               state: 'ACTIVE',
               pause_reason: undefined,
               consecutive_transport_failures: 0,
               pending_invocation: null,
+              ...(llmVerdictSummary ? {
+                llm_last_verdict_summary: { slot_id: key, ...llmVerdictSummary },
+                llm_daily_summary: accumulateAiSummary(latestTask.llm_daily_summary, key, llmVerdictSummary),
+              } : {}),
               last_run: { ...lastRun, fail_closed: false, no_same_slot_retry: true },
             } } });
           }
@@ -3009,6 +3080,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.vpsLiveOrders === 0
         && parsed.reconciliations === 0
         && parsed.orderSymbol === null;
+      const incompleteVerdictNoOp = task.kind === 'order'
+        && !postCloseRefresh
+        && parsed.status === 'blocked'
+        && parsed.failClosed
+        && ['llm_position_decision_missing', 'llm_candidate_decision_missing', 'llm_held_position_action_invalid']
+          .includes(parsed.errorClass)
+        && ERROR_POLICY[parsed.errorClass]?.slotDegradeOnly === true
+        && parsed.orderApiCalls === 0
+        && parsed.vpsLiveOrders === 0
+        && parsed.reconciliations === 0
+        && parsed.orderSymbol === null;
       const postCloseBackfillTransportNoOp = task.kind === 'order'
         && postCloseRefresh
         && parsed.status === 'blocked'
@@ -3046,6 +3128,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           pending_invocation: null,
           next_run_at: nextRunAt(task, dueTime),
           last_run: lastRun,
+        } } });
+      }
+      if (incompleteVerdictNoOp) {
+        const postNotificationTask = postNotificationState.tasks[taskId];
+        if (!ownsCurrentOrderInvocation(postNotificationState, pendingInvocation)) return postNotificationState;
+        return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
+          ...postNotificationTask,
+          state: 'ACTIVE',
+          pause_reason: undefined,
+          consecutive_transport_failures: 0,
+          pending_invocation: null,
+          last_run: {
+            ...lastRun,
+            status: 'no_op',
+            action_type: 'transport_degraded_no_op',
+            fail_closed: false,
+            no_same_slot_retry: true,
+          },
         } } });
       }
       if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseForTask(postNotificationState, parsed.errorClass || 'blocked', lastRun);
