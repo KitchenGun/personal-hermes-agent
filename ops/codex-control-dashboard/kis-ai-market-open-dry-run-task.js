@@ -274,6 +274,7 @@ const TASK_ALERT_LABELS = new Map([
 const DRY_RUN_TASKS = Object.freeze(TASKS.filter((task) => task.kind === 'dry_run'));
 const ORDER_TASK = TASKS.find((task) => task.kind === 'order');
 const REFRESH_ONLY_ORDER_TASK = Object.freeze({ ...ORDER_TASK, minutes: [980] });
+const INTRADAY_SHADOW_TASK = TASKS.find((task) => task.id === 'kis-ai-intraday-shadow-validation-v1');
 const POST_CLOSE_TASK = TASKS.find((task) => task.id === 'kis-ai-post-close-learning-v1');
 const ACTIVE_STATUSES = new Set(['success', 'no_op', 'waiting', 'report_ready']);
 const ALL_STATUSES = new Set([...ACTIVE_STATUSES, 'blocked']);
@@ -2712,13 +2713,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const latestTask = state.tasks[taskId];
       const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
       lastRun.consecutive_transport_failures = consecutive;
-      if (consecutive >= 2) return pauseForTask(state, reason, lastRun);
+      const skipOnly = task.id === INTRADAY_SHADOW_TASK.id && reason === 'timeout';
+      if (!skipOnly && consecutive >= 2) return pauseForTask(state, reason, lastRun);
       const degraded = save({ ...state, tasks: { ...state.tasks, [taskId]: {
         ...latestTask,
         state: 'ACTIVE',
         pause_reason: undefined,
         consecutive_transport_failures: consecutive,
-        last_run: lastRun,
+        last_run: {
+          ...lastRun,
+          ...(skipOnly ? { no_same_slot_retry: true } : {}),
+        },
         ...(task.kind === 'order' ? { pending_invocation: null } : {}),
       } } });
       return notifyPause(degraded, taskId, reason, lastRun, { transientOnly: true });
