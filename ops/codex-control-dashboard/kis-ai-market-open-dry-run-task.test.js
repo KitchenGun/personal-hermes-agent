@@ -2556,8 +2556,65 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
 });
 
-test('manual production-transition hold resumes only dry-run tasks after clear VPS safety checks', async () => {
+test('mixed timeout and TLS task pauses are visible and recover only after verification', async () => {
+  const value = await active();
+  const current = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  const shadowId = 'kis-ai-intraday-shadow-validation-v1';
+  const orderId = 'kis-vps-model-v3-autonomous-pilot-v1';
+  current.state = 'ACTIVE';
+  Object.assign(current.tasks[shadowId], {
+    state: 'PAUSED',
+    pause_reason: 'timeout',
+    next_run_at: null,
+  });
+  Object.assign(current.tasks[orderId], {
+    state: 'PAUSED',
+    pause_reason: 'tls_failed',
+    next_run_at: null,
+  });
+  current.tasks[shadowId].pending_invocation = { due_key: 'pending' };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /pending_invocation_active/);
+  current.tasks[shadowId].pending_invocation = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+
+  const degraded = value.task.status();
+  assert.equal(degraded.aggregate_state, 'DEGRADED');
+  assert.deepEqual(
+    degraded.critical_task_pauses.map(({ task_id }) => task_id).sort(),
+    [orderId, shadowId].sort(),
+  );
+
+  const resumed = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(resumed.tasks[shadowId].state, 'ACTIVE');
+  assert.equal(resumed.tasks[orderId].state, 'DISABLED');
+  const recovered = value.task.status();
+  assert.equal(recovered.aggregate_state, 'ACTIVE');
+  assert.deepEqual(recovered.critical_task_pauses, []);
+});
+
+test('TLS order recovery preserves and rejects an unresolved pending invocation', async () => {
+  const value = await active();
+  const current = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  const orderId = 'kis-vps-model-v3-autonomous-pilot-v1';
+  Object.assign(current.tasks[orderId], {
+    state: 'PAUSED',
+    pause_reason: 'tls_failed',
+    next_run_at: null,
+    pending_invocation: { due_key: 'pending' },
+  });
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /order_invocation_pending/,
+  );
+  const preserved = value.task.status().tasks[orderId];
+  assert.equal(preserved.state, 'PAUSED');
+  assert.deepEqual(preserved.pending_invocation, { due_key: 'pending' });
+});
   let activationPreflights = 0;
+test('manual production-transition hold resumes only dry-run tasks after clear VPS safety checks', async () => {
   const commands = [];
   const value = await active({
     onActivationPreflight() { activationPreflights += 1; },
@@ -4581,6 +4638,9 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   }
   assert.equal(mod.ERROR_POLICY.tls_failed.autoRepair, false);
   assert.equal(mod.ERROR_POLICY.quote_api_failed.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.tls_failed.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.tls_failed.resumable, true);
+  assert.equal(mod.ERROR_POLICY.tls_failed.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.autoRepair, true);
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.resumable, true);
   assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.autoRepair, false);
