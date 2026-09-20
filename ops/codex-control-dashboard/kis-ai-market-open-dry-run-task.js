@@ -57,7 +57,8 @@ const RESUME_BLOCKING_LOCK_PATHS = Object.freeze([
   '/tmp/kis-trading-lab-vps-order.lock',
   '/tmp/kis-trading-lab-vps-preflight-only-0910.lock',
 ]);
-const APPROVED_SOURCE_TASK_PATH = '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
+const APPROVED_SOURCE_TASK_PATH = process.env.KIS_HERMES_APPROVED_SOURCE_PATH
+  || '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
 const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
@@ -114,7 +115,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['http_transport_failed', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
   ['response_read_failed', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
   ['database_busy', { transient: true, autoResume: true, resumable: true, orderRecovery: true, safetyAwait: true }],
-  ['tls_failed', {}],
+  ['tls_failed', { resumable: true, orderRecovery: true, safetyAwait: true }],
   ['quote_api_failed', {}],
   ['local_file_io_failed', { autoRepair: true, resumable: true }],
   ['unknown_runtime_io_failed', { autoResume: true, resumable: true, orderRecovery: true, scope: 'order' }],
@@ -2083,8 +2084,25 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }
     return stateFaultNotificationPromise;
   }
+  function withAggregateStatus(current) {
+    const criticalTaskPauses = [INTRADAY_SHADOW_TASK, ORDER_TASK].flatMap((task) => {
+      const taskState = current.tasks?.[task.id];
+      return taskState?.state === 'PAUSED' ? [{
+        task_id: task.id,
+        state: taskState.state,
+        pause_reason: taskState.pause_reason || null,
+      }] : [];
+    });
+    return {
+      ...current,
+      aggregate_state: current.state === 'ACTIVE' && criticalTaskPauses.length > 0
+        ? 'DEGRADED'
+        : current.state,
+      critical_task_pauses: criticalTaskPauses,
+    };
+  }
   function status() {
-    try { return { ...loadStrict(), scheduler_faulted: schedulerFaulted }; }
+    try { return withAggregateStatus({ ...loadStrict(), scheduler_faulted: schedulerFaulted }); }
     catch {
       schedulerFaulted = true;
       void queueStateFaultNotification();
@@ -2340,7 +2358,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && pausedTaskReasons.length > 0
         && pausedTaskReasons.every((reason) => RESUMABLE_PAUSE_REASONS.has(reason));
       if (manualHold && !manualHoldIncidentsClear(current)) throw new Error('incident_approval_required');
-      if (manualHold && Object.values(current.tasks).some((task) => task.pending_invocation !== null)) {
+      if (Object.values(current.tasks).some((task) => task.pending_invocation !== null)) {
         throw new Error('pending_invocation_active');
       }
       if (!manualHold && !globallyResumable && !partiallyResumable) throw new Error('task_not_resumable');
@@ -2478,6 +2496,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const current = loadStrict();
       const prior = current.tasks[ORDER_TASK.id];
       const unresolvedIncident = blockingIncident(current);
+      if (prior.pending_invocation !== null) throw new Error('order_invocation_pending');
       if (unresolvedIncident && invokedBy !== `incident:${unresolvedIncident.incident_id}`) {
         throw new Error('incident_approval_required');
       }
@@ -2501,7 +2520,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid'].includes(prior.pause_reason)) {
+      if (['tls_failed', 'order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid'].includes(prior.pause_reason)) {
         const safetyRun = await execute(buildSafetyMonitorCommand());
         if (safetyRun.error) throw new Error('safety_monitor_process_error');
         const safety = parseSafetyMonitorOutput(safetyRun.stdout);
@@ -2566,7 +2585,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (latest.state !== current.state
         || latestPrior.state !== prior.state
         || latestPrior.pause_reason !== prior.pause_reason
-        || latestPrior.next_run_at !== prior.next_run_at) {
+        || latestPrior.next_run_at !== prior.next_run_at
+        || latestPrior.pending_invocation !== null) {
         throw new Error('order_activation_state_changed');
       }
       const activatedAt = now();
@@ -3473,15 +3493,7 @@ async function cli(argv = process.argv.slice(2)) {
   const approval = approvalIndex >= 0 ? argv[approvalIndex + 1] : '';
   const result = action === 'prepare-disabled' ? task.prepareDisabled()
     : action === 'activate' ? await task.activate({ approval: argv[2], invokedBy: 'hermes_cli' })
-    : action === 'resume-after-io-fix' ? await (() => {
-      const current = task.status();
-      const manualHold = current.state === 'PAUSED'
-        && current.pause_reason === 'operator_prod_transition_preparation'
-        && TASKS.every((taskDefinition) => current.tasks[taskDefinition.id]?.state === 'PAUSED')
-        && Object.values(current.tasks).every((taskState) => taskState.pending_invocation === null);
-      if (!manualHold) throw new Error('incident_approval_required');
-      return task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' });
-    })()
+    : action === 'resume-after-io-fix' ? await task.resumeAfterIoFix({ approval: argv[2], invokedBy: 'hermes_cli' })
     : action === 'enable-order' ? await task.enableOrderTask(parseEnableOrderArgs(argv))
     : action === 'cutover-intraday-provider' ? await task.cutoverIntradayProvider({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
     : action === 'approve-daily-entry-cap-five' ? task.approveAggressiveDailyEntryCap({ confirm: argv.includes('--confirm'), approval, invokedBy: 'hermes_cli' })
