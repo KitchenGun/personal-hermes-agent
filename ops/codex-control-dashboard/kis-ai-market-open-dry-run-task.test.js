@@ -733,6 +733,42 @@ test('delayed post-close learning retains the canonical due key without a same-d
   assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, observedDueKey);
 });
 
+test('expired KIS learning start remains parser-valid waiting with calendar evidence', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async () => {
+  const script = `
+import importlib.util, json, os, sys, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+root = Path(sys.argv[1]).resolve().parents[1]
+os.chdir(root)
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location('fixture', root / 'tests/test_ai_market_open_runtime.py')
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+with tempfile.TemporaryDirectory() as directory:
+    db = Path(directory) / 'vps.sqlite3'
+    latch = Path(directory) / 'kill-switch'
+    latch.write_text('disabled\\n', encoding='utf-8')
+    fixture._database(db)
+    result = fixture._run_task(db, latch, fixture.SafeClient(), fixture.TASK_IDS[2],
+        now=datetime(2026, 7, 21, 8, 49, tzinfo=timezone.utc),
+        observation_clock=lambda: datetime(2026, 7, 21, 8, 50, tzinfo=timezone.utc))
+    print(json.dumps(result))
+`;
+  const stdout = await new Promise((resolve, reject) => execFile(
+    process.env.KIS_REPORT_TEST_PYTHON || 'python3',
+    ['-c', script, process.env.KIS_REPORT_PRODUCER_SOURCE],
+    (error, output) => error ? reject(error) : resolve(output),
+  ));
+  const value = JSON.parse(stdout);
+  const parsed = mod.parseKisAiMarketOpenOutput(stdout, mod.TASKS[2].id,
+    () => ({ isTradingDay: true, sourceHash: value.official_calendar_source_hash }));
+  assert.equal(parsed.status, 'waiting');
+  assert.equal(parsed.actionType, 'waiting_window');
+  assert.equal(parsed.failClosed, false);
+});
+
 test('intraday decision and order schedules align on future 10-minute slots', () => {
   assert.deepEqual(mod.TASKS[1].minutes, Array.from({ length: 34 }, (_, i) => 550 + (i * 10)));
   assert.deepEqual(mod.TASKS[2].minutes, [980]);
