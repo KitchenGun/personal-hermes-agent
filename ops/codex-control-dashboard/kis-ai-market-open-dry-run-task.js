@@ -146,8 +146,13 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['model_v3_refresh_failed', { autoRepair: true }],
   ['model_v3_shadow_failed', { autoRepair: true }],
   ['model_v3_shadow_batch_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
-  ['model_v3_backfill_transport_unavailable', { slotDegradeOnly: true }],
+  ['model_v3_prediction_batch_incomplete', { orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_transport_unavailable', { slotDegradeOnly: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_backfill_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_warmup_insufficient', { orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_data_invalid', { orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_credentials_unavailable', { orderRecovery: true, postCloseRecovery: true }],
+  ['model_v3_backfill_tls_unavailable', { orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_shadow_execution_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_artifact_load_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_artifact_verify_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
@@ -366,6 +371,20 @@ function isDue(task, date) {
   const parts = seoulParts(date);
   return !['Sat', 'Sun'].includes(parts.weekday)
     && task.minutes.includes((Number(parts.hour) * 60) + Number(parts.minute));
+}
+
+function isDelayedPostCloseStart(task, scheduledAt, invokedAt, calendarProofResolver) {
+  if (task.id !== POST_CLOSE_TASK.id || !isDue(task, scheduledAt)) return false;
+  const scheduled = seoulParts(scheduledAt);
+  const invoked = seoulParts(invokedAt);
+  const invokedMinute = (Number(invoked.hour) * 60) + Number(invoked.minute);
+  if (scheduled.year !== invoked.year || scheduled.month !== invoked.month || scheduled.day !== invoked.day
+    || invokedMinute < 980 || invokedMinute >= 1070) return false;
+  try {
+    return calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`)?.isTradingDay === true;
+  } catch {
+    return false;
+  }
 }
 
 function dueKey(task, date) {
@@ -1374,7 +1393,10 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   }
   const args = ['-m', 'kis_trading_lab', 'ai-market-open-dry-run-once', '--approval', ACTIVATION_APPROVAL, '--task-id', taskId, '--strategy-manifest', STRATEGY_MANIFEST, '--db', VPS_DB_PATH];
   if (activationPreflight) args.push('--activation-preflight');
-  return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO, env: verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath } : {} };
+  return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO, env: {
+    ...(taskId === POST_CLOSE_TASK.id ? { KIS_HERMES_DUE_KEY: invocationDueKey } : {}),
+    ...(verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath } : {}),
+  } };
 }
 
 function buildDiagnosticCommand() {
@@ -2359,9 +2381,28 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && current.order_pause_reason === 'order_submission_unknown';
       const globallyResumable = current.state === 'PAUSED'
         && (RESUMABLE_PAUSE_REASONS.has(current.pause_reason) || sanitizedReconciliationPause);
+      const postCloseTask = current.tasks[POST_CLOSE_TASK.id];
+      const postCloseRefreshError = sanitizeErrorClass(
+        postCloseTask?.last_run?.model_v3_candidate_refresh_error_class,
+      );
+      const postCloseRefreshRecovery = current.state === 'ACTIVE'
+        && postCloseTask?.state === 'PAUSED'
+        && postCloseTask.pause_reason === postCloseRefreshError
+        && postCloseTask.last_run?.status === 'success'
+        && postCloseTask.last_run?.action_type === 'post_close_learning'
+        && postCloseTask.last_run?.fail_closed === false
+        && postCloseTask.last_run?.model_v3_candidate_refresh_status === 'blocked'
+        && postCloseTask.last_run?.model_v3_candidate_refresh_fail_closed === true
+        && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(postCloseRefreshError)
+        && current.last_error_notification?.task_id === POST_CLOSE_TASK.id
+        && current.last_error_notification?.error_class === postCloseRefreshError;
       const partiallyResumable = current.state === 'ACTIVE'
         && pausedTaskReasons.length > 0
-        && pausedTaskReasons.every((reason) => RESUMABLE_PAUSE_REASONS.has(reason));
+        && pausedTaskReasons.every((reason) => RESUMABLE_PAUSE_REASONS.has(reason))
+        || (postCloseRefreshRecovery
+          && Object.entries(current.tasks).every(([taskId, taskState]) => taskState.state !== 'PAUSED'
+            || taskId === POST_CLOSE_TASK.id
+            || RESUMABLE_PAUSE_REASONS.has(taskState.pause_reason)));
       if (manualHold && !manualHoldIncidentsClear(current)) throw new Error('incident_approval_required');
       if (Object.values(current.tasks).some((task) => task.pending_invocation !== null)) {
         throw new Error('pending_invocation_active');
@@ -2461,7 +2502,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         : current.tasks[POST_CLOSE_TASK.id]?.pause_reason;
       const postCloseRefreshPending = current.last_error_notification?.task_id === POST_CLOSE_TASK.id
         && current.last_error_notification?.error_class === sanitizeErrorClass(postClosePauseReason)
-        && current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === postClosePauseReason
+        && (current.tasks[POST_CLOSE_TASK.id]?.last_run?.error_class === postClosePauseReason
+          || (postCloseRefreshRecovery
+            && current.tasks[ORDER_TASK.id]?.decision_provider !== INTRADAY_PROVIDER_ATTESTATION.decision_provider))
         && current.tasks[ORDER_TASK.id]?.activation_artifact_hash != null;
       const tasks = Object.fromEntries(TASKS.map((task) => {
         const prior = current.tasks[task.id] || {};
@@ -2762,8 +2805,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     };
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
-    if (!isDue(task, dueTime) || !sameMinute(taskState.next_run_at, dueTime)) {
-      const scheduled = new Date(taskState.next_run_at || 0);
+    const scheduled = new Date(taskState.next_run_at || 0);
+    const delayedPostCloseStart = !sameMinute(taskState.next_run_at, dueTime)
+      && isDelayedPostCloseStart(task, scheduled, dueTime, calendarProofResolver);
+    const scheduledDueTime = delayedPostCloseStart ? scheduled : dueTime;
+    if (!isDue(task, scheduledDueTime) || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
       if (scheduled.getTime() < dueTime.getTime()) {
         const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
           ? REFRESH_ONLY_ORDER_TASK : task;
@@ -2790,10 +2836,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     current = loadStrict();
     taskState = current.tasks[taskId];
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE'
-      || !sameMinute(taskState.next_run_at, dueTime)) return current;
-    const key = dueKey(task, dueTime);
-    const postCloseRefresh = isPostCloseRefreshSlot(task, dueTime);
-    const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, dueTime) && !postCloseRefresh;
+      || !sameMinute(taskState.next_run_at, scheduledDueTime)) return current;
+    const key = dueKey(task, scheduledDueTime);
+    const postCloseRefresh = isPostCloseRefreshSlot(task, scheduledDueTime);
+    const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, scheduledDueTime) && !postCloseRefresh;
     const ownsCurrentOrderInvocation = (state, expectedInvocation) => {
       const currentTask = state.tasks[taskId];
       return state.state === 'ACTIVE' && currentTask?.state === 'ACTIVE'
@@ -2824,7 +2870,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
         ? REFRESH_ONLY_ORDER_TASK : task;
       save({ ...current, tasks: { ...current.tasks, [taskId]: {
-        ...taskState, last_due_at: key, next_run_at: nextRunAt(scheduleTask, dueTime), pending_invocation: pendingInvocation,
+        ...taskState, last_due_at: key, next_run_at: nextRunAt(scheduleTask, scheduledDueTime), pending_invocation: pendingInvocation,
       } } });
       if (task.kind === 'order') {
         attestationPath = attestationFileForDueKey(key, orderAttestationDir);
@@ -2832,7 +2878,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (requiresAiVerdict) {
         try {
-          const verdict = await createAiVerdictFile(taskId, key, dueTime, schedulerToken);
+          const verdict = await createAiVerdictFile(taskId, key, scheduledDueTime, schedulerToken);
           verdictPath = verdict?.path || null;
           promptHash = verdict?.promptHash || '';
           decisionContextCandidateCount = verdict?.candidateCount || 0;
@@ -2902,7 +2948,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       let weeklyUniverse = null;
       let independentShadowRefresh = null;
-      if (isWeeklyUniverseRefreshDue(task, dueTime)) {
+      if (isWeeklyUniverseRefreshDue(task, scheduledDueTime)) {
         const weekly = await execute(buildWeeklyUniverseCommand());
         if (weekly.error && Number(weekly.error.code) !== 2) {
           weeklyUniverse = {
@@ -2948,7 +2994,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const errorClass = safeText(parseError.message, 80);
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
       }
-      if (task.id === POST_CLOSE_TASK.id && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
+      if (task.id === POST_CLOSE_TASK.id && parsed.status === 'success'
+        && parsed.actionType === 'post_close_learning' && parsed.failClosed === false && !delayedPostCloseStart
+        && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
         const refresh = await execute(buildIndependentShadowRefreshCommand());
         if (refresh.error && Number(refresh.error.code) !== 2) {
           independentShadowRefresh = {
@@ -2959,12 +3007,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         } else {
           try {
             const refreshResult = parseKisVpsAutonomousOutput(refresh.stdout, ORDER_TASK.id, runtimeContract);
-            if (refreshResult.status !== 'blocked'
-              && (!['shadow_refreshed', 'market_closed_no_op'].includes(refreshResult.actionType)
+            if ((refreshResult.status !== 'blocked'
+                && !['shadow_refreshed', 'market_closed_no_op'].includes(refreshResult.actionType))
               || refreshResult.artifactPromoted
               || refreshResult.orderApiCalls !== 0
               || refreshResult.vpsLiveOrders !== 0
-              || refreshResult.reconciliations !== 0)) {
+              || refreshResult.reconciliations !== 0) {
               throw new Error('invalid_independent_shadow_refresh');
             }
             independentShadowRefresh = {
@@ -2985,7 +3033,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           }
         }
       }
-      const slot = seoulParts(dueTime);
+      const slot = seoulParts(scheduledDueTime);
       const horizonExitOrderSlot = task.kind === 'order'
         && Number(slot.hour) === 14
         && Number(slot.minute) >= 40
@@ -3073,11 +3121,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           model_v3_candidate_artifact_hash: independentShadowRefresh.artifactHash || null,
         });
         if (independentShadowRefresh.failClosed) {
-          return pauseForTask(
-            latest,
+          const refreshBlocker = sanitizeErrorClass(
             independentShadowRefresh.errorClass || 'post_close_shadow_failed',
-            lastRun,
           );
+          if (!POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(refreshBlocker)) {
+            return pauseForTask(latest, refreshBlocker, lastRun);
+          }
+          const recordedRun = { ...lastRun, no_same_slot_retry: true };
+          const refreshedTask = latest.tasks[taskId];
+          const active = save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
+            ...refreshedTask,
+            state: 'ACTIVE',
+            pause_reason: undefined,
+            consecutive_transport_failures: 0,
+            last_run: recordedRun,
+          } } });
+          return notifyPause(active, taskId, refreshBlocker, recordedRun, { transientOnly: true });
         }
       }
       if (task.kind === 'order') {
@@ -3154,7 +3213,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           consecutive_transport_failures: 0,
           pending_invocation: null,
           refresh_only_pending: true,
-          next_run_at: nextRunAt(REFRESH_ONLY_ORDER_TASK, dueTime),
+          next_run_at: nextRunAt(REFRESH_ONLY_ORDER_TASK, scheduledDueTime),
           last_run: {
             ...lastRun,
             status: 'no_op',
@@ -3172,7 +3231,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           pause_reason: undefined,
           consecutive_transport_failures: 0,
           pending_invocation: null,
-          next_run_at: nextRunAt(task, dueTime),
+          next_run_at: nextRunAt(task, scheduledDueTime),
           last_run: lastRun,
         } } });
       }
@@ -3218,7 +3277,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           pending_invocation: null,
           refresh_only_pending: refreshOnlyPending,
           next_run_at: postNotificationTask.refresh_only_pending === true
-            ? nextRunAt(refreshOnlyPending ? REFRESH_ONLY_ORDER_TASK : task, dueTime)
+            ? nextRunAt(refreshOnlyPending ? REFRESH_ONLY_ORDER_TASK : task, scheduledDueTime)
             : postNotificationTask.next_run_at,
           activation_artifact_hash: postNotificationTask.activation_artifact_hash,
           last_run: lastRun,
