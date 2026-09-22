@@ -9,6 +9,13 @@ const path = require('node:path');
 const test = require('node:test');
 const mod = require('./kis-ai-market-open-dry-run-task');
 const CALENDAR_HASH = `sha256:${'a'.repeat(64)}`;
+const LEGACY_INTRADAY_ATTESTATION = {
+  decision_provider: 'intraday_v1',
+  intraday_feature_version: 'intraday-quote-10m-v2-dynamic-universe',
+  intraday_policy_version: 'intraday-fast-track-v3-intraday-discovery',
+  intraday_feature_hash: crypto.createHash('sha256').update('intraday-quote-10m-v2-dynamic-universe', 'ascii').digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update('intraday-fast-track-v3-intraday-discovery', 'ascii').digest('hex'),
+};
 
 function calendarProof(isTradingDay = true) {
   return { isTradingDay, sourceHash: CALENDAR_HASH };
@@ -26,12 +33,16 @@ function good(taskId, status = 'success', extra = {}) {
   const intraday = taskId === mod.TASKS[1].id && status === 'success' && actionType === 'intraday_shadow'
     ? {
         intraday_decisions: 3,
-        intraday_mode: 'hybrid_bootstrap',
-        intraday_model_version: 'intraday_hybrid_v2',
+        intraday_mode: 'ml_champion',
+        intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
         intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
         intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
         intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
         intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+        intraday_candidate_counts: {
+          analyzed: 3, observation_ready: 3, data_excluded: 0,
+          model_unavailable: 0, risk_excluded: 0, llm_eligible: 3,
+        },
       }
     : {};
   const postClose = taskId === mod.TASKS[2].id && status === 'success' && actionType === 'post_close_learning'
@@ -117,6 +128,10 @@ function orderGood(status = 'no_op', extra = {}) {
     intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
     intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
     intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+    intraday_candidate_counts: {
+      analyzed: 0, observation_ready: 0, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: 0,
+    },
     order_symbol: null,
     order_name: null,
     order_side: null,
@@ -392,6 +407,10 @@ function decisionContext(slotId, candidates = ['005930'], minimumVpsEntryDecisio
       daily_loss_limit_pct: 3,
     },
     event_metadata: [],
+    intraday_candidate_counts: {
+      analyzed: candidates.length, observation_ready: candidates.length, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: candidates.length,
+    },
     fail_closed: false,
     error_class: 'none',
     raw_response_persisted: false,
@@ -552,9 +571,9 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_HERMES_SCHEDULER_TOKEN, '1'.repeat(32));
   assert.equal(command.env.KIS_HERMES_DUE_KEY, dueKey);
   assert.equal(command.env.KIS_INTRADAY_PROVIDER_ID, 'intraday_v1');
-  assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v2-dynamic-universe');
+  assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v3-independent');
   assert.equal(command.env.KIS_INTRADAY_FEATURE_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash);
-  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v3-intraday-discovery');
+  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v4-independent');
   assert.equal(command.env.KIS_INTRADAY_POLICY_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash);
   assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, 'null');
   assert.equal(command.args.includes('--approval'), false);
@@ -966,6 +985,7 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   })), /unsafe_order_count/);
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v2',
+    ...LEGACY_INTRADAY_ATTESTATION,
   })));
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v1',
@@ -1081,7 +1101,7 @@ test('exact v2 provider attestation remains readable for atomic v3 synchronizati
 
   const before = value.task.status();
   assert.equal(before.state, 'ACTIVE');
-  assert.equal(before.tasks[mod.TASKS[4].id].intraday_feature_version, legacyFeatureVersion);
+  assert.equal(before.tasks[mod.TASKS[4].id].intraday_feature_version, 'intraday-quote-10m-v3-independent');
   const state = await value.task.cutoverIntradayProvider({
     confirm: true,
     approval: mod.INTRADAY_PROVIDER_CUTOVER_APPROVAL,
@@ -1091,11 +1111,11 @@ test('exact v2 provider attestation remains readable for atomic v3 synchronizati
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(
     state.tasks[mod.TASKS[4].id].intraday_feature_version,
-    'intraday-quote-10m-v2-dynamic-universe',
+    'intraday-quote-10m-v3-independent',
   );
   assert.equal(
     state.tasks[mod.TASKS[4].id].intraday_policy_version,
-    'intraday-fast-track-v3-intraday-discovery',
+    'intraday-fast-track-v4-independent',
   );
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(Object.keys(state.tasks).length, 5);
@@ -2207,10 +2227,18 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     quote_api_calls: 10, decisions: 10, intraday_decisions: 10,
+    intraday_candidate_counts: {
+      analyzed: 10, observation_ready: 10, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: 10,
+    },
   }), mod.TASKS[1].id, trading));
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     decisions: 10, intraday_decisions: 3,
-  }), mod.TASKS[1].id, trading), /intraday_output_contract/);
+    intraday_candidate_counts: {
+      analyzed: 10, observation_ready: 10, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: 10,
+    },
+  }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     quote_api_calls: 21,
   }), mod.TASKS[1].id, trading), /unsafe/);
@@ -2220,8 +2248,11 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
   }), mod.TASKS[1].id, trading));
-  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_decisions: 2,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
+    decisions: 2, intraday_decisions: 3,
   }), mod.TASKS[1].id, trading), /intraday_output_contract/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_feature_hash: 'b'.repeat(64),
@@ -2302,6 +2333,175 @@ test('post-close runtime failure preserves its sanitized cause instead of maskin
   assert.equal(state.tasks[mod.TASKS[2].id].pause_reason, 'runtime_unhandled_error');
   assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_phase, 'post_close_learning');
   assert.equal(state.tasks[mod.TASKS[2].id].last_run.failure_exception_type, 'RuntimeError');
+});
+
+test('independent intraday summaries accept model-unavailable counts and reject unsafe entries', () => {
+  const counts = {
+    analyzed: 3, observation_ready: 2, data_excluded: 1,
+    model_unavailable: 1, risk_excluded: 1, llm_eligible: 0,
+  };
+  const unavailable = JSON.parse(good(mod.TASKS[1].id));
+  Object.assign(unavailable, {
+    decisions: 0, intraday_decisions: 0,
+    intraday_mode: 'model_unavailable', intraday_model_version: 'intraday_model_unavailable_v3',
+    intraday_candidate_counts: { ...counts },
+  });
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(
+    JSON.stringify(unavailable), mod.TASKS[1].id, () => calendarProof(true),
+  ));
+  unavailable.intraday_candidate_counts.llm_eligible = 1;
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(
+    JSON.stringify(unavailable), mod.TASKS[1].id, () => calendarProof(true),
+  ), /invalid_intraday_candidate_counts/);
+
+  const order = JSON.parse(orderGood('success', {
+    action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1, reconciliations: 1,
+    intraday_mode: 'model_unavailable', intraday_model_version: 'intraday_model_unavailable_v3',
+    order_symbol: '005930', order_name: '삼성전자', order_side: 'buy', requested_quantity: 1,
+    filled_quantity: 1, unfilled_quantity: 0, lifecycle_status: 'filled',
+    decision_reason_codes: ['NO_EDGE'], notification_idempotency_key: 'a'.repeat(64),
+    intraday_candidate_counts: counts,
+  }));
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(JSON.stringify(order)), /intraday_model_unavailable_entry/);
+});
+
+test('decision context permits only blocked held positions with nullable model values', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const context = JSON.parse(decisionContext(slotId));
+  Object.assign(context.candidates[0], {
+    role: 'held_position', review_tier: 'position', ml_action: 'BLOCK', data_quality: 'BLOCKED',
+    prob_up: null, prob_flat: null, prob_down: null, expected_net_return: null,
+    daily_prior: { predicted_class: 'flat', prob_up: 0.4 },
+  });
+  context.holdings = [{ symbol: '005930', quantity: 1 }];
+  context.risk_aggregate.open_positions = 1;
+  context.intraday_candidate_counts = {
+    analyzed: 1, observation_ready: 1, data_excluded: 0,
+    model_unavailable: 1, risk_excluded: 0, llm_eligible: 0,
+  };
+  const parsed = mod.parseDecisionContextOutput(JSON.stringify(context), slotId);
+  assert.equal(parsed.candidates[0].prob_up, null);
+  assert.equal(parsed.candidates[0].daily_prior.predicted_class, 'flat');
+  context.candidates[0].role = 'eligible_entry';
+  context.candidates[0].review_tier = 'primary';
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(context), slotId), /invalid_ai_candidates/);
+});
+
+test('post-close learning starts once in its same-day delayed window with the canonical due key', async () => {
+  let normalRuns = 0;
+  const normal = await active({ onExec({ args, execOptions }) {
+    if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) {
+      normalRuns += 1;
+      assert.equal(execOptions.env.KIS_HERMES_DUE_KEY, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+    }
+  } });
+  const normalState = normal.task.status();
+  normalState.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(normal.paths.statePath, JSON.stringify(normalState));
+  normal.setClock('2026-07-21T07:20:00.000Z');
+  await normal.task.tick();
+  assert.equal(normalRuns, 1);
+
+  let runs = 0;
+  let dueKey = '';
+  let delayedRefreshRuns = 0;
+  const value = await active({
+    onExec({ args, execOptions }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) {
+        runs += 1;
+        dueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      }
+      if (args.includes('refresh-shadow')) delayedRefreshRuns += 1;
+    },
+  });
+  const scheduled = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = scheduled;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:00.000Z');
+
+  const after = await value.task.tick();
+
+  assert.equal(runs, 1);
+  assert.equal(delayedRefreshRuns, 0);
+  assert.equal(dueKey, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, dueKey);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.started_at, '2026-07-21T07:21:00.000Z');
+  assert.equal(after.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+});
+
+test('post-close delayed window excludes 17:50, date changes, holidays, and order catch-up', async () => {
+  let postCloseRuns = 0;
+  let orderRuns = 0;
+  const value = await active({
+    calendarProofResolver: (date) => calendarProof(date !== '2026-07-23'),
+    onExec({ args }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) postCloseRuns += 1;
+      if (args.includes('vps-autonomous-order')) orderRuns += 1;
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  value.setClock('2026-07-21T08:50:00.000Z');
+  let after = await value.task.tick();
+  assert.equal(postCloseRuns, 0);
+  assert.equal(orderRuns, 0);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.action_type, 'missed_window_no_op');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_window_no_op');
+
+  after.tasks[mod.TASKS[2].id].next_run_at = '2026-07-22T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(after));
+  value.setClock('2026-07-23T07:21:00.000Z');
+  after = await value.task.tick();
+  assert.equal(postCloseRuns, 0);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.action_type, 'missed_window_no_op');
+
+  after.tasks[mod.TASKS[2].id].next_run_at = '2026-07-23T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(after));
+  value.setClock('2026-07-23T07:21:00.000Z');
+  after = await value.task.tick();
+  assert.equal(postCloseRuns, 0);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.action_type, 'missed_window_no_op');
+});
+
+test('a delayed post-close failure persists its canonical due key and does not retry after restart', async () => {
+  let runs = 0;
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) {
+      runs += 1;
+      callback(null, good(mod.TASKS[2].id, 'blocked', {
+        error_class: 'runtime_unhandled_error', failure_phase: 'post_close_learning',
+        failure_exception_type: 'RuntimeError', failure_attempt_number: 1,
+      }));
+      return;
+    }
+    callback(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:00.000Z');
+  let after = await value.task.tick();
+  assert.equal(runs, 1);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+  assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
+
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths,
+    now: () => new Date('2026-07-21T07:22:00.000Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
+    runtimeHealthCheck: async () => true,
+    calendarProofResolver: () => calendarProof(true),
+    execFile(command, args, options, callback) { runs += 1; callback(null, good(mod.TASKS[2].id)); },
+    enforceSchedulerOwnership: false,
+  });
+  after = await restarted.tick();
+  assert.equal(runs, 1);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, `${mod.TASKS[2].id}:2026-07-21:16:20`);
 });
 
 test('error class sanitizer allows codes and blocks secret-like or raw detail', () => {
@@ -3253,6 +3453,70 @@ test('state-fault claim I/O failure remains fail-closed without an unhandled ale
 });
 
 const report = '[KIS VPS 모의투자 일일 결과]\n기준일: 2026-07-21\n오늘 체결: 매수 삼성전자(005930) 2주; 매도 현대차(005380) 1주\n현재 보유: 삼성전자(005930) 2주\n오늘 실현손익: +1,000원 (현금 증감 기준)\nAI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회\n운영 상태: 정상\n실전계좌: 주문 없음';
+
+test('current KIS task summary model-unavailable counts pass the Hermes consumer', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async () => {
+  const script = `import ast, json, pathlib, sys
+tree = ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+summary = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_task_summary')
+namespace = {'__builtins__': {'dict': dict, 'str': str, 'object': object}}
+exec(compile(ast.Module(body=[summary], type_ignores=[]), '<task-summary-contract>', 'exec'), namespace)
+print(json.dumps(namespace['_task_summary']('kis-ai-intraday-shadow-validation-v1', **json.loads(sys.argv[2]))))
+`;
+  const overrides = {
+    status: 'success', action_type: 'intraday_shadow', official_trade_date: '2026-07-21',
+    official_session_state: 'regular_session', official_calendar_verified: true,
+    official_calendar_source_hash: CALENDAR_HASH, fail_closed: false, error_class: 'none',
+    decisions: 4, intraday_decisions: 0, intraday_mode: 'model_unavailable',
+    intraday_model_version: 'intraday_model_unavailable_v3',
+    intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+    intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+    intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+    intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+    intraday_candidate_counts: {
+      analyzed: 4, observation_ready: 4, data_excluded: 0,
+      model_unavailable: 4, risk_excluded: 0, llm_eligible: 0,
+    },
+  };
+  const python = process.env.KIS_REPORT_TEST_PYTHON || 'python';
+  const stdout = await new Promise((resolve, reject) => execFile(python,
+    ['-c', script, process.env.KIS_REPORT_PRODUCER_SOURCE, JSON.stringify(overrides)],
+    { maxBuffer: 64 * 1024 }, (error, value, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(value)));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(stdout, mod.TASKS[1].id, () => calendarProof(true)));
+});
+
+test('current KIS autonomous summary emits default counts and attaches batch counts', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async () => {
+  const sourcePath = path.join(path.dirname(process.env.KIS_REPORT_PRODUCER_SOURCE), 'vps_autonomous_runtime.py');
+  const script = `import ast, json, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(source.parent.parent))
+from kis_trading_lab import vps_autonomous_runtime as runtime
+tree = ast.parse(source.read_text(encoding='utf-8'))
+attached = any(
+    isinstance(node, ast.Assign)
+    and any(isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant)
+            and target.slice.value == 'intraday_candidate_counts' for target in node.targets)
+    and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+    and node.value.func.attr == 'candidate_counts'
+    for node in ast.walk(tree)
+)
+print(json.dumps({'summary': runtime._summary(official_trade_date='2026-07-21', artifact_hash='a' * 64), 'attached': attached}))
+`;
+  const python = process.env.KIS_REPORT_TEST_PYTHON || 'python';
+  const stdout = await new Promise((resolve, reject) => execFile(python,
+    ['-c', script, sourcePath], { maxBuffer: 64 * 1024 },
+    (error, value, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(value)));
+  const value = JSON.parse(stdout);
+  assert.equal(value.attached, true);
+  assert.deepEqual(value.summary.intraday_candidate_counts, {
+    analyzed: 0, observation_ready: 0, data_excluded: 0,
+    model_unavailable: 0, risk_excluded: 0, llm_eligible: 0,
+  });
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(JSON.stringify(value.summary)));
+});
 
 test('current KIS producer message passes the Hermes consumer without broker or DB access', {
   skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
