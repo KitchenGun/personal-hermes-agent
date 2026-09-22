@@ -177,6 +177,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['hermes_scheduler_attestation_unavailable', { persistent: true, orderRecovery: true }],
   ['order_action_not_allowed_for_schedule_slot', { persistent: true }],
   ['runtime_unhandled_error', { resumable: true }],
+  ['autonomous_runtime_failed', { resumable: true, orderRecovery: true, scope: 'order' }],
   ['unsafe_output', { resumable: true }],
   ['account_risk_status_active', { persistent: true, resumable: true, autoResume: true, scope: 'order' }],
   ['daily_loss_entry_blocked', { resumable: true }],
@@ -2192,6 +2193,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
 
     const globalPause = pausedState.state === 'PAUSED';
     const orderPause = taskId === ORDER_TASK.id;
+    const automaticSafetyRecheck = ERROR_POLICY[errorClass]?.autoResume === true
+      && ERROR_POLICY[errorClass]?.safetyAwait === true;
     const content = [
       transientOnly ? '[KIS 자동운영 일시 지연]' : (globalPause ? '[KIS 자동운영 보호 중단]' : '[KIS 자동운영 기능 제한]'),
       `작업: ${TASK_ALERT_LABELS.get(taskId) || 'KIS 자동운영'}`,
@@ -2202,7 +2205,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       `자동 복구: ${transientOnly
         ? (taskId === TASKS[0].id ? '안전 확인 자동 진행 중' : '다음 정규 실행에서 재확인')
         : incidentClaim ? '아래 버튼에서 선택'
-        : (selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})` : '운영자 확인 필요')}`,
+        : selfHeal.queued ? `격리 작업 생성 (${selfHeal.task_id || 'queued'})`
+        : automaticSafetyRecheck ? '안전 상태 자동 재확인 중'
+        : '운영자 확인 필요'}`,
     ].join('\n');
     let succeeded = false;
     const queuedClaim = save({ ...(incidentClaim?.state || claim), last_self_heal: selfHeal });
@@ -2729,24 +2734,31 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         return stateUnavailableStatus();
       }
     };
-    const handleTransientFailure = async (state, reason, lastRun) => {
+    const handleTransientFailure = async (state, reason, lastRun, { slotNoOp = false } = {}) => {
       const latestTask = state.tasks[taskId];
       const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
       lastRun.consecutive_transport_failures = consecutive;
       const skipOnly = task.id === INTRADAY_SHADOW_TASK.id && reason === 'timeout';
       if (!skipOnly && consecutive >= 2) return pauseForTask(state, reason, lastRun);
+      const recordedRun = slotNoOp ? {
+        ...lastRun,
+        status: 'no_op',
+        action_type: 'transport_degraded_no_op',
+        fail_closed: false,
+        no_same_slot_retry: true,
+      } : lastRun;
       const degraded = save({ ...state, tasks: { ...state.tasks, [taskId]: {
         ...latestTask,
         state: 'ACTIVE',
         pause_reason: undefined,
         consecutive_transport_failures: consecutive,
         last_run: {
-          ...lastRun,
+          ...recordedRun,
           ...(skipOnly ? { no_same_slot_retry: true } : {}),
         },
         ...(task.kind === 'order' ? { pending_invocation: null } : {}),
       } } });
-      return notifyPause(degraded, taskId, reason, lastRun, { transientOnly: true });
+      return notifyPause(degraded, taskId, reason, recordedRun, { transientOnly: true });
     };
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
@@ -3124,6 +3136,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.orderApiCalls === 0
         && parsed.vpsLiveOrders === 0
         && parsed.reconciliations === 0;
+      const orderTransportNoOp = task.kind === 'order'
+        && !postCloseRefresh
+        && parsed.status === 'blocked'
+        && parsed.failClosed
+        && TRANSIENT_TRANSPORT_ERRORS.has(parsed.errorClass)
+        && parsed.orderApiCalls === 0
+        && parsed.vpsLiveOrders === 0
+        && parsed.reconciliations === 0
+        && parsed.orderSymbol === null;
       if (postCloseBackfillTransportNoOp) {
         const postNotificationTask = postNotificationState.tasks[taskId];
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
@@ -3172,6 +3193,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             no_same_slot_retry: true,
           },
         } } });
+      }
+      if (orderTransportNoOp) {
+        if (!ownsCurrentOrderInvocation(postNotificationState, pendingInvocation)) {
+          return postNotificationState;
+        }
+        return handleTransientFailure(
+          postNotificationState,
+          parsed.errorClass,
+          lastRun,
+          { slotNoOp: true },
+        );
       }
       if (parsed.status === 'blocked' || parsed.failClosed || error) return pauseForTask(postNotificationState, parsed.errorClass || 'blocked', lastRun);
       if (task.kind === 'order') {

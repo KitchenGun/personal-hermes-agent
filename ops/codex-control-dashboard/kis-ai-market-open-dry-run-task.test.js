@@ -490,7 +490,7 @@ function fixture(options = {}) {
     runtimeContract: options.runtimeContract || mod.REQUIRED_RUNTIME_CONTRACT,
     runtimeHealthCheck: options.runtimeHealthCheck || (async () => true),
     sourceParityCheck: options.sourceParityCheck || (() => true),
-    resumeBlockingLockPaths: options.resumeBlockingLockPaths,
+    resumeBlockingLockPaths: options.resumeBlockingLockPaths ?? [],
     execFile,
     reportSender: options.reportSender,
     repairTaskSender: options.repairTaskSender,
@@ -1351,6 +1351,27 @@ test('enable-order CLI maps the explicit refresh adoption contract only', () => 
   assert.equal(mod.parseEnableOrderArgs([
     'enable-order', '--adopt-refresh', '--approval', 'wrong',
   ]).confirm, false);
+});
+
+test('legacy autonomous runtime pause requires exact approved activation before recovery', async () => {
+  const value = await active();
+  const current = value.task.status();
+  const order = current.tasks[mod.TASKS[4].id];
+  order.state = 'PAUSED';
+  order.pause_reason = 'autonomous_runtime_failed';
+  order.next_run_at = null;
+  order.pending_invocation = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+
+  await assert.rejects(value.task.enableOrderTask({
+    confirm: true, approval: 'wrong',
+  }), /exact_order_activation_approval_required/);
+  const recovered = await value.task.enableOrderTask({
+    confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
+  });
+  assert.equal(recovered.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(recovered.tasks[mod.TASKS[4].id].pause_reason, undefined);
+  assert.equal(recovered.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
 });
 
 test('global recovery preserves a disabled failed refresh for the next post-close slot', async () => {
@@ -4343,7 +4364,7 @@ test('provider timeout stays fail-closed without pausing or running tasks', asyn
 
 test('open-order read outage holds tasks for four minutes and then pauses only new orders', async () => {
   let taskRuns = 0;
-  let notifications = 0;
+  const notifications = [];
   const options = {
     schedulerRegistered: true,
     safetyOutput: safetyOutput('blocked', {
@@ -4353,8 +4374,8 @@ test('open-order read outage holds tasks for four minutes and then pauses only n
       taskRuns += 1;
       callback(null, good(args[args.indexOf('--task-id') + 1]));
     },
-    reportSender: async () => {
-      notifications += 1;
+    reportSender: async (message) => {
+      notifications.push(message);
       return { discord_sent: true };
     },
   };
@@ -4377,7 +4398,9 @@ test('open-order read outage holds tasks for four minutes and then pauses only n
   assert.equal(paused.tasks[mod.TASKS[4].id].pause_reason, 'open_order_status_unavailable');
   assert.equal(paused.consecutive_safety_monitor_failures, 5);
   assert.equal(mod.TASKS.slice(0, 4).every((task) => paused.tasks[task.id].state === 'ACTIVE'), true);
-  assert.equal(notifications, 1);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0].content, /자동 복구: 안전 상태 자동 재확인 중/);
+  assert.doesNotMatch(notifications[0].content, /운영자 확인 필요/);
   assert.equal(taskRuns, 0);
 });
 
@@ -4641,6 +4664,8 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.tls_failed.autoResume, false);
   assert.equal(mod.ERROR_POLICY.tls_failed.resumable, true);
   assert.equal(mod.ERROR_POLICY.tls_failed.orderRecovery, true);
+  assert.equal(mod.ERROR_POLICY.autonomous_runtime_failed.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.autonomous_runtime_failed.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.autoRepair, true);
   assert.equal(mod.ERROR_POLICY.local_file_io_failed.resumable, true);
   assert.equal(mod.ERROR_POLICY.unknown_runtime_io_failed.autoRepair, false);
@@ -4747,6 +4772,42 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(nextState.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(nextState.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
   assert.equal(orderRuns, 0);
+});
+
+test('one safe KIS order transport failure skips the slot and a consecutive failure pauses', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => aiVerdict(packet),
+    execFile(command, args, options, callback) {
+      orderRuns += 1;
+      callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+        error_class: 'timeout',
+      }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+
+  const firstDueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(firstDueAt);
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.status, 'no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 1);
+
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 1);
+  assert.equal(orderRuns, 1);
+
+  const secondDueAt = new Date('2026-07-21T00:20:00Z');
+  value.setClock(secondDueAt);
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: secondDueAt });
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'timeout');
+  assert.equal(orderRuns, 2);
 });
 
 test('missing intraday decision degrades one slot without pausing the order task', async () => {
