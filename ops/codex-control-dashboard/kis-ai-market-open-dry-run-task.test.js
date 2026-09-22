@@ -624,14 +624,51 @@ test('post-close does not duplicate candidate refresh when the order task is act
   assert.equal(after.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_status, undefined);
 });
 
-test('post-close candidate refresh preserves an exact fail-closed blocker', async () => {
-  const messages = [];
+for (const refreshError of [
+  'model_v3_prediction_batch_incomplete',
+  'model_v3_backfill_warmup_insufficient',
+  'model_v3_backfill_data_invalid',
+  'model_v3_backfill_credentials_unavailable',
+  'model_v3_backfill_tls_unavailable',
+  'model_v3_backfill_transport_unavailable',
+]) {
+  test(`successful post-close learning defers known refresh blocker ${refreshError}`, async () => {
+    const messages = [];
+    const value = await active({
+      independentShadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+      independentShadowRefreshOutput: orderGood('blocked', { error_class: refreshError }),
+      reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
+    });
+    const due = '2026-07-21T07:20:00.000Z';
+    const state = value.task.status();
+    state.tasks[mod.TASKS[2].id].next_run_at = due;
+    state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+    state.tasks[mod.TASKS[4].id].pause_reason = 'tls_failed';
+    state.tasks[mod.TASKS[4].id].next_run_at = null;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+
+    const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+    const lastRun = after.tasks[mod.TASKS[2].id].last_run;
+
+    assert.equal(after.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+    assert.equal(lastRun.status, 'success');
+    assert.equal(lastRun.action_type, 'post_close_learning');
+    assert.equal(lastRun.model_v3_candidate_refresh_error_class, refreshError);
+    assert.equal(lastRun.no_same_slot_retry, true);
+    assert.equal(after.tasks[mod.TASKS[4].id].state, 'PAUSED');
+    assert.equal(after.tasks[mod.TASKS[4].id].pause_reason, 'tls_failed');
+    assert.equal(messages.length, 1);
+    assert.match(messages[0].content, new RegExp(refreshError));
+  });
+}
+
+test('unknown post-close refresh blocker does not auto-recover learning', async () => {
   const value = await active({
     independentShadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
     independentShadowRefreshOutput: orderGood('blocked', {
-      error_class: 'model_v3_prediction_batch_incomplete',
+      error_class: 'model_v3_backfill_unrecognized_safe_error',
     }),
-    reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
   });
   const due = '2026-07-21T07:20:00.000Z';
   const state = value.task.status();
@@ -640,15 +677,96 @@ test('post-close candidate refresh preserves an exact fail-closed blocker', asyn
   value.setClock(due);
 
   const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
-  const lastRun = after.tasks[mod.TASKS[2].id].last_run;
 
-  assert.equal(after.state, 'ACTIVE');
   assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
-  assert.equal(lastRun.model_v3_candidate_refresh_status, 'blocked');
-  assert.equal(lastRun.model_v3_candidate_refresh_fail_closed, true);
-  assert.equal(lastRun.model_v3_candidate_refresh_error_class, 'model_v3_prediction_batch_incomplete');
-  assert.equal(messages.length, 1);
-  assert.match(messages[0].content, /model_v3_prediction_batch_incomplete/);
+  assert.equal(after.tasks[mod.TASKS[2].id].pause_reason, 'model_v3_backfill_unrecognized_safe_error');
+});
+
+for (const evidence of [
+  { order_api_calls: 1 },
+  { reconciliations: 1 },
+  { artifact_promoted: true },
+]) {
+  test(`blocked independent refresh cannot suppress unsafe evidence ${Object.keys(evidence)[0]}`, async () => {
+    const value = await active({
+      independentShadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+      independentShadowRefreshOutput: orderGood('blocked', {
+        error_class: 'model_v3_backfill_failed', ...evidence,
+      }),
+    });
+    const due = '2026-07-21T07:20:00.000Z';
+    const state = value.task.status();
+    state.tasks[mod.TASKS[2].id].next_run_at = due;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+    const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+    assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
+    assert.notEqual(after.tasks[mod.TASKS[2].id].pause_reason, 'model_v3_backfill_failed');
+  });
+}
+
+test('delayed post-close learning retains the canonical due key without a same-due retry', async () => {
+  let runs = 0;
+  let observedDueKey = '';
+  const value = await active({
+    onExec({ args, execOptions }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) {
+        runs += 1;
+        observedDueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      }
+    },
+  });
+  const scheduled = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = scheduled;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:00.000Z');
+
+  let after = await value.task.tick();
+  assert.equal(runs, 1);
+  assert.equal(observedDueKey, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, observedDueKey);
+  assert.equal(after.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+
+  after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:21:00.000Z') });
+  assert.equal(runs, 1);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, observedDueKey);
+});
+
+test('expired KIS learning start remains parser-valid waiting with calendar evidence', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async () => {
+  const script = `
+import importlib.util, json, os, sys, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+root = Path(sys.argv[1]).resolve().parents[1]
+os.chdir(root)
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location('fixture', root / 'tests/test_ai_market_open_runtime.py')
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+with tempfile.TemporaryDirectory() as directory:
+    db = Path(directory) / 'vps.sqlite3'
+    latch = Path(directory) / 'kill-switch'
+    latch.write_text('disabled\\n', encoding='utf-8')
+    fixture._database(db)
+    result = fixture._run_task(db, latch, fixture.SafeClient(), fixture.TASK_IDS[2],
+        now=datetime(2026, 7, 21, 8, 49, tzinfo=timezone.utc),
+        observation_clock=lambda: datetime(2026, 7, 21, 8, 50, tzinfo=timezone.utc))
+    print(json.dumps(result))
+`;
+  const stdout = await new Promise((resolve, reject) => execFile(
+    process.env.KIS_REPORT_TEST_PYTHON || 'python3',
+    ['-c', script, process.env.KIS_REPORT_PRODUCER_SOURCE],
+    (error, output) => error ? reject(error) : resolve(output),
+  ));
+  const value = JSON.parse(stdout);
+  const parsed = mod.parseKisAiMarketOpenOutput(stdout, mod.TASKS[2].id,
+    () => ({ isTradingDay: true, sourceHash: value.official_calendar_source_hash }));
+  assert.equal(parsed.status, 'waiting');
+  assert.equal(parsed.actionType, 'waiting_window');
+  assert.equal(parsed.failClosed, false);
 });
 
 test('intraday decision and order schedules align on future 10-minute slots', () => {
@@ -2913,6 +3031,58 @@ test('exact IO resume preserves a post-close shadow refresh without enabling ord
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
 });
+
+for (const [name, mutate, resumes] of [
+  ['successful learning with matching refresh blocker', () => {}, true],
+  ['genuine learning failure', (lastRun) => { lastRun.status = 'blocked'; lastRun.fail_closed = true; }, false],
+  ['mismatched refresh blocker', (lastRun) => { lastRun.model_v3_candidate_refresh_error_class = 'model_v3_shadow_execution_failed'; }, false],
+]) {
+  test(`exact IO resume ${resumes ? 'accepts' : 'rejects'} post-close recovery after ${name}`, async () => {
+    const value = await active();
+    const state = value.task.status();
+    const postClose = state.tasks[mod.TASKS[2].id];
+    postClose.state = 'PAUSED';
+    postClose.pause_reason = 'model_v3_backfill_failed';
+    postClose.next_run_at = null;
+    postClose.last_due_at = `${mod.TASKS[2].id}:2026-07-21:16:20`;
+    postClose.last_run = {
+      status: 'success', action_type: 'post_close_learning', fail_closed: false,
+      error_class: 'none', model_v3_candidate_refresh_status: 'blocked',
+      model_v3_candidate_refresh_fail_closed: true,
+      model_v3_candidate_refresh_error_class: 'model_v3_backfill_failed',
+    };
+    mutate(postClose.last_run);
+    const order = state.tasks[mod.TASKS[4].id];
+    order.state = 'PAUSED';
+    order.pause_reason = 'tls_failed';
+    order.next_run_at = null;
+    order.activation_artifact_hash = 'a'.repeat(64);
+    state.last_error_notification = {
+      task_id: mod.TASKS[2].id,
+      error_class: 'model_v3_backfill_failed',
+      attempted: true,
+      succeeded: true,
+    };
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+    if (!resumes) {
+      await assert.rejects(
+        value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+        /task_not_resumable/,
+      );
+      assert.equal(value.task.status().tasks[mod.TASKS[2].id].state, 'PAUSED');
+      assert.equal(value.task.status().tasks[mod.TASKS[4].id].pause_reason, 'tls_failed');
+      return;
+    }
+
+    const resumed = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+    assert.equal(resumed.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+    assert.equal(resumed.tasks[mod.TASKS[2].id].last_due_at, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+    assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'DISABLED');
+    assert.equal(resumed.tasks[mod.TASKS[4].id].next_run_at, null);
+    assert.equal(resumed.tasks[mod.TASKS[4].id].refresh_only_pending, false);
+  });
+}
 
 
 test('exact IO resume recovers a cleared reconciliation latch with order disabled', async () => {
