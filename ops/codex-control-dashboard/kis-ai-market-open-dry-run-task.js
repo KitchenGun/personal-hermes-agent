@@ -124,6 +124,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['llm_candidate_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_held_position_action_invalid', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
+  ['intraday_decision_slot_invalid', { persistent: true, orderRecovery: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
@@ -2568,7 +2569,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (['tls_failed', 'order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid'].includes(prior.pause_reason)) {
+      if (['tls_failed', 'order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid'].includes(prior.pause_reason)) {
         const safetyRun = await execute(buildSafetyMonitorCommand());
         if (safetyRun.error) throw new Error('safety_monitor_process_error');
         const safety = parseSafetyMonitorOutput(safetyRun.stdout);
@@ -2619,10 +2620,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         throw new Error('order_activation_check_process_error');
       }
       if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch'
-        || prior.pause_reason === 'hermes_scheduler_attestation_unavailable') {
+        || prior.pause_reason === 'hermes_scheduler_attestation_unavailable'
+        || prior.pause_reason === 'intraday_decision_slot_invalid') {
         if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
       }
-      if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch'].includes(prior.pause_reason)) {
+      if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid'].includes(prior.pause_reason)) {
         if (prior.activation_artifact_hash === null
           || parsed.artifactHash !== prior.activation_artifact_hash) {
           throw new Error('artifact_recovery_hash_changed');

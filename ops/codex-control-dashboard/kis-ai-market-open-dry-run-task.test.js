@@ -1673,6 +1673,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'order_rejected',
     'duplicate_order_blocked',
     'intraday_prediction_attestation_mismatch',
+    'intraday_decision_slot_invalid',
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
@@ -1695,7 +1696,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
     paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
     paused.tasks[mod.TASKS[4].id].next_run_at = null;
-    if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch'].includes(pauseReason)) {
+    if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid'].includes(pauseReason)) {
       paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
     }
     fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
@@ -1709,7 +1710,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
 });
 
 test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
-  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid']) {
+  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid']) {
   for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
     { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
     { execution_owner: 'prod' }]) {
@@ -1741,7 +1742,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
 });
 
 test('artifact mismatch recovery refuses to rotate the attested artifact', async () => {
-  for (const pauseReason of ['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch']) {
+  for (const pauseReason of ['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid']) {
   const value = await active({
     activationCheckOutput: orderGood('success', {
       action_type: 'activation_check', artifact_hash: 'b'.repeat(64),
@@ -1766,6 +1767,7 @@ test('attestation contract recovery requires runtime source parity', async () =>
   for (const pauseReason of [
     'model_v3_artifact_attestation_mismatch',
     'hermes_scheduler_attestation_unavailable',
+    'intraday_decision_slot_invalid',
   ]) {
     const value = await active({ sourceParityCheck: () => false });
     const paused = value.task.status();
@@ -4997,6 +4999,26 @@ test('missing intraday decision degrades one slot without pausing the order task
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'intraday_decision_stale_or_missing');
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(orderRuns, 0);
+});
+
+test('invalid decision slot stays paused without automatic recovery or order execution', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    llmExecutor: async () => { throw new Error('intraday_decision_slot_invalid'); },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'intraday_decision_slot_invalid');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.persistent, true);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.orderRecovery, true);
   assert.equal(orderRuns, 0);
 });
 
