@@ -2383,6 +2383,16 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   }), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
     action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+    failure_phase: 'auth_token_request', failure_symbol: null, failure_exception_type: 'TimeoutError',
+    failure_errno: 110, failure_attempt_number: 1,
+  }), mod.TASKS[1].id, trading));
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+    failure_phase: 'quote_request', failure_symbol: null, failure_exception_type: 'TimeoutError',
+    failure_errno: 110, failure_attempt_number: 1,
+  }), mod.TASKS[1].id, trading), /invalid_fail_closed_contract/);
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'no_op', {
+    action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
     failure_phase: 'quote_request', failure_symbol: '035420', failure_exception_type: 'TimeoutError',
     failure_errno: 110, failure_attempt_number: 20,
   }), mod.TASKS[1].id, trading));
@@ -5020,6 +5030,135 @@ test('invalid decision slot stays paused without automatic recovery or order exe
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.autoResume, false);
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.orderRecovery, true);
   assert.equal(orderRuns, 0);
+});
+
+test('intraday auth timeout degrades without orders or same-slot retry', async () => {
+  let orderCommands = 0;
+  const value = await active({ execFile(command, args, options, callback) {
+    if (args.includes('vps-autonomous-order')) orderCommands += 1;
+    const taskId = args[args.indexOf('--task-id') + 1];
+    callback(null, good(taskId, 'no_op', {
+      action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+      failure_phase: 'auth_token_request', failure_symbol: null, failure_exception_type: 'TimeoutError',
+      failure_errno: 110, failure_attempt_number: 1,
+    }));
+  } });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt });
+  const lastRun = state.tasks[mod.TASKS[1].id].last_run;
+
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'ACTIVE');
+  assert.equal(lastRun.action_type, 'transport_degraded_no_op');
+  assert.equal(lastRun.failure_phase, 'auth_token_request');
+  assert.equal(lastRun.failure_symbol, null);
+  assert.equal(lastRun.no_same_slot_retry, true);
+  assert.equal(orderCommands, 0);
+});
+
+test('late decision-context transport result preserves a persistent pause', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    decisionContextError: Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }),
+    onDecisionContext() {
+      const state = value.task.status();
+      state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+      state.tasks[mod.TASKS[4].id].pause_reason = 'operator_hold';
+      state.tasks[mod.TASKS[4].id].next_run_at = null;
+      state.tasks[mod.TASKS[4].id].pending_invocation = null;
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    },
+    execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'operator_hold');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.equal(orderRuns, 0);
+});
+
+test('late intraday transport result preserves a persistent pause', async () => {
+  const value = await active({ execFile(command, args, options, callback) {
+    const taskId = args[args.indexOf('--task-id') + 1];
+    const state = value.task.status();
+    state.state = 'PAUSED';
+    state.pause_reason = 'operator_hold';
+    state.tasks[taskId].state = 'PAUSED';
+    state.tasks[taskId].pause_reason = 'operator_hold';
+    state.tasks[taskId].next_run_at = null;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    callback(null, good(taskId, 'no_op', {
+      action_type: 'transport_degraded_no_op', error_class: 'timeout', transport_degraded: true,
+      failure_phase: 'quote_request', failure_symbol: '005930', failure_exception_type: 'TimeoutError',
+      failure_errno: 110, failure_attempt_number: 1,
+    }));
+  } });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt });
+
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'operator_hold');
+  assert.equal(state.tasks[mod.TASKS[1].id].pause_reason, 'operator_hold');
+});
+
+test('late post-close transport result preserves a replacement invocation', async () => {
+  let replacementTokenHash;
+  let replacementPath;
+  const value = await active({
+    shadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    shadowRefreshOutput: orderGood('blocked', {
+      error_class: 'model_v3_backfill_transport_unavailable', artifact_hash: null,
+    }),
+    onShadowRefresh() {
+      const state = value.task.status();
+      const orderTask = state.tasks[mod.TASKS[4].id];
+      replacementTokenHash = 'b'.repeat(64);
+      orderTask.pending_invocation = { ...orderTask.pending_invocation, token_hash: replacementTokenHash };
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+      replacementPath = path.join(value.paths.orderAttestationDir, fs.readdirSync(value.paths.orderAttestationDir)[0]);
+      fs.writeFileSync(replacementPath, JSON.stringify(orderTask.pending_invocation));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T07:20:00Z');
+  const scheduled = value.task.status();
+  scheduled.tasks[mod.TASKS[4].id].next_run_at = dueAt.toISOString();
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(scheduled));
+  value.setClock(dueAt);
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation.token_hash, replacementTokenHash);
+  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
+  assert.equal(JSON.parse(fs.readFileSync(replacementPath, 'utf8')).token_hash, replacementTokenHash);
+});
+
+test('order execution timeout cannot approve a changed artifact contract', async () => {
+  let executions = 0;
+  const value = await active({ execFile(command, args, options, callback) {
+    executions += 1;
+    const state = value.task.status();
+    state.tasks[mod.TASKS[4].id].activation_artifact_hash = 'b'.repeat(64);
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    callback(Object.assign(new Error('timed out'), { killed: true }), '');
+  } });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:10:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(executions, 1);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'scheduler_attestation_state_changed');
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  assert.deepEqual(fs.readdirSync(value.paths.orderAttestationDir), []);
 });
 
 for (const invalidAction of [null, 'ENTER', 'REJECT']) {
