@@ -655,9 +655,11 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     && value.failure_exception_type !== 'none'
     && value.failure_attempt_number >= 1
     && (
-      (value.task_id === TASKS[0].id
-        && value.failure_symbol === null
-        && ['auth_token_request', 'account_balance_request', 'open_orders_read_request'].includes(value.failure_phase))
+      (value.failure_symbol === null
+        && (((value.task_id === TASKS[0].id || value.task_id === TASKS[1].id)
+            && value.failure_phase === 'auth_token_request')
+          || (value.task_id === TASKS[0].id
+            && ['account_balance_request', 'open_orders_read_request'].includes(value.failure_phase))))
       || (value.task_id === TASKS[1].id && value.failure_symbol !== null)
       || (value.error_class === 'database_busy'
         && value.failure_phase === 'database_begin'
@@ -2758,8 +2760,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }
     let taskState = current.tasks[taskId];
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE') return current;
+    let ownsCurrentInvocation = () => true;
     const pauseForTask = async (state, reason, lastRun, options) => {
       try {
+        if (!ownsCurrentInvocation(state)) return state;
         const policy = ERROR_POLICY[sanitizeErrorClass(reason)] || {};
         const paused = policy.scope === 'global'
           ? pauseAll(state, taskId, reason, lastRun)
@@ -2780,6 +2784,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
     };
     const handleTransientFailure = async (state, reason, lastRun, { slotNoOp = false } = {}) => {
+      if (!ownsCurrentInvocation(state)) return state;
+      if (task.kind === 'order' && !ownsCurrentOrderInvocation(state)) {
+        return pauseForTask(state, 'scheduler_attestation_state_changed', {
+          ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
+        });
+      }
       const latestTask = state.tasks[taskId];
       const consecutive = Number(latestTask.consecutive_transport_failures || 0) + 1;
       lastRun.consecutive_transport_failures = consecutive;
@@ -2842,15 +2852,23 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const key = dueKey(task, scheduledDueTime);
     const postCloseRefresh = isPostCloseRefreshSlot(task, scheduledDueTime);
     const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, scheduledDueTime) && !postCloseRefresh;
-    const ownsCurrentOrderInvocation = (state, expectedInvocation) => {
+    ownsCurrentInvocation = (state, expectedInvocation = pendingInvocation) => {
       const currentTask = state.tasks[taskId];
       return state.state === 'ACTIVE' && currentTask?.state === 'ACTIVE'
         && currentTask.last_due_at === key
-        && JSON.stringify(currentTask.pending_invocation) === JSON.stringify(expectedInvocation)
-        && currentTask.activation_artifact_hash === taskState.activation_artifact_hash
-        && currentTask.daily_entry_cap_approval_hash === taskState.daily_entry_cap_approval_hash
-        && Object.keys(INTRADAY_PROVIDER_ATTESTATION)
-          .every((keyName) => currentTask[keyName] === taskState[keyName]);
+        && (task.kind !== 'order' || (
+          JSON.stringify(currentTask.pending_invocation) === JSON.stringify(expectedInvocation)
+        ));
+    };
+    const ownsCurrentOrderInvocation = (state, expectedInvocation = pendingInvocation) => {
+      const currentTask = state.tasks[taskId];
+      return ownsCurrentInvocation(state, expectedInvocation)
+        && (
+          currentTask.activation_artifact_hash === taskState.activation_artifact_hash
+          && currentTask.daily_entry_cap_approval_hash === taskState.daily_entry_cap_approval_hash
+          && Object.keys(INTRADAY_PROVIDER_ATTESTATION)
+            .every((keyName) => currentTask[keyName] === taskState[keyName])
+        );
     };
     let schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
     let pendingInvocation = task.kind === 'order' ? {
@@ -2927,10 +2945,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             llm_verdict_status: llmVerdictStatus,
             llm_verdict_summary: llmVerdictSummary,
           };
+          const latest = loadStrict();
+          if (!ownsCurrentInvocation(latest, pendingInvocation)) return latest;
+          if (!ownsCurrentOrderInvocation(latest, pendingInvocation)) {
+            return pauseForTask(latest, 'scheduler_attestation_state_changed', {
+              ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
+            });
+          }
           if (ERROR_POLICY[reason]?.slotDegradeOnly === true) {
-            const latest = loadStrict();
             const latestTask = latest.tasks[taskId];
-            if (!ownsCurrentOrderInvocation(latest, pendingInvocation)) return latest;
             return save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
               ...latestTask,
               state: 'ACTIVE',
@@ -3080,6 +3103,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
+      if (!ownsCurrentInvocation(latest, pendingInvocation)) return latest;
+      let lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
+      if (task.kind === 'order' && !ownsCurrentOrderInvocation(latest, pendingInvocation)) {
+        return pauseForTask(latest, 'scheduler_attestation_state_changed', {
+          ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
+        });
+      }
       const blockedBeforeArtifactLoad = task.kind === 'order'
         && parsed.status === 'blocked' && parsed.artifactHash === null
         && parsed.previousArtifactHash === null && parsed.artifactPromoted === false;
@@ -3097,7 +3127,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           error_class: 'model_v3_artifact_attestation_mismatch', fail_closed: true,
         });
       }
-      let lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
       if (weeklyUniverse) {
         Object.assign(lastRun, {
           weekly_universe_status: weeklyUniverse.status,
@@ -3169,6 +3198,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         });
       }
       const postNotificationState = task.kind === 'order' ? loadStrict() : latest;
+      if (!ownsCurrentInvocation(postNotificationState, pendingInvocation)) return postNotificationState;
+      if (task.kind === 'order' && !ownsCurrentOrderInvocation(postNotificationState, pendingInvocation)) {
+        return pauseForTask(postNotificationState, 'scheduler_attestation_state_changed', {
+          ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
+        });
+      }
       const dailyLossEntryOnlyBlock = task.kind === 'order'
         && !postCloseRefresh
         && parsed.status === 'blocked'
@@ -3239,7 +3274,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (incompleteVerdictNoOp) {
         const postNotificationTask = postNotificationState.tasks[taskId];
-        if (!ownsCurrentOrderInvocation(postNotificationState, pendingInvocation)) return postNotificationState;
+        if (!ownsCurrentInvocation(postNotificationState, pendingInvocation)) return postNotificationState;
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
           ...postNotificationTask,
           state: 'ACTIVE',
@@ -3256,7 +3291,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         } } });
       }
       if (orderTransportNoOp) {
-        if (!ownsCurrentOrderInvocation(postNotificationState, pendingInvocation)) {
+        if (!ownsCurrentInvocation(postNotificationState, pendingInvocation)) {
           return postNotificationState;
         }
         return handleTransientFailure(
@@ -3296,10 +3331,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (delivery?.discord_sent !== true) return pauseForTask(loadStrict(), sanitizeErrorClass(delivery?.error_class || 'report_delivery_failed'), { ...lastRun, delivery_attempted: true, delivery_succeeded: false }, { sendAllowed: false });
         lastRun.status = 'report_sent'; lastRun.delivery_attempted = true; lastRun.delivery_succeeded = true;
       }
-      return save({ ...latest, tasks: { ...latest.tasks, [taskId]: { ...latestTask, state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } } });
+      const finalState = loadStrict();
+      if (!ownsCurrentInvocation(finalState, pendingInvocation)) return finalState;
+      if (task.kind === 'order' && !ownsCurrentOrderInvocation(finalState, pendingInvocation)) {
+        return pauseForTask(finalState, 'scheduler_attestation_state_changed', {
+          ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
+        });
+      }
+      return save({ ...finalState, tasks: { ...finalState.tasks, [taskId]: { ...finalState.tasks[taskId], state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } } });
     } finally {
       if (attestationPath) {
-        try { fs.unlinkSync(attestationPath); } catch (error) { if (error.code !== 'ENOENT') schedulerFaulted = true; }
+        try {
+          const stored = JSON.parse(fs.readFileSync(attestationPath, 'utf8'));
+          if (stored.token_hash === pendingInvocation?.token_hash) fs.unlinkSync(attestationPath);
+        } catch (error) { if (error.code !== 'ENOENT') schedulerFaulted = true; }
       }
       if (verdictPath) {
         try { fs.unlinkSync(verdictPath); } catch (error) { if (error.code !== 'ENOENT') schedulerFaulted = true; }
