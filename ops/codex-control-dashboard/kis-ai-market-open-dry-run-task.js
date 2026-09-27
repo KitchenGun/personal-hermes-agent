@@ -17,22 +17,29 @@ const DAILY_ENTRY_CAP_5_APPROVAL_HASH = crypto.createHash('sha256')
   .update(DAILY_ENTRY_CAP_5_APPROVAL).digest('hex');
 const INTRADAY_PROVIDER_ID = 'intraday_v1';
 const LEGACY_INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v2-dynamic-universe';
-const LEGACY_INTRADAY_POLICY_VERSION = 'intraday-fast-track-v2-dynamic-universe';
+const LEGACY_INTRADAY_POLICY_VERSION = 'intraday-fast-track-v3-intraday-discovery';
 const LEGACY_INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   decision_provider: INTRADAY_PROVIDER_ID,
   intraday_feature_version: LEGACY_INTRADAY_FEATURE_VERSION,
   intraday_policy_version: LEGACY_INTRADAY_POLICY_VERSION,
-  intraday_feature_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_FEATURE_VERSION).digest('hex'),
-  intraday_policy_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_POLICY_VERSION).digest('hex'),
+  intraday_feature_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_FEATURE_VERSION, 'ascii').digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_POLICY_VERSION, 'ascii').digest('hex'),
 });
-const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v2-dynamic-universe';
-const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v3-intraday-discovery';
+const STATE_LEGACY_INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
+  decision_provider: INTRADAY_PROVIDER_ID,
+  intraday_feature_version: LEGACY_INTRADAY_FEATURE_VERSION,
+  intraday_policy_version: 'intraday-fast-track-v2-dynamic-universe',
+  intraday_feature_hash: crypto.createHash('sha256').update(LEGACY_INTRADAY_FEATURE_VERSION, 'ascii').digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update('intraday-fast-track-v2-dynamic-universe', 'ascii').digest('hex'),
+});
+const INTRADAY_FEATURE_VERSION = 'intraday-quote-10m-v3-independent';
+const INTRADAY_POLICY_VERSION = 'intraday-fast-track-v4-independent';
 const INTRADAY_PROVIDER_ATTESTATION = Object.freeze({
   decision_provider: INTRADAY_PROVIDER_ID,
   intraday_feature_version: INTRADAY_FEATURE_VERSION,
   intraday_policy_version: INTRADAY_POLICY_VERSION,
-  intraday_feature_hash: crypto.createHash('sha256').update(INTRADAY_FEATURE_VERSION).digest('hex'),
-  intraday_policy_hash: crypto.createHash('sha256').update(INTRADAY_POLICY_VERSION).digest('hex'),
+  intraday_feature_hash: crypto.createHash('sha256').update(INTRADAY_FEATURE_VERSION, 'ascii').digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update(INTRADAY_POLICY_VERSION, 'ascii').digest('hex'),
   daily_entry_cap: null,
 });
 const KIS_REPO = process.env.KIS_TRADING_LAB_REPO_DIR || '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab';
@@ -84,6 +91,7 @@ const MAX_AI_CANDIDATES = REQUIRED_RUNTIME_CONTRACT.slot_review_limit;
 const MIN_VPS_CUTOVER_DAYS = 20;
 const MIN_RECONCILED_ROUND_TRIPS = 30;
 const AI_DECISION_ACTIONS = new Set(['ENTER', 'EXIT', 'HOLD', 'HOLD_OVERNIGHT', 'REJECT']);
+const ML_ACTIONS = new Set([...AI_DECISION_ACTIONS, 'BLOCK']);
 const HELD_POSITION_ACTIONS = new Set(['EXIT', 'HOLD', 'HOLD_OVERNIGHT']);
 const AI_CONFIDENCE_BUCKETS = new Set(['low', 'medium', 'high']);
 const AI_REASON_CODES = new Set([
@@ -303,6 +311,9 @@ const INTRADAY_OUTPUT_KEYS = new Set([
   'intraday_feature_version', 'intraday_policy_version',
   'intraday_feature_hash', 'intraday_policy_hash',
 ]);
+const INTRADAY_CANDIDATE_COUNT_KEYS = Object.freeze([
+  'analyzed', 'observation_ready', 'data_excluded', 'model_unavailable', 'risk_excluded', 'llm_eligible',
+]);
 const POST_CLOSE_OUTPUT_KEYS = new Set([
   ...OUTPUT_KEYS,
   'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
@@ -358,6 +369,27 @@ function hasIntradayProviderAttestation(value, expected = INTRADAY_PROVIDER_ATTE
     && value.intraday_policy_version === expected.intraday_policy_version
     && value.intraday_feature_hash === expected.intraday_feature_hash
     && value.intraday_policy_hash === expected.intraday_policy_hash;
+}
+
+function hasIntradayFeatureAttestation(value, expected = INTRADAY_PROVIDER_ATTESTATION) {
+  return Boolean(value)
+    && value.intraday_feature_version === expected.intraday_feature_version
+    && value.intraday_policy_version === expected.intraday_policy_version
+    && value.intraday_feature_hash === expected.intraday_feature_hash
+    && value.intraday_policy_hash === expected.intraday_policy_hash;
+}
+
+function parseIntradayCandidateCounts(value, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
+  if (value === undefined) return null;
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== INTRADAY_CANDIDATE_COUNT_KEYS.length
+    || INTRADAY_CANDIDATE_COUNT_KEYS.some((key) => !Object.prototype.hasOwnProperty.call(value, key)
+      || !Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > runtimeContract.slot_review_limit)
+    || value.analyzed !== value.observation_ready + value.data_excluded
+    || value.analyzed !== value.data_excluded + value.model_unavailable + value.risk_excluded + value.llm_eligible) {
+    throw new Error('invalid_intraday_candidate_counts');
+  }
+  return Object.freeze({ ...value });
 }
 
 function seoulParts(date) {
@@ -622,8 +654,9 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     : hasPostCloseResult
     ? POST_CLOSE_OUTPUT_KEYS
     : OUTPUT_KEYS;
-  if (Object.keys(value).length !== expectedOutputKeys.size
-    || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+  if (Object.keys(value).length < expectedOutputKeys.size
+    || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+    || Object.keys(value).some((key) => !expectedOutputKeys.has(key) && key !== 'intraday_candidate_counts')) {
     throw new Error('invalid_output_fields');
   }
   if (value.task_id !== expectedTaskId || !TASK_BY_ID.has(value.task_id)) throw new Error('invalid_output_task_id');
@@ -636,6 +669,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     throw new Error('invalid_output_count');
   }
   if ([...BOOLEAN_KEYS].some((key) => typeof value[key] !== 'boolean')) throw new Error('invalid_output_boolean');
+  const intradayCandidateCounts = parseIntradayCandidateCounts(value.intraday_candidate_counts, runtimeContract);
   const taskFailurePhases = TASK_FAILURE_PHASES.get(expectedTaskId);
   const quoteApiCallLimit = runtimeContract.quote_api_calls_per_slot;
   if (!(FAILURE_PHASES.has(value.failure_phase) || taskFailurePhases?.has(value.failure_phase))
@@ -688,21 +722,25 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
   }
   validateTaskMeaning(value);
   if (hasIntradayResult) {
-    const expectedFeatureHash = INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash;
-    const expectedPolicyHash = INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
+    const activeAttestation = hasIntradayFeatureAttestation(value, INTRADAY_PROVIDER_ATTESTATION);
+    const legacyAttestation = hasIntradayFeatureAttestation(value, LEGACY_INTRADAY_PROVIDER_ATTESTATION);
     const hybridMode = value.intraday_mode === 'hybrid_bootstrap'
       && value.intraday_model_version === 'intraday_hybrid_v2';
     const championMode = value.intraday_mode === 'ml_champion'
       && /^intraday_ml_(?:logistic|hist_gradient)_[a-f0-9]{12}$/.test(String(value.intraday_model_version || ''));
+    const unavailableMode = value.intraday_mode === 'model_unavailable'
+      && value.intraday_model_version === 'intraday_model_unavailable_v3';
     if (!Number.isSafeInteger(value.intraday_decisions)
-      || value.intraday_decisions < 1
+      || value.intraday_decisions < 0
       || value.intraday_decisions > runtimeContract.slot_review_limit
-      || value.intraday_decisions !== value.decisions
-      || (!hybridMode && !championMode)
-      || value.intraday_feature_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
-      || value.intraday_policy_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
-      || value.intraday_feature_hash !== expectedFeatureHash
-      || value.intraday_policy_hash !== expectedPolicyHash) {
+      || (hybridMode ? !legacyAttestation : (!championMode && !unavailableMode) || !activeAttestation)
+      || (activeAttestation && (
+        intradayCandidateCounts === null
+        || value.intraday_decisions > value.decisions
+        || value.decisions > intradayCandidateCounts.analyzed
+        || value.intraday_decisions > intradayCandidateCounts.observation_ready - intradayCandidateCounts.model_unavailable
+      ))
+      || (unavailableMode && value.intraday_decisions !== 0)) {
       throw new Error('invalid_intraday_output_contract');
     }
   }
@@ -718,6 +756,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     failurePhase: safeText(value.failure_phase, 40), failureSymbol: value.failure_symbol,
     failureExceptionType: safeText(value.failure_exception_type, 40),
     failureErrno: value.failure_errno, failureAttemptNumber: value.failure_attempt_number,
+    intradayCandidateCounts,
   });
 }
 
@@ -731,8 +770,9 @@ function parseKisVpsAutonomousOutput(
   let value;
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_order_json'); }
   if (!value || Array.isArray(value) || typeof value !== 'object'
-    || Object.keys(value).length !== ORDER_OUTPUT_KEYS.size
-    || [...ORDER_OUTPUT_KEYS].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    || Object.keys(value).length < ORDER_OUTPUT_KEYS.size
+    || [...ORDER_OUTPUT_KEYS].some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+    || Object.keys(value).some((key) => !ORDER_OUTPUT_KEYS.has(key) && key !== 'intraday_candidate_counts')) {
     throw new Error('invalid_order_output_fields');
   }
   if (value.task_id !== expectedTaskId || expectedTaskId !== ORDER_TASK.id
@@ -762,26 +802,47 @@ function parseKisVpsAutonomousOutput(
     || value.backfill !== false || value.raw_response_persisted !== false || value.secret_exposure !== false) {
     throw new Error('unsafe_order_output');
   }
-  if (!hasIntradayProviderAttestation(value)) throw new Error('intraday_provider_attestation_mismatch');
-  if (!(value.intraday_mode === null || ['hybrid_bootstrap', 'ml_champion'].includes(value.intraday_mode))
+  const intradayCandidateCounts = parseIntradayCandidateCounts(value.intraday_candidate_counts, runtimeContract);
+  const activeAttestation = hasIntradayProviderAttestation(value, INTRADAY_PROVIDER_ATTESTATION);
+  const legacyAttestation = hasIntradayProviderAttestation(value, LEGACY_INTRADAY_PROVIDER_ATTESTATION);
+  if (!activeAttestation && !legacyAttestation) throw new Error('intraday_provider_attestation_mismatch');
+  const hybridMode = value.intraday_mode === 'hybrid_bootstrap'
+    && value.intraday_model_version === 'intraday_hybrid_v2';
+  const championMode = value.intraday_mode === 'ml_champion'
+    && /^intraday_ml_[a-z0-9_]+$/.test(String(value.intraday_model_version || ''));
+  const unavailableMode = value.intraday_mode === 'model_unavailable'
+    && value.intraday_model_version === 'intraday_model_unavailable_v3';
+  if (!(value.intraday_mode === null || hybridMode || championMode || unavailableMode)
     || !(value.intraday_model_version === null
-      || /^intraday_(?:hybrid_v2|ml_[a-z0-9_]+)$/.test(value.intraday_model_version))) {
+      || value.intraday_model_version === 'intraday_model_unavailable_v3'
+      || /^intraday_(?:hybrid_v2|ml_[a-z0-9_]+)$/.test(value.intraday_model_version))
+    || (hybridMode && !legacyAttestation)
+    || ((championMode || unavailableMode) && !activeAttestation)
+    || (activeAttestation && intradayCandidateCounts === null)) {
     throw new Error('intraday_model_contract_invalid');
   }
   const artifactHash = value.artifact_hash;
   const previousArtifactHash = value.previous_artifact_hash;
   if (!(artifactHash === null || /^[a-f0-9]{64}$/.test(artifactHash))
-    || (value.status !== 'blocked' && artifactHash === null)) throw new Error('invalid_order_artifact_hash');
+    || (value.status !== 'blocked' && value.action_type !== 'reconciliation_recovered' && artifactHash === null)) {
+    throw new Error('invalid_order_artifact_hash');
+  }
   if (!(previousArtifactHash === null || /^[a-f0-9]{64}$/.test(previousArtifactHash))) {
     throw new Error('invalid_order_previous_artifact_hash');
   }
+  const normalActivationPromotion = value.status === 'success'
+    && value.action_type === 'activation_check'
+    && value.artifact_promoted === false
+    && value.artifact_reused === false
+    && previousArtifactHash !== null
+    && previousArtifactHash !== artifactHash;
   if (value.artifact_promoted) {
     if (value.status !== 'success' || value.artifact_reused !== false || value.action_type !== 'shadow_refreshed'
       || previousArtifactHash === null || previousArtifactHash === artifactHash) {
       throw new Error('invalid_order_artifact_promotion');
     }
-  } else if (value.artifact_reused !== true
-    || !(previousArtifactHash === null || previousArtifactHash === artifactHash)) {
+  } else if (!normalActivationPromotion && (value.artifact_reused !== true
+    || !(previousArtifactHash === null || previousArtifactHash === artifactHash))) {
     throw new Error('invalid_order_artifact_reuse');
   }
   if (!(value.order_symbol === null || KRX_SYMBOL_RE.test(String(value.order_symbol)))
@@ -804,6 +865,9 @@ function parseKisVpsAutonomousOutput(
     || (hasOrderLifecycle && (value.requested_quantity <= 0
       || value.filled_quantity + value.unfilled_quantity > value.requested_quantity))) {
     throw new Error('invalid_order_lifecycle_contract');
+  }
+  if (unavailableMode && (value.action_type === 'entry_reconciled' || value.order_side === 'buy')) {
+    throw new Error('intraday_model_unavailable_entry');
   }
   const blocked = value.status === 'blocked';
   const normalizedErrorClass = sanitizeErrorClass(value.error_class);
@@ -835,8 +899,14 @@ function parseKisVpsAutonomousOutput(
     artifactPromoted: value.artifact_promoted,
     previousArtifactHash,
     artifactHash,
+    decisionProvider: value.decision_provider,
+    intradayFeatureVersion: value.intraday_feature_version,
+    intradayPolicyVersion: value.intraday_policy_version,
+    intradayFeatureHash: value.intraday_feature_hash,
+    intradayPolicyHash: value.intraday_policy_hash,
     intradayMode: value.intraday_mode,
     intradayModelVersion: value.intraday_model_version,
+    intradayCandidateCounts,
     shadowPredictionsInserted: value.shadow_predictions_inserted,
     shadowDuplicatesSkipped: value.shadow_duplicates_skipped,
     orderSymbol: value.order_symbol,
@@ -923,23 +993,38 @@ function normalizedAiCandidates(value = [], runtimeContract = REQUIRED_RUNTIME_C
   }
   return value.map((item) => {
     if (!item || Array.isArray(item) || typeof item !== 'object'
-      || Object.keys(item).some((key) => !expectedKeys.has(key) && key !== 'market_evidence')
+      || Object.keys(item).some((key) => !expectedKeys.has(key) && key !== 'market_evidence' && key !== 'daily_prior')
       || [...expectedKeys].some((key) => !Object.prototype.hasOwnProperty.call(item, key))
       || !['held_position', 'eligible_entry'].includes(item.role)
       || !['position', 'primary', 'watch'].includes(item.review_tier)
       || (item.role === 'held_position' && item.review_tier !== 'position')
       || (item.role === 'eligible_entry' && item.review_tier === 'position')
-      || !AI_DECISION_ACTIONS.has(item.ml_action)
+      || !ML_ACTIONS.has(item.ml_action)
       || !AI_CONFIDENCE_BUCKETS.has(item.confidence_bucket)
       || !['ALLOW', 'BLOCK_ENTRY', 'FORCE_EXIT', 'SYSTEM_PAUSE'].includes(item.risk_overlay)
       || !['PASS', 'BLOCKED'].includes(item.data_quality)
-      || ['prob_up', 'prob_flat', 'prob_down', 'expected_net_return']
-        .some((key) => !Number.isFinite(item[key]))
+      || !(item.daily_prior === undefined || item.daily_prior === null
+        || (!Array.isArray(item.daily_prior) && typeof item.daily_prior === 'object'
+          && Object.keys(item.daily_prior).length === 2
+          && ['predicted_class', 'prob_up'].every((key) => Object.prototype.hasOwnProperty.call(item.daily_prior, key))
+          && ['up', 'flat', 'down'].includes(item.daily_prior.predicted_class)
+          && Number.isFinite(item.daily_prior.prob_up)
+          && item.daily_prior.prob_up >= 0 && item.daily_prior.prob_up <= 1))) {
+        throw new Error('invalid_ai_candidates');
+      }
+    const nullableBlockedPosition = item.role === 'held_position'
+      && item.data_quality === 'BLOCKED' && item.ml_action === 'BLOCK'
+      && ['prob_up', 'prob_flat', 'prob_down', 'expected_net_return'].every((key) => item[key] === null);
+    if (!nullableBlockedPosition && (
+      ['prob_up', 'prob_flat', 'prob_down', 'expected_net_return'].some((key) => !Number.isFinite(item[key]))
       || ['prob_up', 'prob_flat', 'prob_down'].some((key) => item[key] < 0 || item[key] > 1)
-      || Math.abs((item.prob_up + item.prob_flat + item.prob_down) - 1) > 0.000001) {
-      throw new Error('invalid_ai_candidates');
-    }
-    return Object.freeze({ ...item, market_evidence: normalizedMarketEvidence(item.market_evidence) });
+      || Math.abs((item.prob_up + item.prob_flat + item.prob_down) - 1) > 0.000001
+    )) throw new Error('invalid_ai_candidates');
+    return Object.freeze({
+      ...item,
+      daily_prior: item.daily_prior === undefined || item.daily_prior === null ? null : Object.freeze({ ...item.daily_prior }),
+      market_evidence: normalizedMarketEvidence(item.market_evidence),
+    });
   });
 }
 
@@ -1116,8 +1201,9 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     'error_class', 'raw_response_persisted', 'secret_exposure',
   ];
   if (!value || Array.isArray(value) || typeof value !== 'object'
-    || Object.keys(value).length !== keys.length
+    || Object.keys(value).length < keys.length
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+    || Object.keys(value).some((key) => !keys.includes(key) && key !== 'intraday_candidate_counts')
     || value.task_id !== 'kis-llm-decision-context-v1'
     || !['success', 'blocked'].includes(value.status)
     || value.slot_id !== expectedSlotId || value.model_id !== LLM_MODEL_ID
@@ -1125,6 +1211,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     || value.raw_response_persisted !== false || value.secret_exposure !== false) {
     throw new Error('invalid_decision_context');
   }
+  const intradayCandidateCounts = parseIntradayCandidateCounts(value.intraday_candidate_counts, runtimeContract);
   if (value.status === 'blocked') {
     if (value.fail_closed !== true || typeof value.error_class !== 'string' || value.error_class === 'none'
       || value.candidates.length !== 0 || value.holdings.length !== 0
@@ -1166,6 +1253,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     account_aggregate: Object.freeze({ ...value.account_aggregate }),
     risk_aggregate: Object.freeze({ ...value.risk_aggregate }),
     event_metadata: value.event_metadata.map((item) => Object.freeze({ ...item })),
+    intraday_candidate_counts: intradayCandidateCounts,
   });
 }
 
@@ -1377,20 +1465,25 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
         throw new Error('scheduler_attestation_required');
       }
     }
+    const intradayProviderEnv = {
+      KIS_INTRADAY_PROVIDER_ID: INTRADAY_PROVIDER_ATTESTATION.decision_provider,
+      KIS_INTRADAY_FEATURE_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+      KIS_INTRADAY_FEATURE_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+      KIS_INTRADAY_POLICY_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+      KIS_INTRADAY_POLICY_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+    };
     return {
       command: KIS_VENV_PYTHON,
       args,
       cwd: KIS_REPO,
-      env: activationPreflight ? {} : {
-        KIS_HERMES_SCHEDULER_TOKEN: schedulerToken,
-        KIS_HERMES_DUE_KEY: invocationDueKey,
-        KIS_INTRADAY_PROVIDER_ID: INTRADAY_PROVIDER_ATTESTATION.decision_provider,
-        KIS_INTRADAY_FEATURE_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
-        KIS_INTRADAY_FEATURE_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
-        KIS_INTRADAY_POLICY_VERSION: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
-        KIS_INTRADAY_POLICY_HASH: INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
-        KIS_INTRADAY_DAILY_ENTRY_CAP: String(INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap),
-        ...(verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath, KIS_LLM_PROMPT_HASH: promptHash } : {}),
+      env: {
+        ...intradayProviderEnv,
+        ...(activationPreflight ? {} : {
+          KIS_HERMES_SCHEDULER_TOKEN: schedulerToken,
+          KIS_HERMES_DUE_KEY: invocationDueKey,
+          KIS_INTRADAY_DAILY_ENTRY_CAP: String(INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap),
+          ...(verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath, KIS_LLM_PROMPT_HASH: promptHash } : {}),
+        }),
       },
     };
   }
@@ -1762,17 +1855,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && hasIntradayProviderAttestation(orderTask);
       const validPreviousIntraday = validCap
         && hasIntradayProviderAttestation(orderTask, LEGACY_INTRADAY_PROVIDER_ATTESTATION);
+      const validStateLegacyIntraday = validCap
+        && hasIntradayProviderAttestation(orderTask, STATE_LEGACY_INTRADAY_PROVIDER_ATTESTATION);
       const validLegacy = !providerFieldsPresent && (
         (orderTask.daily_entry_cap === 3 && orderTask.daily_entry_cap_approval_hash == null)
         || (orderTask.daily_entry_cap === 5
           && orderTask.daily_entry_cap_approval_hash === DAILY_ENTRY_CAP_5_APPROVAL_HASH)
       );
-      if (!validIntraday && !validPreviousIntraday && !validLegacy) {
+      if (!validIntraday && !validPreviousIntraday && !validStateLegacyIntraday && !validLegacy) {
         throw new Error('state_contract_invalid');
       }
-      orderTask.daily_entry_cap = runtimeContract.daily_entry_cap;
-      orderTask.daily_entry_cap_approval_hash = null;
-      Object.assign(orderTask, INTRADAY_PROVIDER_ATTESTATION);
+      if (validIntraday) {
+        orderTask.daily_entry_cap = runtimeContract.daily_entry_cap;
+        orderTask.daily_entry_cap_approval_hash = null;
+      }
       if (orderTask.state === 'ACTIVE') delete value.order_pause_reason;
       return value;
     } catch (error) {
@@ -2700,13 +2796,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
       if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
+      const safetyRun = await execute(buildSafetyMonitorCommand());
+      if (safetyRun.error) throw new Error('safety_monitor_process_error');
+      const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+      if (safety.status !== 'success' || safety.execution_owner !== 'vps'
+        || ['process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status']
+          .some((key) => safety[key] !== 'clear')) {
+        throw new Error(safety.error_class === 'none' ? 'safety_monitor_not_clear' : safety.error_class);
+      }
       const { error, stdout } = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
       if (error) throw new Error('provider_cutover_preflight_process_error');
       const parsed = parseKisVpsAutonomousOutput(stdout, ORDER_TASK.id, runtimeContract);
       if (parsed.status !== 'success' || parsed.failClosed || parsed.actionType !== 'activation_check') {
         throw new Error(`provider_cutover_preflight_failed:${parsed.errorClass}`);
       }
-      if (prior.activation_artifact_hash !== null
+      const legacyProvider = hasIntradayProviderAttestation(prior, LEGACY_INTRADAY_PROVIDER_ATTESTATION)
+        || hasIntradayProviderAttestation(prior, STATE_LEGACY_INTRADAY_PROVIDER_ATTESTATION)
+        || prior.decision_provider == null;
+      if (!legacyProvider && prior.activation_artifact_hash !== null
         && parsed.artifactHash !== prior.activation_artifact_hash) {
         throw new Error('provider_cutover_artifact_mismatch');
       }
@@ -2715,7 +2822,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (latest.state !== current.state
         || latestOrder.state !== prior.state
         || latestOrder.pending_invocation !== null
-        || latestOrder.next_run_at !== prior.next_run_at) {
+        || latestOrder.next_run_at !== prior.next_run_at
+        || latestOrder.activation_artifact_hash !== prior.activation_artifact_hash
+        || latestOrder.pause_reason !== prior.pause_reason
+        || latestOrder.intraday_feature_hash !== prior.intraday_feature_hash
+        || latestOrder.intraday_policy_hash !== prior.intraday_policy_hash
+        || Object.values(latest.tasks).some((item) => item.pending_invocation !== null)) {
         throw new Error('provider_cutover_state_changed');
       }
       const cutoverAt = now();
@@ -2845,12 +2957,77 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         fail_closed: true,
       });
     }
-    current = loadStrict();
-    taskState = current.tasks[taskId];
+    try {
+      current = loadStrict();
+      taskState = current.tasks[taskId];
+    } catch (error) {
+      release();
+      throw error;
+    }
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE'
-      || !sameMinute(taskState.next_run_at, scheduledDueTime)) return current;
+      || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
+      release();
+      return current;
+    }
     const key = dueKey(task, scheduledDueTime);
     const postCloseRefresh = isPostCloseRefreshSlot(task, scheduledDueTime);
+    const scheduledParts = seoulParts(scheduledDueTime);
+    const officialTradeDate = `${scheduledParts.year}-${scheduledParts.month}-${scheduledParts.day}`;
+    const releaseBeforeOrderInvocation = () => {
+      if (release) { release(); release = null; }
+    };
+    const pauseBeforeOrderInvocation = async (reason) => {
+      releaseBeforeOrderInvocation();
+      return pauseForTask(loadStrict(), reason, {
+        invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+        error_class: reason, fail_closed: true,
+      });
+    };
+    try {
+      if (task.kind === 'order' && !postCloseRefresh
+        && taskState.promotion_preflight_trade_date !== officialTradeDate) {
+        const preflightRun = await execute(buildCommand(ORDER_TASK.id, { activationPreflight: true }));
+        if (preflightRun.error && Number(preflightRun.error.code) !== 2) {
+          return pauseBeforeOrderInvocation(preflightRun.error.killed ? 'timeout' : 'order_activation_check_process_error');
+        }
+        const preflight = parseKisVpsAutonomousOutput(preflightRun.stdout, ORDER_TASK.id, runtimeContract);
+        const validPreflight = preflight.status === 'success'
+          && preflight.failClosed === false
+          && preflight.actionType === 'activation_check'
+          && preflight.officialTradeDate === officialTradeDate
+          && hasIntradayProviderAttestation({
+            decision_provider: preflight.decisionProvider,
+            intraday_feature_version: preflight.intradayFeatureVersion,
+            intraday_policy_version: preflight.intradayPolicyVersion,
+            intraday_feature_hash: preflight.intradayFeatureHash,
+            intraday_policy_hash: preflight.intradayPolicyHash,
+          });
+        const unchangedArtifact = preflight.artifactHash === taskState.activation_artifact_hash;
+        const approvedRotation = !unchangedArtifact
+          && preflight.previousArtifactHash === taskState.activation_artifact_hash;
+        if (!validPreflight || (!unchangedArtifact && !approvedRotation)) {
+          return pauseBeforeOrderInvocation('model_v3_artifact_attestation_mismatch');
+        }
+        const latest = loadStrict();
+        const latestTask = latest.tasks[taskId];
+        if (latest.state !== current.state || latestTask.state !== taskState.state
+          || latestTask.pending_invocation !== null
+          || latestTask.next_run_at !== taskState.next_run_at
+          || latestTask.activation_artifact_hash !== taskState.activation_artifact_hash
+          || !hasIntradayProviderAttestation(latestTask)) {
+          releaseBeforeOrderInvocation();
+          return latest;
+        }
+        current = save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
+          ...latestTask,
+          activation_artifact_hash: preflight.artifactHash,
+          promotion_preflight_trade_date: officialTradeDate,
+        } } });
+        taskState = current.tasks[taskId];
+      }
+    } catch {
+      return pauseBeforeOrderInvocation('model_v3_artifact_attestation_mismatch');
+    }
     const requiresAiVerdict = task.kind === 'order' && !isDeterministicRiskOffSlot(task, scheduledDueTime) && !postCloseRefresh;
     ownsCurrentInvocation = (state, expectedInvocation = pendingInvocation) => {
       const currentTask = state.tasks[taskId];
@@ -3104,7 +3281,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       const latest = loadStrict(); const latestTask = latest.tasks[taskId];
       if (!ownsCurrentInvocation(latest, pendingInvocation)) return latest;
-      let lastRun = { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate, action_type: parsed.actionType, error_class: parsed.errorClass };
+      let lastRun = {
+        invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+        status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate,
+        action_type: parsed.actionType, error_class: parsed.errorClass,
+        ...(parsed.intradayCandidateCounts ? { intraday_candidate_counts: parsed.intradayCandidateCounts } : {}),
+      };
       if (task.kind === 'order' && !ownsCurrentOrderInvocation(latest, pendingInvocation)) {
         return pauseForTask(latest, 'scheduler_attestation_state_changed', {
           ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
@@ -3116,10 +3298,6 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const artifactAttestationValid = task.kind !== 'order' || blockedBeforeArtifactLoad
         || (postCloseRefresh
           ? parsed.artifactPromoted === false
-            && parsed.artifactHash === latestTask.activation_artifact_hash
-            && (postCloseMarketClosedNoOp
-              ? parsed.previousArtifactHash === null && parsed.shadowPredictionsInserted === 0
-              : parsed.previousArtifactHash === latestTask.activation_artifact_hash)
           : parsed.artifactHash === latestTask.activation_artifact_hash);
       if (!artifactAttestationValid) {
         return pauseForTask(latest, 'model_v3_artifact_attestation_mismatch', {
