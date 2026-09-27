@@ -9,9 +9,24 @@ const path = require('node:path');
 const test = require('node:test');
 const mod = require('./kis-ai-market-open-dry-run-task');
 const CALENDAR_HASH = `sha256:${'a'.repeat(64)}`;
+const LEGACY_INTRADAY_ATTESTATION = Object.freeze({
+  decision_provider: 'intraday_v1',
+  intraday_feature_version: 'intraday-quote-10m-v2-dynamic-universe',
+  intraday_policy_version: 'intraday-fast-track-v3-intraday-discovery',
+  intraday_feature_hash: crypto.createHash('sha256').update('intraday-quote-10m-v2-dynamic-universe', 'ascii').digest('hex'),
+  intraday_policy_hash: crypto.createHash('sha256').update('intraday-fast-track-v3-intraday-discovery', 'ascii').digest('hex'),
+});
 
 function calendarProof(isTradingDay = true) {
   return { isTradingDay, sourceHash: CALENDAR_HASH };
+}
+
+function kstTradeDate(date) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
 }
 
 function good(taskId, status = 'success', extra = {}) {
@@ -26,12 +41,16 @@ function good(taskId, status = 'success', extra = {}) {
   const intraday = taskId === mod.TASKS[1].id && status === 'success' && actionType === 'intraday_shadow'
     ? {
         intraday_decisions: 3,
-        intraday_mode: 'hybrid_bootstrap',
-        intraday_model_version: 'intraday_hybrid_v2',
+        intraday_mode: 'ml_champion',
+        intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
         intraday_feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
         intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
         intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
         intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+        intraday_candidate_counts: {
+          analyzed: 3, observation_ready: 3, data_excluded: 0,
+          model_unavailable: 0, risk_excluded: 0, llm_eligible: 3,
+        },
       }
     : {};
   const postClose = taskId === mod.TASKS[2].id && status === 'success' && actionType === 'post_close_learning'
@@ -117,6 +136,10 @@ function orderGood(status = 'no_op', extra = {}) {
     intraday_policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
     intraday_feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
     intraday_policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+    intraday_candidate_counts: {
+      analyzed: 0, observation_ready: 0, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: 0,
+    },
     order_symbol: null,
     order_name: null,
     order_side: null,
@@ -478,7 +501,9 @@ function fixture(options = {}) {
         : options.activationCheckOutput;
       callback(
         options.activationCheckError || null,
-        activationCheckOutput || orderGood('success', { action_type: 'activation_check' }),
+        activationCheckOutput || orderGood('success', {
+          action_type: 'activation_check', official_trade_date: kstTradeDate(clock),
+        }),
       );
       return;
     }
@@ -504,6 +529,34 @@ function fixture(options = {}) {
     enforceSchedulerOwnership: options.enforceSchedulerOwnership ?? false,
   });
   return { root, paths, task, setClock(value) { clock = new Date(value); }, rawExec: taskExec };
+}
+
+for (const corrupt of [false, true]) {
+  test(`state change after lock acquisition releases the lock (corrupt=${corrupt})`, async () => {
+    const value = await active();
+    const readFile = fs.readFileSync;
+    let changed = false;
+    fs.readFileSync = function readWithConcurrentStateChange(file, ...args) {
+      if (file === value.paths.legacyV1StatePath && fs.existsSync(value.paths.runLockPath) && !changed) {
+        changed = true;
+        const state = JSON.parse(readFile(value.paths.statePath, 'utf8'));
+        state.tasks[mod.TASKS[1].id].state = 'PAUSED';
+        state.tasks[mod.TASKS[1].id].next_run_at = null;
+        fs.writeFileSync(value.paths.statePath, corrupt ? '{' : JSON.stringify(state));
+      }
+      return readFile.call(this, file, ...args);
+    };
+    try {
+      value.setClock('2026-07-21T00:10:00Z');
+      const running = value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+      if (corrupt) await assert.rejects(running);
+      else assert.equal((await running).tasks[mod.TASKS[1].id].state, 'PAUSED');
+      assert.equal(changed, true);
+      assert.equal(fs.existsSync(value.paths.runLockPath), false);
+    } finally {
+      fs.readFileSync = readFile;
+    }
+  });
 }
 
 async function active(options = {}) {
@@ -552,12 +605,21 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   assert.equal(command.env.KIS_HERMES_SCHEDULER_TOKEN, '1'.repeat(32));
   assert.equal(command.env.KIS_HERMES_DUE_KEY, dueKey);
   assert.equal(command.env.KIS_INTRADAY_PROVIDER_ID, 'intraday_v1');
-  assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v2-dynamic-universe');
+  assert.equal(command.env.KIS_INTRADAY_FEATURE_VERSION, 'intraday-quote-10m-v3-independent');
   assert.equal(command.env.KIS_INTRADAY_FEATURE_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash);
-  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v3-intraday-discovery');
+  assert.equal(command.env.KIS_INTRADAY_POLICY_VERSION, 'intraday-fast-track-v4-independent');
   assert.equal(command.env.KIS_INTRADAY_POLICY_HASH, mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash);
   assert.equal(command.env.KIS_INTRADAY_DAILY_ENTRY_CAP, 'null');
   assert.equal(command.args.includes('--approval'), false);
+  const preflight = mod.buildCommand(mod.TASKS[4].id, { activationPreflight: true });
+  assert.deepEqual(preflight.env, {
+    KIS_INTRADAY_PROVIDER_ID: 'intraday_v1',
+    KIS_INTRADAY_FEATURE_VERSION: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+    KIS_INTRADAY_FEATURE_HASH: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+    KIS_INTRADAY_POLICY_VERSION: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+    KIS_INTRADAY_POLICY_HASH: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash,
+  });
+  assert.equal(mod.buildIndependentShadowRefreshCommand().env, undefined);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
   const finalDueKey = `${mod.TASKS[4].id}:2026-07-22:14:40`;
   const finalSlot = mod.buildCommand(mod.TASKS[4].id, {
@@ -877,11 +939,8 @@ test('invalid legacy 16:40 refresh slot recovers only into the next attested 16:
   assert.equal(fs.existsSync(value.paths.orderAttestationDir), false);
 });
 
-test('post-close market-closed no-op accepts only the current artifact attestation', async () => {
-  for (const [artifactHash, expectedState] of [
-    ['a'.repeat(64), 'ACTIVE'],
-    ['b'.repeat(64), 'PAUSED'],
-  ]) {
+test('post-close market-closed no-op keeps the independent intraday attestation', async () => {
+  for (const artifactHash of ['a'.repeat(64), 'b'.repeat(64)]) {
     const value = await active({
       shadowRefreshOutput: orderGood('no_op', {
         action_type: 'market_closed_no_op',
@@ -900,13 +959,8 @@ test('post-close market-closed no-op accepts only the current artifact attestati
       dueAt: new Date('2026-07-21T07:20:00.000Z'),
     });
 
-    assert.equal(state.tasks[mod.TASKS[4].id].state, expectedState);
-    if (expectedState === 'PAUSED') {
-      assert.equal(
-        state.tasks[mod.TASKS[4].id].pause_reason,
-        'model_v3_artifact_attestation_mismatch',
-      );
-    }
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+    assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
   }
 });
 
@@ -1084,6 +1138,7 @@ test('order output contract allows one reconciled VPS order and rejects unsafe d
   })), /unsafe_order_count/);
   assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v2',
+    ...LEGACY_INTRADAY_ATTESTATION,
   })));
   assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
     intraday_mode: 'hybrid_bootstrap', intraday_model_version: 'intraday_hybrid_v1',
@@ -1181,7 +1236,7 @@ test('exact provider cutover migrates the existing active order task without cre
   assert.equal(state.os_cron_used, false);
 });
 
-test('exact v2 provider attestation remains readable for atomic v3 synchronization', async () => {
+test('exact v2 provider attestation remains readable for atomic independent-provider synchronization', async () => {
   const value = await active();
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const legacy = value.task.status();
@@ -1209,11 +1264,11 @@ test('exact v2 provider attestation remains readable for atomic v3 synchronizati
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(
     state.tasks[mod.TASKS[4].id].intraday_feature_version,
-    'intraday-quote-10m-v2-dynamic-universe',
+    'intraday-quote-10m-v3-independent',
   );
   assert.equal(
     state.tasks[mod.TASKS[4].id].intraday_policy_version,
-    'intraday-fast-track-v3-intraday-discovery',
+    'intraday-fast-track-v4-independent',
   );
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(Object.keys(state.tasks).length, 5);
@@ -1628,8 +1683,8 @@ test('post-close refresh rejects order execution output', async () => {
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
 });
 
-test('post-close refresh rejects artifact promotion and hash drift', async () => {
-  for (const scenario of ['promotion', 'drift']) {
+test('post-close refresh rejects artifact promotion without rotating the independent artifact', async () => {
+  for (const scenario of ['promotion', 'daily_hash']) {
     const extra = scenario === 'promotion'
       ? {
         action_type: 'shadow_refreshed', artifact_reused: false, artifact_promoted: true,
@@ -1652,14 +1707,192 @@ test('post-close refresh rejects artifact promotion and hash drift', async () =>
       dueAt: new Date('2026-07-21T07:20:00.000Z'),
     });
 
-    assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-    assert.equal(
-      state.tasks[mod.TASKS[4].id].pause_reason,
-      scenario === 'promotion'
-        ? 'model_v3_post_close_promotion_forbidden'
-        : 'model_v3_artifact_attestation_mismatch',
-    );
+    assert.equal(state.tasks[mod.TASKS[4].id].state, scenario === 'promotion' ? 'PAUSED' : 'ACTIVE');
+    if (scenario === 'promotion') {
+      assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'model_v3_post_close_promotion_forbidden');
+    } else {
+      assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+    }
   }
+});
+
+test('next-day normal activation preflight atomically adopts a linked independent artifact before the order run', async () => {
+  let activationChecks = 0;
+  const commands = [];
+  const value = await active({
+    activationCheckOutput() {
+      activationChecks += 1;
+      return activationChecks === 1
+        ? orderGood('success', { action_type: 'activation_check' })
+        : orderGood('success', {
+          action_type: 'activation_check', artifact_reused: false,
+          previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+          official_trade_date: '2026-07-22',
+        });
+    },
+    onExec({ args, execOptions }) { commands.push({ args, env: execOptions.env }); },
+    execFile(_command, args, _options, callback) {
+      assert.ok(args.includes('run-once'));
+      callback(null, orderGood('no_op', {
+        previous_artifact_hash: 'b'.repeat(64), artifact_hash: 'b'.repeat(64),
+      }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const before = value.task.status();
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  value.setClock('2026-07-22T00:10:00.000Z');
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+
+  assert.equal(activationChecks, 2);
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
+  const preflight = commands.find(({ args }) => args.includes('activation-check') && args.includes('vps-autonomous-order'));
+  const order = commands.find(({ args }) => args.includes('run-once'));
+  assert.equal(preflight.env.KIS_HERMES_SCHEDULER_TOKEN, undefined);
+  assert.equal(preflight.env.KIS_HERMES_DUE_KEY, undefined);
+  assert.match(order.env.KIS_HERMES_SCHEDULER_TOKEN, /^[a-f0-9]{32}$/);
+});
+
+test('normal promotion preflight rejects missing or mismatched predecessor without an order invocation', async () => {
+  for (const previousArtifactHash of [null, 'c'.repeat(64)]) {
+    let activationChecks = 0;
+    let orderRuns = 0;
+    const value = await active({
+      activationCheckOutput() {
+        activationChecks += 1;
+        return activationChecks === 1
+          ? orderGood('success', { action_type: 'activation_check' })
+          : orderGood('success', {
+            action_type: 'activation_check', artifact_reused: false,
+            previous_artifact_hash: previousArtifactHash, artifact_hash: 'b'.repeat(64),
+            official_trade_date: '2026-07-22',
+          });
+      },
+      execFile(_command, args, _options, callback) {
+        orderRuns += 1;
+        callback(null, orderGood('no_op'));
+      },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    const before = value.task.status();
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+    value.setClock('2026-07-22T00:10:00.000Z');
+
+    const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+    assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+    assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+    assert.equal(orderRuns, 0);
+    assert.equal(fs.existsSync(value.paths.runLockPath), false);
+  }
+});
+
+test('normal promotion preflight cannot adopt an artifact reported for a later official day', async () => {
+  let activationChecks = 0;
+  let orderRuns = 0;
+  const value = await active({
+    activationCheckOutput() {
+      activationChecks += 1;
+      return activationChecks === 1
+        ? orderGood('success', { action_type: 'activation_check' })
+        : orderGood('success', {
+          action_type: 'activation_check', artifact_reused: false,
+          previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64),
+          official_trade_date: '2026-07-23',
+        });
+    },
+    execFile(_command, _args, _options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op'));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const before = value.task.status();
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  value.setClock('2026-07-22T00:10:00.000Z');
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  assert.equal(orderRuns, 0);
+});
+
+for (const preflightResult of ['success', 'process_error', 'malformed', 'rejected']) {
+test(`normal promotion preflight ${preflightResult} preserves a newly pending invocation`, async () => {
+  let mutateState = false;
+  let orderRuns = 0;
+  let activationChecks = 0;
+  let value;
+  const options = {
+    activationCheckOutput: () => {
+      activationChecks += 1;
+      if (activationChecks > 1 && preflightResult === 'malformed') return 'not-json';
+      if (activationChecks > 1 && preflightResult === 'rejected') {
+        return orderGood('blocked', { action_type: 'activation_check', error_class: 'intraday_promotion_link_invalid' });
+      }
+      return activationChecks === 1
+        ? orderGood('success', { action_type: 'activation_check' })
+        : orderGood('success', {
+          action_type: 'activation_check', artifact_reused: false,
+          previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'b'.repeat(64), official_trade_date: '2026-07-22',
+        });
+    },
+    onExec({ args }) {
+      if (!mutateState || !args.includes('activation-check')) return;
+      const state = value.task.status();
+      state.tasks[mod.TASKS[4].id].pending_invocation = { due_key: 'newer', token_hash: 'd'.repeat(64) };
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    },
+    execFile(_command, _args, _options, callback) {
+      orderRuns += 1;
+      callback(null, orderGood('no_op'));
+    },
+  };
+  value = await active(options);
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  if (preflightResult === 'process_error') options.activationCheckError = { code: 1 };
+  const before = value.task.status();
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  mutateState = true;
+  value.setClock('2026-07-22T00:10:00.000Z');
+
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  assert.deepEqual(state.tasks[mod.TASKS[4].id].pending_invocation, { due_key: 'newer', token_hash: 'd'.repeat(64) });
+  assert.equal(orderRuns, 0);
+  assert.equal(fs.existsSync(value.paths.runLockPath), false);
+});
+}
+
+test('same-hash normal preflight is recorded once per official day', async () => {
+  let activationChecks = 0;
+  const value = await active({
+    activationCheckOutput() {
+      activationChecks += 1;
+      return orderGood('success', { action_type: 'activation_check' });
+    },
+    execFile(_command, _args, _options, callback) { callback(null, orderGood('no_op')); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  for (const instant of ['2026-07-21T00:10:00.000Z', '2026-07-21T00:20:00.000Z']) {
+    const state = value.task.status();
+    state.tasks[mod.TASKS[4].id].next_run_at = instant;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(instant);
+    await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(instant) });
+  }
+  const state = value.task.status();
+  assert.equal(activationChecks, 2);
+  assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  assert.equal(state.tasks[mod.TASKS[4].id].promotion_preflight_trade_date, '2026-07-21');
 });
 
 test('explicit enable check reactivates an order task paused for known reconciliation recovery reasons', async () => {
@@ -2327,6 +2560,10 @@ test('strict command and output contract reject drift and unsafe fields', () => 
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id), mod.TASKS[1].id, trading));
   assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     quote_api_calls: 10, decisions: 10, intraday_decisions: 10,
+    intraday_candidate_counts: {
+      analyzed: 10, observation_ready: 10, data_excluded: 0,
+      model_unavailable: 0, risk_excluded: 0, llm_eligible: 10,
+    },
   }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     decisions: 10, intraday_decisions: 3,
@@ -2341,7 +2578,7 @@ test('strict command and output contract reject drift and unsafe fields', () => 
     intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
   }), mod.TASKS[1].id, trading));
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
-    intraday_decisions: 2,
+    intraday_decisions: 4,
   }), mod.TASKS[1].id, trading), /intraday_output_contract/);
   assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[1].id, 'success', {
     intraday_feature_hash: 'b'.repeat(64),
@@ -5030,6 +5267,96 @@ test('invalid decision slot stays paused without automatic recovery or order exe
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.autoResume, false);
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.orderRecovery, true);
   assert.equal(orderRuns, 0);
+});
+
+test('independent provider cutover adopts a new verified hash once and requires fresh VPS safety', async () => {
+  const options = {};
+  const value = await active(options);
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const legacy = value.task.status();
+  Object.assign(legacy.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(legacy));
+  options.activationCheckOutput = orderGood('success', { action_type: 'activation_check', artifact_hash: 'b'.repeat(64) });
+  options.safetyOutput = safetyOutput('blocked', { open_order_status: 'active', error_class: 'open_order_status_active' });
+  await assert.rejects(value.task.cutoverIntradayProvider({
+    confirm: true, approval: mod.INTRADAY_PROVIDER_CUTOVER_APPROVAL,
+  }), /open_order_status_active/);
+  assert.equal(value.task.status().tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
+  options.safetyOutput = safetyOutput();
+  const after = await value.task.cutoverIntradayProvider({
+    confirm: true, approval: mod.INTRADAY_PROVIDER_CUTOVER_APPROVAL,
+  });
+  assert.equal(after.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
+  options.activationCheckOutput = orderGood('success', { action_type: 'activation_check', artifact_hash: 'c'.repeat(64) });
+  await assert.rejects(value.task.cutoverIntradayProvider({
+    confirm: true, approval: mod.INTRADAY_PROVIDER_CUTOVER_APPROVAL,
+  }), /provider_cutover_artifact_mismatch/);
+});
+
+test('independent intraday counts reject mixed contracts and inactive-model entries', () => {
+  const counts = {
+    analyzed: 3, observation_ready: 2, data_excluded: 1,
+    model_unavailable: 1, risk_excluded: 0, llm_eligible: 1,
+  };
+  const partial = JSON.parse(good(mod.TASKS[1].id, 'success', {
+    decisions: 1, intraday_decisions: 1, intraday_candidate_counts: counts,
+  }));
+  assert.deepEqual(
+    mod.parseKisAiMarketOpenOutput(JSON.stringify(partial), mod.TASKS[1].id, () => calendarProof(true)).intradayCandidateCounts,
+    counts,
+  );
+  partial.intraday_policy_version = 'intraday-fast-track-v3-intraday-discovery';
+  assert.throws(() => mod.parseKisAiMarketOpenOutput(
+    JSON.stringify(partial), mod.TASKS[1].id, () => calendarProof(true),
+  ), /intraday_output_contract/);
+
+  const unavailable = JSON.parse(good(mod.TASKS[1].id, 'success', {
+    decisions: 0, intraday_decisions: 0,
+    intraday_mode: 'model_unavailable', intraday_model_version: 'intraday_model_unavailable_v3',
+    intraday_candidate_counts: {
+      analyzed: 1, observation_ready: 1, data_excluded: 0,
+      model_unavailable: 1, risk_excluded: 0, llm_eligible: 0,
+    },
+  }));
+  assert.doesNotThrow(() => mod.parseKisAiMarketOpenOutput(
+    JSON.stringify(unavailable), mod.TASKS[1].id, () => calendarProof(true),
+ ));
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'entry_reconciled', order_api_calls: 1, vps_live_orders: 1, reconciliations: 1,
+    intraday_mode: 'model_unavailable', intraday_model_version: 'intraday_model_unavailable_v3',
+    intraday_candidate_counts: {
+      analyzed: 1, observation_ready: 1, data_excluded: 0,
+      model_unavailable: 1, risk_excluded: 0, llm_eligible: 0,
+    },
+    order_symbol: '005930', order_name: '삼성전자', order_side: 'buy', requested_quantity: 1,
+    filled_quantity: 1, lifecycle_status: 'filled', decision_reason_codes: ['NO_EDGE'],
+    notification_idempotency_key: 'b'.repeat(64),
+  })), /intraday_model_unavailable_entry/);
+});
+
+test('read-only reconciliation accepts no artifact while executable paths remain attested', () => {
+  assert.doesNotThrow(() => mod.parseKisVpsAutonomousOutput(orderGood('success', {
+    action_type: 'reconciliation_recovered', reconciliations: 1, artifact_hash: null,
+  })));
+  assert.throws(() => mod.parseKisVpsAutonomousOutput(orderGood('no_op', {
+    artifact_hash: null,
+  })), /invalid_order_artifact_hash/);
+});
+
+test('blocked held positions permit a nullable daily reference without a daily artifact', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const context = JSON.parse(decisionContext(slotId));
+  Object.assign(context.candidates[0], {
+    role: 'held_position', review_tier: 'position', ml_action: 'BLOCK', data_quality: 'BLOCKED',
+    prob_up: null, prob_flat: null, prob_down: null, expected_net_return: null, daily_prior: null,
+  });
+  context.holdings = [{ symbol: '005930', quantity: 1 }];
+  context.risk_aggregate.open_positions = 1;
+  context.intraday_candidate_counts = {
+    analyzed: 1, observation_ready: 1, data_excluded: 0,
+    model_unavailable: 1, risk_excluded: 0, llm_eligible: 0,
+  };
+  assert.equal(mod.parseDecisionContextOutput(JSON.stringify(context), slotId).candidates[0].daily_prior, null);
 });
 
 test('intraday auth timeout degrades without orders or same-slot retry', async () => {
