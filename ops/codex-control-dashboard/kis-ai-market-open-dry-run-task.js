@@ -2965,7 +2965,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       throw error;
     }
     if (current.state !== 'ACTIVE' || taskState.state !== 'ACTIVE'
-      || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
+      || !sameMinute(taskState.next_run_at, scheduledDueTime)
+      || (task.kind === 'order' && taskState.pending_invocation !== null)) {
       release();
       return current;
     }
@@ -2976,12 +2977,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const releaseBeforeOrderInvocation = () => {
       if (release) { release(); release = null; }
     };
+    const ownsPreflight = (state) => state.state === current.state
+      && ['state', 'pause_reason', 'next_run_at', 'last_due_at', 'activation_artifact_hash',
+        'daily_entry_cap_approval_hash', ...Object.keys(INTRADAY_PROVIDER_ATTESTATION)]
+        .every((field) => state.tasks[taskId]?.[field] === taskState[field])
+      && JSON.stringify(state.tasks[taskId]?.pending_invocation) === JSON.stringify(taskState.pending_invocation);
     const pauseBeforeOrderInvocation = async (reason) => {
-      releaseBeforeOrderInvocation();
-      return pauseForTask(loadStrict(), reason, {
-        invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
-        error_class: reason, fail_closed: true,
-      });
+      try {
+        const latest = loadStrict();
+        if (!ownsPreflight(latest)) return latest;
+        return pauseForTask(latest, reason, {
+          invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+          error_class: reason, fail_closed: true,
+        });
+      } finally { releaseBeforeOrderInvocation(); }
     };
     try {
       if (task.kind === 'order' && !postCloseRefresh
@@ -3010,11 +3019,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
         const latest = loadStrict();
         const latestTask = latest.tasks[taskId];
-        if (latest.state !== current.state || latestTask.state !== taskState.state
-          || latestTask.pending_invocation !== null
-          || latestTask.next_run_at !== taskState.next_run_at
-          || latestTask.activation_artifact_hash !== taskState.activation_artifact_hash
-          || !hasIntradayProviderAttestation(latestTask)) {
+        if (!ownsPreflight(latest) || !hasIntradayProviderAttestation(latestTask)) {
           releaseBeforeOrderInvocation();
           return latest;
         }

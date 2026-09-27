@@ -1823,14 +1823,19 @@ test('normal promotion preflight cannot adopt an artifact reported for a later o
   assert.equal(orderRuns, 0);
 });
 
-test('normal promotion preflight never overwrites a newly pending invocation', async () => {
+for (const preflightResult of ['success', 'process_error', 'malformed', 'rejected']) {
+test(`normal promotion preflight ${preflightResult} preserves a newly pending invocation`, async () => {
   let mutateState = false;
   let orderRuns = 0;
   let activationChecks = 0;
   let value;
-  value = await active({
+  const options = {
     activationCheckOutput: () => {
       activationChecks += 1;
+      if (activationChecks > 1 && preflightResult === 'malformed') return 'not-json';
+      if (activationChecks > 1 && preflightResult === 'rejected') {
+        return orderGood('blocked', { action_type: 'activation_check', error_class: 'intraday_promotion_link_invalid' });
+      }
       return activationChecks === 1
         ? orderGood('success', { action_type: 'activation_check' })
         : orderGood('success', {
@@ -1848,8 +1853,10 @@ test('normal promotion preflight never overwrites a newly pending invocation', a
       orderRuns += 1;
       callback(null, orderGood('no_op'));
     },
-  });
+  };
+  value = await active(options);
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  if (preflightResult === 'process_error') options.activationCheckError = { code: 1 };
   const before = value.task.status();
   before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
@@ -1863,6 +1870,7 @@ test('normal promotion preflight never overwrites a newly pending invocation', a
   assert.equal(orderRuns, 0);
   assert.equal(fs.existsSync(value.paths.runLockPath), false);
 });
+}
 
 test('same-hash normal preflight is recorded once per official day', async () => {
   let activationChecks = 0;
