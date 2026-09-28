@@ -3754,10 +3754,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (current.state !== 'ACTIVE') return current;
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
           && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) return current;
+        const dispatchTime = now();
         for (const task of TASKS) {
           const item = current.tasks[task.id];
-          if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= time.getTime()) {
-            current = await runOnce({ taskId: task.id, dueAt: time });
+          if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= dispatchTime.getTime()) {
+            current = await runOnce({ taskId: task.id, dueAt: dispatchTime });
             if (current.state !== 'ACTIVE') break;
           }
         }
