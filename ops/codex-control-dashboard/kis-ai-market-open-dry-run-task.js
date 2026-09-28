@@ -407,7 +407,8 @@ function isDue(task, date) {
 }
 
 function isDelayedPostCloseStart(task, scheduledAt, invokedAt, calendarProofResolver) {
-  if (task.id !== POST_CLOSE_TASK.id || !isDue(task, scheduledAt)) return false;
+  if (![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id) || !isDue(task, scheduledAt)
+    || (task.id === ORDER_TASK.id && !isPostCloseRefreshSlot(task, scheduledAt))) return false;
   const scheduled = seoulParts(scheduledAt);
   const invoked = seoulParts(invokedAt);
   const invokedMinute = (Number(invoked.hour) * 60) + Number(invoked.minute);
@@ -3202,41 +3203,51 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
       }
       if (task.id === POST_CLOSE_TASK.id && parsed.status === 'success'
-        && parsed.actionType === 'post_close_learning' && parsed.failClosed === false && !delayedPostCloseStart
-        && current.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') {
-        const refresh = await execute(buildIndependentShadowRefreshCommand());
-        if (refresh.error && Number(refresh.error.code) !== 2) {
-          independentShadowRefresh = {
-            status: 'blocked', actionType: 'paused', predictionsInserted: 0,
-            duplicatesSkipped: 0, failClosed: true,
-            errorClass: refresh.error.killed ? 'post_close_shadow_timeout' : 'post_close_shadow_process_error',
-          };
-        } else {
-          try {
-            const refreshResult = parseKisVpsAutonomousOutput(refresh.stdout, ORDER_TASK.id, runtimeContract);
-            if ((refreshResult.status !== 'blocked'
-                && !['shadow_refreshed', 'market_closed_no_op'].includes(refreshResult.actionType))
-              || refreshResult.artifactPromoted
-              || refreshResult.orderApiCalls !== 0
-              || refreshResult.vpsLiveOrders !== 0
-              || refreshResult.reconciliations !== 0) {
-              throw new Error('invalid_independent_shadow_refresh');
-            }
-            independentShadowRefresh = {
-              status: refreshResult.status,
-              actionType: refreshResult.actionType,
-              predictionsInserted: refreshResult.shadowPredictionsInserted,
-              duplicatesSkipped: refreshResult.shadowDuplicatesSkipped,
-              failClosed: refreshResult.failClosed,
-              errorClass: refreshResult.errorClass,
-              artifactHash: refreshResult.artifactHash,
-            };
-          } catch (refreshParseError) {
+        && parsed.actionType === 'post_close_learning' && parsed.failClosed === false) {
+        const refreshDispatchAt = now();
+        const refreshDispatchParts = seoulParts(refreshDispatchAt);
+        const refreshDispatchTradeDate = `${refreshDispatchParts.year}-${refreshDispatchParts.month}-${refreshDispatchParts.day}`;
+        const liveOrderTask = loadStrict().tasks[ORDER_TASK.id];
+        const refreshDueKey = dueKey(ORDER_TASK, scheduledDueTime);
+        const scheduledRefreshConsumed = liveOrderTask.last_due_at === refreshDueKey
+          || liveOrderTask.pending_invocation?.due_key === refreshDueKey;
+        if (isDelayedPostCloseStart(ORDER_TASK, scheduledDueTime, refreshDispatchAt, calendarProofResolver)
+          && refreshDispatchTradeDate === officialTradeDate
+          && !scheduledRefreshConsumed && liveOrderTask.state !== 'ACTIVE') {
+          const refresh = await execute(buildIndependentShadowRefreshCommand());
+          if (refresh.error && Number(refresh.error.code) !== 2) {
             independentShadowRefresh = {
               status: 'blocked', actionType: 'paused', predictionsInserted: 0,
               duplicatesSkipped: 0, failClosed: true,
-              errorClass: safeText(refreshParseError.message, 80),
+              errorClass: refresh.error.killed ? 'post_close_shadow_timeout' : 'post_close_shadow_process_error',
             };
+          } else {
+            try {
+              const refreshResult = parseKisVpsAutonomousOutput(refresh.stdout, ORDER_TASK.id, runtimeContract);
+              if ((refreshResult.status !== 'blocked'
+                  && !['shadow_refreshed', 'market_closed_no_op'].includes(refreshResult.actionType))
+                || refreshResult.artifactPromoted
+                || refreshResult.orderApiCalls !== 0
+                || refreshResult.vpsLiveOrders !== 0
+                || refreshResult.reconciliations !== 0) {
+                throw new Error('invalid_independent_shadow_refresh');
+              }
+              independentShadowRefresh = {
+                status: refreshResult.status,
+                actionType: refreshResult.actionType,
+                predictionsInserted: refreshResult.shadowPredictionsInserted,
+                duplicatesSkipped: refreshResult.shadowDuplicatesSkipped,
+                failClosed: refreshResult.failClosed,
+                errorClass: refreshResult.errorClass,
+                artifactHash: refreshResult.artifactHash,
+              };
+            } catch (refreshParseError) {
+              independentShadowRefresh = {
+                status: 'blocked', actionType: 'paused', predictionsInserted: 0,
+                duplicatesSkipped: 0, failClosed: true,
+                errorClass: safeText(refreshParseError.message, 80),
+              };
+            }
           }
         }
       }
@@ -3758,7 +3769,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= dispatchTime.getTime()) {
-            current = await runOnce({ taskId: task.id, dueAt: dispatchTime });
+            current = await runOnce({ taskId: task.id, dueAt: now() });
             if (current.state !== 'ACTIVE') break;
           }
         }
