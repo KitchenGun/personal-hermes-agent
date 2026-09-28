@@ -795,6 +795,182 @@ test('delayed post-close learning retains the canonical due key without a same-d
   assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, observedDueKey);
 });
 
+for (const scenario of [
+  { name: 'disabled order task', orderState: 'DISABLED', completedAt: '2026-07-21T07:22:09.000Z', refresh: true },
+  { name: 'paused order task', orderState: 'PAUSED', completedAt: '2026-07-21T07:22:09.000Z', refresh: true },
+  { name: 'active order task after its missed slot', orderState: 'ACTIVE', completedAt: '2026-07-21T07:22:09.000Z', refresh: false },
+  { name: 'active order task owns the slot', orderState: 'ACTIVE', consumed: true, completedAt: '2026-07-21T07:22:09.000Z', refresh: false },
+  { name: 'learning finishes at the exclusive window end', orderState: 'PAUSED', completedAt: '2026-07-21T08:50:00.000Z', refresh: false },
+  { name: 'learning finishes on the next official date', orderState: 'PAUSED', completedAt: '2026-07-22T00:01:00.000Z', refresh: false },
+]) {
+  test(`delayed post-close refresh dispatch ${scenario.name}`, async () => {
+    let refreshCalls = 0;
+    let value;
+    value = await active({
+      onExec({ args }) {
+        if (!args.includes('--task-id') || !args.includes(mod.TASKS[2].id)) return;
+        value.setClock(scenario.completedAt);
+        const state = value.task.status();
+        const order = state.tasks[mod.TASKS[4].id];
+        order.state = scenario.orderState;
+        order.next_run_at = scenario.orderState === 'ACTIVE' ? '2026-07-21T07:20:00.000Z' : null;
+        if (scenario.consumed) order.last_due_at = `${mod.TASKS[4].id}:2026-07-21:16:20`;
+        fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+      },
+      onIndependentShadowRefresh() { refreshCalls += 1; },
+    });
+    const scheduled = '2026-07-21T07:20:00.000Z';
+    const state = value.task.status();
+    state.tasks[mod.TASKS[2].id].next_run_at = scheduled;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock('2026-07-21T07:21:01.000Z');
+
+    const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:21:01.000Z') });
+
+    assert.equal(refreshCalls, scenario.refresh ? 1 : 0);
+    assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, `${mod.TASKS[2].id}:2026-07-21:16:20`);
+  });
+}
+
+test('tick starting at 16:21 rechecks actual time before dispatching an order slot after slow learning', async () => {
+  let scheduledRefreshCalls = 0;
+  let refreshCalls = 0;
+  let scheduledDueKey = '';
+  let invocationExpiresAt = '';
+  let value;
+  value = await active({
+    onExec({ args }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) value.setClock('2026-07-21T07:22:09.000Z');
+    },
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+    onShadowRefresh({ execOptions }) {
+      scheduledRefreshCalls += 1;
+      scheduledDueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      invocationExpiresAt = value.task.status().tasks[mod.TASKS[4].id].pending_invocation.expires_at;
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  state.tasks[mod.TASKS[3].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[3].id].next_run_at = null;
+  state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:01.000Z');
+
+  const after = await value.task.tick();
+
+  assert.equal(refreshCalls, 0);
+  assert.equal(scheduledRefreshCalls, 1);
+  assert.equal(scheduledDueKey, `${mod.TASKS[4].id}:2026-07-21:16:20`);
+  assert.equal(invocationExpiresAt, '2026-07-21T07:27:09.000Z');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'shadow_refreshed');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_due_at, `${mod.TASKS[4].id}:2026-07-21:16:20`);
+
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths,
+    now: () => new Date('2026-07-21T07:22:10.000Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
+    runtimeHealthCheck: async () => true,
+    sourceParityCheck: () => true,
+    calendarProofResolver: () => calendarProof(true),
+    enforceSchedulerOwnership: false,
+    execFile(command, args, options, callback) {
+      if (args.includes('scheduled-refresh-shadow')) scheduledRefreshCalls += 1;
+      callback(null, orderGood('success', { action_type: 'shadow_refreshed' }));
+    },
+  });
+  await restarted.tick();
+  assert.equal(scheduledRefreshCalls, 1);
+});
+
+test('holiday at 16:20 does not dispatch an independent delayed refresh', async () => {
+  let refreshCalls = 0;
+  let isTradingDay = true;
+  const value = await active({
+    calendarProofResolver: () => calendarProof(isTradingDay),
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:20:00.000Z');
+  isTradingDay = false;
+
+  await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:20:00.000Z') });
+
+  assert.equal(refreshCalls, 0);
+});
+
+test('failed delayed active refresh is not retried after task recreation on the same date', async () => {
+  let refreshCalls = 0;
+  let value;
+  value = await active({
+    shadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    shadowRefreshOutput: orderGood('blocked', {
+      error_class: 'model_v3_backfill_transport_unavailable', artifact_hash: null,
+    }),
+    onExec({ args }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) value.setClock('2026-07-21T07:22:09.000Z');
+    },
+    onShadowRefresh() { refreshCalls += 1; },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[3].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[3].id].next_run_at = null;
+  state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:01.000Z');
+
+  const after = await value.task.tick();
+  assert.equal(refreshCalls, 1);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_due_at, `${mod.TASKS[4].id}:2026-07-21:16:20`);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths,
+    now: () => new Date('2026-07-21T07:22:10.000Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
+    runtimeHealthCheck: async () => true,
+    sourceParityCheck: () => true,
+    calendarProofResolver: () => calendarProof(true),
+    enforceSchedulerOwnership: false,
+    execFile(command, args, options, callback) {
+      if (args.includes('scheduled-refresh-shadow')) refreshCalls += 1;
+      callback(null, orderGood('success', { action_type: 'shadow_refreshed' }));
+    },
+  });
+  await restarted.tick();
+  assert.equal(refreshCalls, 1);
+});
+
+test('tick does not delayed-dispatch an active order refresh at the exclusive window end', async () => {
+  let scheduledRefreshCalls = 0;
+  let value;
+  value = await active({
+    onExec({ args }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) value.setClock('2026-07-21T08:50:00.000Z');
+    },
+    onShadowRefresh() { scheduledRefreshCalls += 1; },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  state.tasks[mod.TASKS[3].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[3].id].next_run_at = null;
+  state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:20:00.000Z');
+
+  const after = await value.task.tick();
+
+  assert.equal(scheduledRefreshCalls, 0);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_window_no_op');
+});
+
 test('expired KIS learning start remains parser-valid waiting with calendar evidence', {
   skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
 }, async () => {
@@ -1338,7 +1514,7 @@ test('post-close refresh failure waits for the next refresh slot without enablin
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
 });
 
-test('refresh-only recovery survives a missed refresh and restart without opening an intraday slot', async () => {
+test('refresh-only recovery survives an expired refresh window and restart without opening an intraday slot', async () => {
   let shadowRuns = 0;
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
@@ -1360,9 +1536,9 @@ test('refresh-only recovery survives a missed refresh and restart without openin
   });
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
 
-  value.setClock('2026-07-22T07:41:00Z');
+  value.setClock('2026-07-22T08:50:00Z');
   state = await value.task.runOnce({
-    taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T07:41:00Z'),
+    taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T08:50:00Z'),
   });
   assert.equal(shadowRuns, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
