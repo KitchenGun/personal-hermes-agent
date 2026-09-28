@@ -4423,6 +4423,54 @@ test('mismatched AI verdict blocks before KIS execution without fallback', async
   assert.equal(fs.existsSync(value.paths.verdictDir), false);
 });
 
+for (const scenario of [
+  { name: 'clear inside the new slot', finishedAt: '2026-07-21T02:20:08Z', blocked: false, collections: 1 },
+  { name: 'clear after the start window', finishedAt: '2026-07-21T02:21:08Z', blocked: false, collections: 0 },
+  { name: 'blocked inside the new slot', finishedAt: '2026-07-21T02:20:08Z', blocked: true, collections: 0 },
+]) test(`dispatch rechecks the clock after safety monitoring: ${scenario.name}`, async () => {
+  let advanceClock = false;
+  let value;
+  const calls = [];
+  value = await active({
+    schedulerRegistered: true,
+    onExec: ({ args }) => calls.push(args),
+    safetyOutput() {
+      if (advanceClock) value.setClock(scenario.finishedAt);
+      return scenario.blocked
+        ? safetyOutput('blocked', { account_risk_status: 'unknown', error_class: 'account_risk_evidence_missing' })
+        : safetyOutput();
+    },
+  });
+  if (!scenario.collections) markOrderActive(value);
+  const before = value.task.status();
+  const intradayId = mod.TASKS[1].id;
+  const orderId = mod.TASKS[4].id;
+  before.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  before.tasks[intradayId].next_run_at = '2026-07-21T02:20:00.000Z';
+  if (!scenario.collections) before.tasks[orderId].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
+  calls.length = 0;
+  advanceClock = true;
+  value.setClock('2026-07-21T02:19:50Z');
+
+  const after = await value.task.tick();
+
+  assert.equal(calls.filter((args) => args.includes('--task-id') && args.includes(intradayId)).length, scenario.collections);
+  assert.equal(calls.filter((args) => args.includes('vps-autonomous-order') && args.includes('run')).length, 0);
+  if (scenario.collections) {
+    assert.equal(after.tasks[intradayId].last_run.started_at, new Date(scenario.finishedAt).toISOString());
+    assert.equal(after.tasks[intradayId].next_run_at, '2026-07-21T02:30:00.000Z');
+    await value.task.tick();
+    assert.equal(calls.filter((args) => args.includes('--task-id') && args.includes(intradayId)).length, 1);
+  } else if (!scenario.blocked) {
+    assert.equal(after.tasks[intradayId].last_run.action_type, 'missed_window_no_op');
+    assert.equal(after.tasks[orderId].last_run.action_type, 'missed_window_no_op');
+  } else {
+    assert.equal(after.last_safety_monitor.status, 'blocked');
+    assert.equal(after.tasks[intradayId].next_run_at, '2026-07-21T02:20:00.000Z');
+  }
+});
+
 test('one-minute safety monitor keeps supervision active and pauses only orders on a non-global block', async () => {
   let llmCalls = 0;
   const value = await active({
