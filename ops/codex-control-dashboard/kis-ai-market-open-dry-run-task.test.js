@@ -4456,7 +4456,7 @@ for (const scenario of [
   const after = await value.task.tick();
 
   assert.equal(calls.filter((args) => args.includes('--task-id') && args.includes(intradayId)).length, scenario.collections);
-  assert.equal(calls.filter((args) => args.includes('vps-autonomous-order') && args.includes('run')).length, 0);
+  assert.equal(calls.filter((args) => args.includes('vps-autonomous-order') && args.includes('run-once')).length, 0);
   if (scenario.collections) {
     assert.equal(after.tasks[intradayId].last_run.started_at, new Date(scenario.finishedAt).toISOString());
     assert.equal(after.tasks[intradayId].next_run_at, '2026-07-21T02:30:00.000Z');
