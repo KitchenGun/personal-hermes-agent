@@ -3592,6 +3592,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     } catch { /* Unknown calendar coverage must continue through the fail-closed monitor. */ }
     const monitorRun = { checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false };
     let result;
+    let monitorError;
+    let dailyLossEntryBlock = false;
     try {
       const { error, stdout, stderr } = await execute(buildSafetyMonitorCommand());
       if (error && Number(error.code) !== 2) {
@@ -3613,126 +3615,135 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       capture(result);
       if (result.status === 'blocked') {
         if (isVpsDailyLossEntryBlock(result)) {
+          dailyLossEntryBlock = true;
+        } else {
+          const emergencyRequired = new Set(['mdd_liquidation_required', 'kill_switch_liquidation_required']);
+          if (emergencyRequired.has(result.error_class)) {
+            if (typeof emergencyStopExecutor !== 'function') throw new Error('emergency_stop_executor_missing');
+            const emergency = await emergencyStopExecutor({ automaticRiskOff: true });
+            Object.assign(monitorRun, {
+              emergency_stop_attempted: true,
+              emergency_stop_status: safeText(emergency?.status || 'blocked', 32),
+              emergency_execution_owner: safeText(emergency?.execution_owner || 'unknown', 16),
+              emergency_positions_liquidated: Number(emergency?.positions_liquidated || 0),
+              emergency_reconciliation_passed: emergency?.reconciliation_passed === true,
+            });
+            if (emergency?.status !== 'success' || emergency?.reconciliation_passed !== true) {
+              throw new Error(`emergency_${sanitizeErrorClass(emergency?.error_class || 'stop_failed')}`);
+            }
+          }
+          throw new Error(result.error_class || 'safe_block');
+        }
+      }
+    } catch (error) { monitorError = error; }
+    let release;
+    try { release = acquireExclusiveLock(runLockPath); }
+    catch (error) {
+      if (error.message !== 'scheduler_lock_active') throw error;
+      return {
+        ...loadStrict(),
+        last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true, process_lock: 'active', error_class: 'process_lock_active' },
+      };
+    }
+    try {
+      current = loadStrict();
+      if (dailyLossEntryBlock) {
+        return save({
+          ...current,
+          consecutive_safety_monitor_failures: 0,
+          last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true },
+        });
+      }
+      if (monitorError) {
+        const error = monitorError;
+        const reason = sanitizeErrorClass(error.message);
+        const consecutiveFailures = Number(current.consecutive_safety_monitor_failures || 0) + 1;
+        const consecutiveOpenOrderFailures = reason === 'open_order_status_unavailable'
+          && (consecutiveFailures === 1
+            || current.last_safety_monitor?.error_class === 'open_order_status_unavailable');
+        if (TRANSIENT_TRANSPORT_ERRORS.has(reason)) {
           return save({
             ...current,
-            consecutive_safety_monitor_failures: 0,
-            last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true },
+            consecutive_safety_monitor_failures: consecutiveFailures,
+            last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason },
           });
         }
-        const emergencyRequired = new Set(['mdd_liquidation_required', 'kill_switch_liquidation_required']);
-        if (emergencyRequired.has(result.error_class)) {
-          if (typeof emergencyStopExecutor !== 'function') throw new Error('emergency_stop_executor_missing');
-          const emergency = await emergencyStopExecutor({ automaticRiskOff: true });
-          Object.assign(monitorRun, {
-            emergency_stop_attempted: true,
-            emergency_stop_status: safeText(emergency?.status || 'blocked', 32),
-            emergency_execution_owner: safeText(emergency?.execution_owner || 'unknown', 16),
-            emergency_positions_liquidated: Number(emergency?.positions_liquidated || 0),
-            emergency_reconciliation_passed: emergency?.reconciliation_passed === true,
+        const failureLimit = consecutiveOpenOrderFailures
+          ? OPEN_ORDER_STATUS_FAILURE_LIMIT
+          : 2;
+        const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
+          && consecutiveFailures < failureLimit;
+        if (awaitingConfirmation) {
+          return save({
+            ...current,
+            consecutive_safety_monitor_failures: consecutiveFailures,
+            last_safety_monitor: { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason },
           });
-          if (emergency?.status !== 'success' || emergency?.reconciliation_passed !== true) {
-            throw new Error(`emergency_${sanitizeErrorClass(emergency?.error_class || 'stop_failed')}`);
-          }
         }
-        throw new Error(result.error_class || 'safe_block');
-      }
-    } catch (error) {
-      const reason = sanitizeErrorClass(error.message);
-      const consecutiveFailures = Number(current.consecutive_safety_monitor_failures || 0) + 1;
-      const consecutiveOpenOrderFailures = reason === 'open_order_status_unavailable'
-        && (consecutiveFailures === 1
-          || current.last_safety_monitor?.error_class === 'open_order_status_unavailable');
-      if (TRANSIENT_TRANSPORT_ERRORS.has(reason)) {
-        return save({
+        const lastRun = { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason };
+        const monitored = {
           ...current,
           consecutive_safety_monitor_failures: consecutiveFailures,
-          last_safety_monitor: {
-            ...monitorRun,
-            status: 'blocked',
-            fail_closed: true,
-            error_class: reason,
-          },
-        });
+          last_safety_monitor: lastRun,
+        };
+        const globalPause = ERROR_POLICY[reason]?.scope === 'global' || reason.startsWith('emergency_');
+        if (!globalPause && monitored.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') return save(monitored);
+        const paused = globalPause
+          ? pauseAll(monitored, TASKS[0].id, reason, lastRun)
+          : pauseOrder(monitored, reason, lastRun);
+        const notificationTaskId = globalPause ? TASKS[0].id : ORDER_TASK.id;
+        return await notifyPause(paused, notificationTaskId, reason, paused.tasks[notificationTaskId].last_run);
       }
-      const failureLimit = consecutiveOpenOrderFailures
-        ? OPEN_ORDER_STATUS_FAILURE_LIMIT
-        : 2;
-      const awaitingConfirmation = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
-        && consecutiveFailures < failureLimit;
-      if (awaitingConfirmation) {
-        return save({
-          ...current,
-          consecutive_safety_monitor_failures: consecutiveFailures,
-          last_safety_monitor: {
-            ...monitorRun,
-            status: 'blocked',
-            fail_closed: true,
-            error_class: reason,
-          },
-        });
-      }
-      const lastRun = { ...monitorRun, status: 'blocked', fail_closed: true, error_class: reason };
-      const monitored = {
+
+      const orderTask = current.tasks[ORDER_TASK.id];
+      const incident = blockingIncident(current);
+      const autoResolvedIncident = incident?.scope === 'verified_io_resume'
+        && incident.task_id === ORDER_TASK.id
+        && incident.error_class === orderTask?.pause_reason
+        && ERROR_POLICY[incident.error_class]?.autoResume === true;
+      const resumeOrder = current.order_activated_at
+        && orderTask?.state === 'PAUSED'
+        && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(orderTask.pause_reason)
+        && (!incident || autoResolvedIncident)
+        && (orderTask.pause_reason !== 'account_risk_status_active'
+          || orderTask.last_run?.execution_owner === 'vps');
+      const deferRecoveredOrder = monitorRun.reconciliation_recovery_succeeded === true
+        && orderTask?.state === 'ACTIVE';
+      const updateOrder = resumeOrder || deferRecoveredOrder;
+      return save({
         ...current,
-        consecutive_safety_monitor_failures: consecutiveFailures,
-        last_safety_monitor: lastRun,
-      };
-      const globalPause = ERROR_POLICY[reason]?.scope === 'global' || reason.startsWith('emergency_');
-      if (!globalPause && monitored.tasks[ORDER_TASK.id]?.state !== 'ACTIVE') return save(monitored);
-      const paused = globalPause
-        ? pauseAll(monitored, TASKS[0].id, reason, lastRun)
-        : pauseOrder(monitored, reason, lastRun);
-      const notificationTaskId = globalPause ? TASKS[0].id : ORDER_TASK.id;
-      return notifyPause(paused, notificationTaskId, reason, paused.tasks[notificationTaskId].last_run);
-    }
-    const orderTask = current.tasks[ORDER_TASK.id];
-    const incident = blockingIncident(current);
-    const autoResolvedIncident = incident?.scope === 'verified_io_resume'
-      && incident.task_id === ORDER_TASK.id
-      && incident.error_class === orderTask?.pause_reason
-      && ERROR_POLICY[incident.error_class]?.autoResume === true;
-    const resumeOrder = current.order_activated_at
-      && orderTask?.state === 'PAUSED'
-      && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(orderTask.pause_reason)
-      && (!incident || autoResolvedIncident)
-      && (orderTask.pause_reason !== 'account_risk_status_active'
-        || orderTask.last_run?.execution_owner === 'vps');
-    const deferRecoveredOrder = monitorRun.reconciliation_recovery_succeeded === true
-      && orderTask?.state === 'ACTIVE';
-    const updateOrder = resumeOrder || deferRecoveredOrder;
-    return save({
-      ...current,
-      ...(resumeOrder ? { order_pause_reason: undefined } : {}),
-      ...(autoResolvedIncident ? { incidents: {
-        ...current.incidents,
-        [incident.incident_id]: {
-          ...incident,
-          status: 'resolved',
-          result: {
-            action: 'safety_monitor_auto_recovered',
-            broker_order_api_calls: 0,
-            order_reactivated: true,
+        ...(resumeOrder ? { order_pause_reason: undefined } : {}),
+        ...(autoResolvedIncident ? { incidents: {
+          ...current.incidents,
+          [incident.incident_id]: {
+            ...incident,
+            status: 'resolved',
+            result: {
+              action: 'safety_monitor_auto_recovered',
+              broker_order_api_calls: 0,
+              order_reactivated: true,
+            },
+            updated_at: checkedAt.toISOString(),
           },
-          updated_at: checkedAt.toISOString(),
-        },
-      } } : {}),
-      consecutive_safety_monitor_failures: 0,
-      last_safety_monitor: deferRecoveredOrder
-        ? { ...monitorRun, order_slot_deferred: true }
-        : monitorRun,
-      tasks: updateOrder ? {
-        ...current.tasks,
-        [ORDER_TASK.id]: {
-          ...orderTask,
-          state: resumeOrder ? 'ACTIVE' : orderTask.state,
-          pause_reason: resumeOrder ? undefined : orderTask.pause_reason,
-          next_run_at: nextRunAt(orderTask.refresh_only_pending
-            && !hasIntradayProviderAttestation(orderTask) ? REFRESH_ONLY_ORDER_TASK : ORDER_TASK, checkedAt),
-          consecutive_transport_failures: 0,
-          pending_invocation: null,
-        },
-      } : current.tasks,
-    });
+        } } : {}),
+        consecutive_safety_monitor_failures: 0,
+        last_safety_monitor: deferRecoveredOrder
+          ? { ...monitorRun, order_slot_deferred: true }
+          : monitorRun,
+        tasks: updateOrder ? {
+          ...current.tasks,
+          [ORDER_TASK.id]: {
+            ...orderTask,
+            state: resumeOrder ? 'ACTIVE' : orderTask.state,
+            pause_reason: resumeOrder ? undefined : orderTask.pause_reason,
+            next_run_at: nextRunAt(orderTask.refresh_only_pending
+              && !hasIntradayProviderAttestation(orderTask) ? REFRESH_ONLY_ORDER_TASK : ORDER_TASK, checkedAt),
+            consecutive_transport_failures: 0,
+            pending_invocation: null,
+          },
+        } : current.tasks,
+      });
+    } finally { release(); }
   }
   async function tick() {
     if (enforceSchedulerOwnership && typeof releaseSchedulerOwnership !== 'function') {
