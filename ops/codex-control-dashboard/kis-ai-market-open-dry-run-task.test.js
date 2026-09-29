@@ -3462,6 +3462,81 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   assert.equal(state.retry, false); assert.equal(state.catch_up, false); assert.equal(state.backfill, false);
 });
 
+test('process lock recovery stays manual, fail-closed, and leaves order disabled', async () => {
+  assert.equal(mod.ERROR_POLICY.process_lock_active.persistent, true);
+  assert.equal(mod.ERROR_POLICY.process_lock_active.resumable, true);
+  assert.equal(mod.ERROR_POLICY.process_lock_active.scope, 'order');
+  assert.equal(mod.ERROR_POLICY.process_lock_active.autoResume, false);
+  let executions = 0;
+  const options = { schedulerRegistered: true, onExec() { executions += 1; } };
+  const value = await active(options);
+  const paused = value.task.status();
+  paused.state = 'PAUSED';
+  paused.pause_reason = 'process_lock_active';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED';
+    item.pause_reason = 'process_lock_active';
+    item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  const beforeApproval = executions;
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: 'wrong' }), /exact_resume_approval_required/);
+  assert.equal(executions, beforeApproval);
+
+  const blockingLock = path.join(value.root, 'operator.lock');
+  fs.writeFileSync(blockingLock, 'held');
+  const lockBlocked = await active({
+    resumeBlockingLockPaths: [blockingLock],
+    safetyOutput: safetyOutput(),
+  });
+  const lockState = lockBlocked.task.status();
+  lockState.state = 'PAUSED'; lockState.pause_reason = 'process_lock_active';
+  for (const item of Object.values(lockState.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'process_lock_active'; item.next_run_at = null;
+  }
+  fs.writeFileSync(lockBlocked.paths.statePath, JSON.stringify(lockState));
+  await assert.rejects(lockBlocked.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /writer_lock_active/);
+
+  options.safetyOutput = safetyOutput('blocked', {
+    process_lock: 'active', error_class: 'process_lock_active',
+  });
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /process_lock_active/);
+  options.safetyOutput = safetyOutput();
+  const resumed = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  assert.equal(resumed.state, 'ACTIVE');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].next_run_at, null);
+  const enabled = await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  assert.equal(enabled.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(executions > beforeApproval, true);
+});
+
+test('a cleared process lock does not auto-resume persistent pauses', async () => {
+  const options = {
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      process_lock: 'active', error_class: 'process_lock_active',
+    }),
+  };
+  const value = await active(options);
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'process_lock_active';
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'process_lock_active'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  value.setClock('2026-07-21T00:01:00Z');
+  assert.equal((await value.task.tick()).state, 'PAUSED');
+
+  options.safetyOutput = safetyOutput();
+  value.setClock('2026-07-21T00:02:00Z');
+  const cleared = await value.task.tick();
+  assert.equal(cleared.state, 'PAUSED');
+  assert.equal(cleared.pause_reason, 'process_lock_active');
+  assert.equal(cleared.tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
 test('mixed timeout and TLS task pauses are visible and recover only after verification', async () => {
   const value = await active();
   const current = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
