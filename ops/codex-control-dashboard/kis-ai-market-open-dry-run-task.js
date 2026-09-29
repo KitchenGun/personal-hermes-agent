@@ -172,6 +172,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
+  ['process_lock_active', { persistent: true, resumable: true, scope: 'order' }],
   ['order_submission_unknown', {
     persistent: true, autoResume: true, resumable: true, orderRecovery: true, scope: 'order',
   }],
