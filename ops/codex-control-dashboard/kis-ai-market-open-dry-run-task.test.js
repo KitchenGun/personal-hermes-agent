@@ -200,8 +200,8 @@ function blockedDiagnostic() {
 function marketEvidence() {
   return {
     schema_version: 'intraday_market_evidence_v1',
-    decision_time: '2026-07-21T09:10:03+09:00',
-    data_cutoff_at: '2026-07-21T09:10:01+09:00',
+    decision_time: '2026-07-21T09:15:03+09:00',
+    data_cutoff_at: '2026-07-21T09:15:01+09:00',
     values: {
       return_10m: .01, return_20m: .02, stock_vs_market_10m: .005, stock_vs_sector_10m: .004,
       volume_ratio_10m: 1.8, trading_value_ratio: 2.1, vwap_distance: .003,
@@ -211,7 +211,7 @@ function marketEvidence() {
 }
 
 test('market evidence is bounded, point-in-time and included in the prompt hash', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const input = JSON.parse(decisionContext(slotId, Array.from({ length: 20 }, (_, i) => String(i).padStart(6, '0'))));
   for (const c of input.candidates) c.market_evidence = marketEvidence();
   const build = () => mod.buildSanitizedAiPacket({
@@ -230,9 +230,9 @@ test('market evidence is bounded, point-in-time and included in the prompt hash'
     (v) => { v.values.current_price = 70000; },
     (v) => { v.values.return_10m = 'untrusted text'; },
     (v) => { v.values.volume_ratio_10m = -1; },
-    (v) => { v.data_cutoff_at = '2026-07-21T09:10:04+09:00'; },
+    (v) => { v.data_cutoff_at = '2026-07-21T09:15:04+09:00'; },
     (v) => { v.decision_time = '2026-07-21T09:11:00'; },
-    (v) => { v.decision_time = '2026-07-21T09:20:00+09:00'; },
+    (v) => { v.decision_time = '2026-07-21T09:26:00+09:00'; },
     (v) => { v.decision_time = v.data_cutoff_at = '2026-07-20T09:10:00+09:00'; },
   ]) {
     input.candidates[0].market_evidence = marketEvidence();
@@ -245,7 +245,7 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
   const symbols = ['005930', '000660', '005380', '035720'];
   let calls = 0;
   const value = await active({
-    decisionContextOutput: decisionContext(`${mod.TASKS[4].id}:2026-07-21:09:10`, symbols),
+    decisionContextOutput: decisionContext(`${mod.TASKS[4].id}:2026-07-21:09:15`, symbols),
     llmExecutor: async ({ packet }) => aiVerdict(packet, [
       { symbol: symbols[0], action: 'HOLD', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
       { symbol: symbols[1], action: 'REJECT', target_weight_pct: 0, confidence_bucket: 'low', reason_codes: ['RISK_REDUCTION'] },
@@ -258,8 +258,8 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:10Z');
-  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:10Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   const stored = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).tasks[mod.TASKS[4].id];
   const summary = stored.last_run.llm_verdict_summary;
   assert.deepEqual(summary.actions, { ENTER: 1, EXIT: 0, HOLD: 2, HOLD_OVERNIGHT: 0, REJECT: 1 });
@@ -270,7 +270,7 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
   assert.equal(stored.llm_daily_summary.slot_count, 1);
   assert.equal(stored.llm_daily_summary.trade_date, '2026-07-21');
   assert.doesNotMatch(JSON.stringify(summary), /005930|target_weight|account|prompt|quantity/);
-  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(calls, 1);
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].llm_daily_summary.slot_count, 1);
 });
@@ -288,7 +288,7 @@ test('verdict audit accumulates within a day, resets next day and survives downs
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const original = value.task.status();
   for (const [instant, expectedSlots] of [
-    ['2026-07-21T00:10:00Z', 1], ['2026-07-21T00:20:00Z', 2], ['2026-07-22T00:10:00Z', 1],
+    ['2026-07-21T00:15:00Z', 1], ['2026-07-21T00:25:00Z', 2], ['2026-07-22T00:15:00Z', 1],
   ]) {
     const current = value.task.status();
     const prior = current.tasks[mod.TASKS[4].id];
@@ -571,7 +571,7 @@ function markOrderActive(value) {
   state.order_activated_at = '2026-07-21T00:00:00.000Z';
   state.tasks[mod.TASKS[4].id].state = 'ACTIVE';
   state.tasks[mod.TASKS[4].id].pause_reason = undefined;
-  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:10:00.000Z';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
 }
 
@@ -597,7 +597,7 @@ test('exact activation approval enables four dry-run schedules and keeps order d
 });
 
 test('order command uses VM venv and exposes no per-run approval', () => {
-  const dueKey = `${mod.TASKS[4].id}:2026-07-22:09:10`;
+  const dueKey = `${mod.TASKS[4].id}:2026-07-22:09:15`;
   const command = mod.buildCommand(mod.TASKS[4].id, { schedulerToken: '1'.repeat(32), dueKey });
   assert.equal(command.command, mod.KIS_VENV_PYTHON);
   assert.equal(command.cwd, mod.KIS_REPO);
@@ -621,7 +621,7 @@ test('order command uses VM venv and exposes no per-run approval', () => {
   });
   assert.equal(mod.buildIndependentShadowRefreshCommand().env, undefined);
   assert.throws(() => mod.buildCommand(mod.TASKS[4].id), /scheduler_attestation_required/);
-  const finalDueKey = `${mod.TASKS[4].id}:2026-07-22:14:40`;
+  const finalDueKey = `${mod.TASKS[4].id}:2026-07-22:14:35`;
   const finalSlot = mod.buildCommand(mod.TASKS[4].id, {
     schedulerToken: '2'.repeat(32),
     dueKey: finalDueKey,
@@ -1007,14 +1007,14 @@ with tempfile.TemporaryDirectory() as directory:
   assert.equal(parsed.failClosed, false);
 });
 
-test('intraday decision and order schedules align on future 10-minute slots', () => {
+test('intraday shadow and offset order schedules retain their 10-minute slots', () => {
   assert.deepEqual(mod.TASKS[1].minutes, Array.from({ length: 34 }, (_, i) => 550 + (i * 10)));
   assert.deepEqual(mod.TASKS[2].minutes, [980]);
   assert.deepEqual(mod.TASKS[3].minutes, [990]);
   const task = mod.TASKS[4];
-  assert.deepEqual(task.minutes, [...mod.TASKS[1].minutes, 881, 882, 980]);
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:09:00Z')), '2026-07-21T00:10:00.000Z');
-  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:39:00Z')), '2026-07-21T05:40:00.000Z');
+  assert.deepEqual(task.minutes, [...Array.from({ length: 33 }, (_, i) => 555 + (i * 10)), 881, 882, 980]);
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T00:09:00Z')), '2026-07-21T00:15:00.000Z');
+  assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:39:00Z')), '2026-07-21T05:41:00.000Z');
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:40:00Z')), '2026-07-21T05:41:00.000Z');
   assert.equal(mod.nextRunAt(task, new Date('2026-07-21T05:42:00Z')), '2026-07-21T07:20:00.000Z');
 });
@@ -1255,7 +1255,7 @@ test('14:41 risk-off slot reuses the order task without a new LLM decision', asy
   assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'horizon_exit_reconciled');
 });
 
-test('14:40 horizon slot accepts only zero-position non-order no-op outcomes', async () => {
+test('14:41 risk-off slot accepts only zero-position non-order no-op outcomes', async () => {
   for (const actionType of ['no_candidate_no_op', 'entry_window_closed_no_op']) {
     const value = await active({
       execFile(command, args, options, callback) {
@@ -1263,7 +1263,7 @@ test('14:40 horizon slot accepts only zero-position non-order no-op outcomes', a
       },
     });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-    const due = new Date('2026-07-21T05:40:00Z');
+    const due = new Date('2026-07-21T05:41:00Z');
     const state = value.task.status();
     state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
     fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
@@ -1275,7 +1275,7 @@ test('14:40 horizon slot accepts only zero-position non-order no-op outcomes', a
   }
 });
 
-test('14:40 horizon slot rejects either no-op outcome that reports an open position', async () => {
+test('14:41 risk-off slot rejects either no-op outcome that reports an open position', async () => {
   for (const actionType of ['no_candidate_no_op', 'entry_window_closed_no_op']) {
     const value = await active({
       execFile(command, args, options, callback) {
@@ -1286,7 +1286,7 @@ test('14:40 horizon slot rejects either no-op outcome that reports an open posit
       },
     });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-    const due = new Date('2026-07-21T05:40:00Z');
+    const due = new Date('2026-07-21T05:41:00Z');
     const state = value.task.status();
     state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
     fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
@@ -1510,7 +1510,7 @@ test('post-close refresh failure waits for the next refresh slot without enablin
   assert.equal(autonomousRuns, 1);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'shadow_refreshed');
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-23T00:10:00.000Z');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-23T00:15:00.000Z');
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
 });
 
@@ -1545,9 +1545,9 @@ test('refresh-only recovery survives an expired refresh window and restart witho
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_refresh_window_no_op');
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-23T07:20:00.000Z');
 
-  value.setClock('2026-07-23T00:10:00Z');
+  value.setClock('2026-07-23T00:15:00Z');
   state = await value.task.runOnce({
-    taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-23T00:10:00Z'),
+    taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-23T00:15:00Z'),
   });
   assert.equal(shadowRuns, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-23T07:20:00.000Z');
@@ -1559,7 +1559,7 @@ test('refresh-only recovery survives an expired refresh window and restart witho
   });
   assert.equal(shadowRuns, 1);
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-24T00:10:00.000Z');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-24T00:15:00.000Z');
 });
 
 test('post-close waiting recovery refuses to rotate the attested artifact', async () => {
@@ -1627,7 +1627,7 @@ test('explicit refresh adoption verifies the batch before restoring intraday ord
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, false);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:10:00.000Z');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T00:15:00.000Z');
 });
 
 test('refresh adoption preserves refresh-only state when activation check fails', async () => {
@@ -1916,11 +1916,11 @@ test('next-day normal activation preflight atomically adopts a linked independen
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const before = value.task.status();
-  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:15:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-  value.setClock('2026-07-22T00:10:00.000Z');
+  value.setClock('2026-07-22T00:15:00.000Z');
 
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:15:00.000Z') });
 
   assert.equal(activationChecks, 2);
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'b'.repeat(64));
@@ -1953,11 +1953,11 @@ test('normal promotion preflight rejects missing or mismatched predecessor witho
     });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
     const before = value.task.status();
-    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+    before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:15:00.000Z';
     fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-    value.setClock('2026-07-22T00:10:00.000Z');
+    value.setClock('2026-07-22T00:15:00.000Z');
 
-    const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+    const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:15:00.000Z') });
 
     assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
     assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
@@ -1988,11 +1988,11 @@ test('normal promotion preflight cannot adopt an artifact reported for a later o
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const before = value.task.status();
-  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:15:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-  value.setClock('2026-07-22T00:10:00.000Z');
+  value.setClock('2026-07-22T00:15:00.000Z');
 
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:15:00.000Z') });
 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
@@ -2034,12 +2034,12 @@ test(`normal promotion preflight ${preflightResult} preserves a newly pending in
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   if (preflightResult === 'process_error') options.activationCheckError = { code: 1 };
   const before = value.task.status();
-  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:10:00.000Z';
+  before.tasks[mod.TASKS[4].id].next_run_at = '2026-07-22T00:15:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
   mutateState = true;
-  value.setClock('2026-07-22T00:10:00.000Z');
+  value.setClock('2026-07-22T00:15:00.000Z');
 
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:10:00.000Z') });
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-22T00:15:00.000Z') });
 
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, 'a'.repeat(64));
   assert.deepEqual(state.tasks[mod.TASKS[4].id].pending_invocation, { due_key: 'newer', token_hash: 'd'.repeat(64) });
@@ -2058,7 +2058,7 @@ test('same-hash normal preflight is recorded once per official day', async () =>
     execFile(_command, _args, _options, callback) { callback(null, orderGood('no_op')); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  for (const instant of ['2026-07-21T00:10:00.000Z', '2026-07-21T00:20:00.000Z']) {
+  for (const instant of ['2026-07-21T00:15:00.000Z', '2026-07-21T00:25:00.000Z']) {
     const state = value.task.status();
     state.tasks[mod.TASKS[4].id].next_run_at = instant;
     fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
@@ -2614,6 +2614,32 @@ test('next runs skip catch-up and stop intraday inference after 14:40', () => {
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:30:00Z')), '2026-07-21T05:40:00.000Z');
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:40:00Z')), '2026-07-22T00:10:00.000Z');
   assert.equal(mod.nextRunAt(intraday, new Date('2026-07-21T05:51:00Z')), '2026-07-22T00:10:00.000Z');
+  const order = mod.TASKS[4];
+  assert.equal(order.schedule.includes('09:15-14:35'), true);
+  assert.equal(mod.nextRunAt(order, new Date('2026-07-20T23:59:00Z')), '2026-07-21T00:15:00.000Z');
+  assert.equal(mod.nextRunAt(order, new Date('2026-07-21T05:35:00Z')), '2026-07-21T05:41:00.000Z');
+});
+
+test('legacy :10 order schedule migrates forward without executing the old slot', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) orderRuns += 1;
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:10:00Z');
+
+  const migrated = await value.task.tick();
+
+  assert.equal(migrated.tasks[mod.TASKS[4].id].schedule, mod.TASKS[4].schedule);
+  assert.equal(migrated.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T00:15:00.000Z');
+  assert.equal(orderRuns, 0);
 });
 
 test('server polling survives DISABLED state and adopts later CLI activation', async () => {
@@ -2714,7 +2740,7 @@ test('14:30 and later entry output is rejected even when KIS reports success', a
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const due = new Date('2026-07-21T05:40:00Z');
+  const due = new Date('2026-07-21T05:35:00Z');
   const state = value.task.status();
   state.tasks[mod.TASKS[4].id].next_run_at = due.toISOString();
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
@@ -3988,7 +4014,7 @@ test('report failure pauses only reporting and never retries the KIS cycle', asy
 });
 
 test('AI verdict packet and response enforce the fixed model and decision contract', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const context = mod.parseDecisionContextOutput(decisionContext(slotId, ['005930', '000660']), slotId);
   const packet = mod.buildSanitizedAiPacket({ slotId, context });
   assert.equal(packet.model_id, 'gpt-5.6-terra');
@@ -4061,7 +4087,7 @@ test('AI verdict packet and response enforce the fixed model and decision contra
 });
 
 test('AI verdict requires explicit coverage for every bounded candidate', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   for (const candidateCount of [1, 18, 20]) {
     const symbols = Array.from({ length: candidateCount }, (_, index) => String(index + 1).padStart(6, '0'));
     const context = mod.parseDecisionContextOutput(decisionContext(slotId, symbols), slotId);
@@ -4098,7 +4124,7 @@ test('incomplete candidate verdict degrades one slot, records coverage, and neve
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const firstDueAt = new Date('2026-07-21T00:10:00Z');
+  const firstDueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(firstDueAt);
   let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
 
@@ -4126,7 +4152,7 @@ test('incomplete candidate verdict degrades one slot, records coverage, and neve
   assert.equal(llmCalls, 1);
   assert.equal(orderRuns, 0);
 
-  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  const nextDueAt = new Date('2026-07-21T00:25:00Z');
   value.setClock(nextDueAt);
   state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -4162,7 +4188,7 @@ test('incomplete candidate verdict preserves an external order pause', async () 
   });
   statePath = value.paths.statePath;
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -4185,7 +4211,7 @@ test('KIS candidate coverage block degrades one slot after zero broker activity'
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -4203,7 +4229,7 @@ test('KIS candidate coverage block degrades one slot after zero broker activity'
 
   await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   assert.equal(orderRuns, 1);
-  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  const nextDueAt = new Date('2026-07-21T00:25:00Z');
   value.setClock(nextDueAt);
   state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
   taskState = state.tasks[mod.TASKS[4].id];
@@ -4224,7 +4250,7 @@ test('complete REJECT verdict remains a normal no-trade result', async () => {
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
 
@@ -4235,7 +4261,7 @@ test('complete REJECT verdict remains a normal no-trade result', async () => {
 });
 
 test('2026-08-04 09:10 stale decision context pauses before LLM and KIS execution', async () => {
-  const slotId = `${mod.TASKS[4].id}:2026-08-04:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-08-04:09:15`;
   const stale = JSON.parse(decisionContext(slotId, ['005930']));
   stale.official_trade_date = '2026-08-03';
   let llmCalls = 0;
@@ -4250,11 +4276,11 @@ test('2026-08-04 09:10 stale decision context pauses before LLM and KIS executio
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
   const scheduled = value.task.status();
-  scheduled.tasks[mod.TASKS[4].id].next_run_at = '2026-08-04T00:10:00.000Z';
+  scheduled.tasks[mod.TASKS[4].id].next_run_at = '2026-08-04T00:15:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(scheduled));
-  value.setClock('2026-08-04T00:10:00Z');
+  value.setClock('2026-08-04T00:15:00Z');
 
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-08-04T00:10:00Z') });
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-08-04T00:15:00Z') });
 
   assert.equal(llmCalls, 0);
   assert.equal(executionCalls, 0);
@@ -4266,7 +4292,7 @@ test('2026-08-04 09:10 stale decision context pauses before LLM and KIS executio
 });
 
 test('one transient decision-context failure skips the slot and consecutive two pauses', async () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const blocked = JSON.parse(decisionContext(slotId, []));
   Object.assign(blocked, {
     status: 'blocked',
@@ -4288,16 +4314,16 @@ test('one transient decision-context failure skips the slot and consecutive two 
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
+  value.setClock('2026-07-21T00:15:00Z');
 
-  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 1);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'transport_degraded_no_op');
 
-  value.setClock('2026-07-21T00:20:00Z');
-  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:20:00Z') });
+  value.setClock('2026-07-21T00:25:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:25:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'http_transport_failed');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.consecutive_transport_failures, 2);
@@ -4314,7 +4340,7 @@ test('decision-context child timeout degrades one slot without pausing or invoki
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -4325,7 +4351,7 @@ test('decision-context child timeout degrades one slot without pausing or invoki
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'decision_context_timeout');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
-  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:20:00\.000Z$/);
+  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:25:00\.000Z$/);
   assert.equal(orderRuns, 0);
 });
 
@@ -4336,7 +4362,7 @@ test('non-timeout decision-context process failure remains fail-closed', async (
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -4348,14 +4374,14 @@ test('non-timeout decision-context process failure remains fail-closed', async (
 });
 
 test('AI packet accepts bounded six-digit symbols outside the legacy three-symbol watchlist', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const context = mod.parseDecisionContextOutput(decisionContext(slotId, ['035720', '247540']), slotId);
   const packet = mod.buildSanitizedAiPacket({ slotId, context });
   assert.deepEqual(packet.candidates.map((item) => item.symbol), ['035720', '247540']);
 });
 
 test('AI packet preserves bounded watch review metadata without expanding actions', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const parsed = JSON.parse(decisionContext(slotId, ['005930']));
   parsed.candidates[0] = {
     ...parsed.candidates[0],
@@ -4391,16 +4417,16 @@ test('order lifecycle notification is once-only and delivery failure never retri
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, output); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_succeeded, false);
   assert.equal(sent[0].idempotencyKey, notificationKey);
   assert.match(sent[0].content, /매수 카카오\(035720\) 3주/);
   assert.match(sent[0].content, /판단 근거: 상승 흐름 확인, 시장·동종 종목 대비 강세/);
   assert.doesNotMatch(sent[0].content, /MOMENTUM_CONFIRMATION|RELATIVE_STRENGTH/);
-  value.setClock('2026-07-21T00:20:00Z');
-  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:20:00Z') });
+  value.setClock('2026-07-21T00:25:00Z');
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:25:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_notification_duplicate_suppressed, true);
   assert.equal(sent.length, 1);
@@ -4418,7 +4444,7 @@ test('duplicate-entry no-op keeps subsequent slots active without order notifica
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  for (const time of ['2026-07-21T00:10:00Z', '2026-07-21T00:20:00Z']) {
+  for (const time of ['2026-07-21T00:15:00Z', '2026-07-21T00:25:00Z']) {
     value.setClock(time);
     const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date(time) });
     assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -4442,8 +4468,8 @@ test('broker rejection reports rejection once and keeps orders paused without re
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, output); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'order_rejected');
   assert.equal(orderRuns, 1);
@@ -4501,8 +4527,8 @@ test('intraday AI verdict is bounded, passed by path only, and deleted after KIS
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(fs.existsSync(seenPath), false);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.decision_context_candidate_count, 1);
@@ -4516,7 +4542,7 @@ test('empty decision context still rotates the consumed attestation before no-op
   let llmCalls = 0;
   const value = await active({
     decisionContextOutput: decisionContext(
-      `${mod.TASKS[4].id}:2026-07-21:09:10`,
+      `${mod.TASKS[4].id}:2026-07-21:09:15`,
       [],
     ),
     llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
@@ -4537,8 +4563,8 @@ test('empty decision context still rotates the consumed attestation before no-op
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(llmCalls, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'no_candidate_no_op');
@@ -4567,8 +4593,8 @@ test('decision context state drift blocks before issuing an execution attestatio
       },
     });
     await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-    value.setClock('2026-07-21T00:10:00Z');
-    const run = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+    value.setClock('2026-07-21T00:15:00Z');
+    const run = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
     if (mutation.stateInvalid) {
       await assert.rejects(run, /state_unavailable/);
       assert.equal(orderRuns, 0);
@@ -4588,8 +4614,8 @@ test('mismatched AI verdict blocks before KIS execution without fallback', async
     execFile(command, args, options, callback) { calls += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   assert.equal(calls, 0);
   assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
@@ -4623,7 +4649,7 @@ for (const scenario of [
   const orderId = mod.TASKS[4].id;
   before.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
   before.tasks[intradayId].next_run_at = '2026-07-21T02:20:00.000Z';
-  if (!scenario.collections) before.tasks[orderId].next_run_at = '2026-07-21T02:20:00.000Z';
+  if (!scenario.collections) before.tasks[orderId].next_run_at = '2026-07-21T02:25:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
   calls.length = 0;
   advanceClock = true;
@@ -4640,11 +4666,94 @@ for (const scenario of [
     assert.equal(calls.filter((args) => args.includes('--task-id') && args.includes(intradayId)).length, 1);
   } else if (!scenario.blocked) {
     assert.equal(after.tasks[intradayId].last_run.action_type, 'missed_window_no_op');
-    assert.equal(after.tasks[orderId].last_run.action_type, 'missed_window_no_op');
+    assert.equal(after.tasks[orderId].next_run_at, '2026-07-21T02:25:00.000Z');
+    assert.equal(after.tasks[orderId].last_run, null);
   } else {
     assert.equal(after.last_safety_monitor.status, 'blocked');
     assert.equal(after.tasks[intradayId].next_run_at, '2026-07-21T02:20:00.000Z');
   }
+});
+
+test('three-minute shadow run leaves the :15 order for its natural tick exactly once', async () => {
+  let orderRuns = 0;
+  let orderDueKey = null;
+  const value = await active({
+    onExec({ args }) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) {
+        value.setClock('2026-07-21T00:13:00Z');
+      }
+    },
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id')) return callback(null, good(args[args.indexOf('--task-id') + 1]));
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) {
+        orderRuns += 1;
+        orderDueKey = options.env.KIS_HERMES_DUE_KEY;
+        return callback(null, orderGood('no_op', { action_type: 'no_candidate_no_op' }));
+      }
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T00:10:00.000Z';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:10:00Z');
+
+  const afterShadow = await value.task.tick();
+  assert.equal(afterShadow.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T00:15:00.000Z');
+  assert.notEqual(afterShadow.tasks[mod.TASKS[4].id].last_run?.action_type, 'missed_window_no_op');
+  value.setClock('2026-07-21T00:14:00Z');
+  await value.task.tick();
+  assert.equal(orderRuns, 0);
+  value.setClock('2026-07-21T00:15:00Z');
+  const ordered = await value.task.tick();
+  assert.equal(orderRuns, 1);
+  assert.equal(orderDueKey, `${mod.TASKS[4].id}:2026-07-21:09:15`);
+  assert.equal(ordered.tasks[mod.TASKS[4].id].last_due_at, orderDueKey);
+  await value.task.tick();
+  assert.equal(orderRuns, 1);
+});
+
+test('missing shadow decision data at :15 degrades the slot without invoking KIS orders', async () => {
+  const dueKey = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const blocked = JSON.parse(decisionContext(dueKey, []));
+  Object.assign(blocked, { candidates: [], holdings: [], account_aggregate: {}, risk_aggregate: {}, event_metadata: [] });
+  Object.assign(blocked, { status: 'blocked', fail_closed: true, error_class: 'intraday_decision_stale_or_missing' });
+  let orderRuns = 0;
+  let llmCalls = 0;
+  const value = await active({
+    decisionContextOutput: (slotId) => JSON.stringify({ ...blocked, slot_id: slotId }),
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id')) {
+        const taskId = args[args.indexOf('--task-id') + 1];
+        return callback(null, taskId === mod.TASKS[1].id
+          ? good(taskId, 'no_op', { action_type: 'no_candidates_no_op', api_calls: 0, order_api_calls: 0 })
+          : good(taskId));
+      }
+      if (args.includes('run-once')) orderRuns += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T00:10:00.000Z';
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:10:00Z');
+  await value.task.tick();
+  value.setClock('2026-07-21T00:15:00Z');
+
+  const after = await value.task.tick();
+
+  assert.equal(llmCalls, 0);
+  assert.equal(orderRuns, 0);
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.error_class, 'intraday_decision_stale_or_missing');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
 });
 
 test('one-minute safety monitor keeps supervision active and pauses only orders on a non-global block', async () => {
@@ -5151,7 +5260,7 @@ test('VPS daily loss blocks entries without pausing supervision or position mana
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = '2026-07-21T00:10:00.000Z';
+  const dueAt = '2026-07-21T00:15:00.000Z';
   const scheduled = value.task.status();
   for (const task of mod.TASKS) scheduled.tasks[task.id].next_run_at = '2026-07-21T23:59:00.000Z';
   scheduled.tasks[mod.TASKS[4].id].next_run_at = dueAt;
@@ -5202,7 +5311,7 @@ for (const entryBlock of ['daily_loss_limit_reached', 'daily_risk_budget_insuffi
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = '2026-07-21T00:10:00.000Z';
+  const dueAt = '2026-07-21T00:15:00.000Z';
   const scheduled = value.task.status();
   for (const task of mod.TASKS) scheduled.tasks[task.id].next_run_at = '2026-07-21T23:59:00.000Z';
   scheduled.tasks[mod.TASKS[4].id].next_run_at = dueAt;
@@ -5219,7 +5328,7 @@ for (const entryBlock of ['daily_loss_limit_reached', 'daily_risk_budget_insuffi
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.order_api_calls, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 0);
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
-  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:20:00\.000Z$/);
+  assert.match(state.tasks[mod.TASKS[4].id].next_run_at, /T00:25:00\.000Z$/);
 });
 
 test('MDD safety block performs one automatic risk-off reconciliation before persistent pause', async () => {
@@ -5347,6 +5456,8 @@ test('error policy preserves unknown safe classes without recovery and sanitizes
   assert.equal(mod.ERROR_POLICY.llm_candidate_decision_missing.orderRecovery, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.intraday_decision_stale_or_missing.resumable, true);
+  assert.equal(mod.ERROR_POLICY.intraday_decision_slot_expired.slotDegradeOnly, true);
+  assert.equal(mod.ERROR_POLICY.order_submission_unknown.persistent, true);
   assert.equal(mod.ERROR_POLICY.model_v3_backfill_transport_unavailable.slotDegradeOnly, true);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.transient, false);
   assert.equal(mod.ERROR_POLICY.llm_response_timeout.autoRepair, false);
@@ -5400,7 +5511,7 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   assert.equal(state.state, 'ACTIVE');
@@ -5408,7 +5519,7 @@ test('LLM timeout degrades one order slot without a same-slot order invocation',
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'llm_response_timeout');
   assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
   assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
-  const nextDueAt = new Date('2026-07-21T00:20:00Z');
+  const nextDueAt = new Date('2026-07-21T00:25:00Z');
   value.setClock(nextDueAt);
   const nextState = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: nextDueAt });
   assert.equal(nextState.state, 'ACTIVE');
@@ -5430,7 +5541,7 @@ test('one safe KIS order transport failure skips the slot and a consecutive fail
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
 
-  const firstDueAt = new Date('2026-07-21T00:10:00Z');
+  const firstDueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(firstDueAt);
   let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: firstDueAt });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -5445,12 +5556,43 @@ test('one safe KIS order transport failure skips the slot and a consecutive fail
   assert.equal(state.tasks[mod.TASKS[4].id].consecutive_transport_failures, 1);
   assert.equal(orderRuns, 1);
 
-  const secondDueAt = new Date('2026-07-21T00:20:00Z');
+  const secondDueAt = new Date('2026-07-21T00:25:00Z');
   value.setClock(secondDueAt);
   state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: secondDueAt });
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'timeout');
   assert.equal(orderRuns, 2);
+});
+
+test('KIS expired pre-submit slot is a no-retry no-op and leaves the order task active', async () => {
+  let runCalls = 0;
+  const blocked = orderGood('blocked', { error_class: 'intraday_decision_slot_expired' });
+  assert.equal(mod.parseKisVpsAutonomousOutput(blocked).errorClass, 'intraday_decision_slot_expired');
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('run-once')) {
+        runCalls += 1;
+        return callback(Object.assign(new Error('slot guard'), { code: 2 }), blocked);
+      }
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+
+  let state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.error_class, 'intraday_decision_slot_expired');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.no_same_slot_retry, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.fail_closed, false);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(runCalls, 1);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(mod.ERROR_POLICY.order_submission_unknown.persistent, true);
+  assert.equal(mod.ERROR_POLICY.reconciliation_status_active.persistent, true);
 });
 
 test('missing intraday decision degrades one slot without pausing the order task', async () => {
@@ -5460,7 +5602,7 @@ test('missing intraday decision degrades one slot without pausing the order task
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -5480,7 +5622,7 @@ test('invalid decision slot stays paused without automatic recovery or order exe
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   assert.equal(state.state, 'ACTIVE');
@@ -5568,7 +5710,7 @@ test('read-only reconciliation accepts no artifact while executable paths remain
 });
 
 test('blocked held positions permit a nullable daily reference without a daily artifact', () => {
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const context = JSON.parse(decisionContext(slotId));
   Object.assign(context.candidates[0], {
     role: 'held_position', review_tier: 'position', ml_action: 'BLOCK', data_quality: 'BLOCKED',
@@ -5623,7 +5765,7 @@ test('late decision-context transport result preserves a persistent pause', asyn
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -5702,7 +5844,7 @@ test('order execution timeout cannot approve a changed artifact contract', async
     callback(Object.assign(new Error('timed out'), { killed: true }), '');
   } });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   assert.equal(executions, 1);
@@ -5715,7 +5857,7 @@ test('order execution timeout cannot approve a changed artifact contract', async
 for (const invalidAction of [null, 'ENTER', 'REJECT']) {
 test(`held-position verdict ${invalidAction || 'missing'} degrades one slot without invoking KIS orders`, async () => {
   let orderRuns = 0;
-  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:10`;
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const held = JSON.parse(decisionContext(slotId, ['005930', '000660']));
   Object.assign(held.candidates[0], { role: 'held_position', review_tier: 'position' });
   held.holdings = [{ symbol: '005930', quantity: 2 }];
@@ -5729,7 +5871,7 @@ test(`held-position verdict ${invalidAction || 'missing'} degrades one slot with
     execFile(command, args, options, callback) { orderRuns += 1; callback(null, orderGood()); },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -5779,7 +5921,7 @@ test('approved reconciliation incident runs once and reactivates orders only aft
     reconciliation_status: 'active', error_class: 'reconciliation_status_active',
   }));
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -5792,7 +5934,7 @@ test('approved reconciliation incident runs once and reactivates orders only aft
   assert.equal(sent[0].components[0].components.length, 2);
   assert.match(sent[0].components[0].components[0].custom_id, /^kis-recovery:approve:[a-f0-9]{64}$/);
 
-  value.setClock('2026-07-21T00:11:00Z');
+  value.setClock('2026-07-21T00:16:00Z');
   const held = await value.task.tick();
   assert.equal(held.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(held.incidents[incident.incident_id].status, 'awaiting_approval');
@@ -5831,7 +5973,7 @@ test('order not fully filled uses the existing reconciliation recovery buttons',
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
 
   const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
@@ -5904,7 +6046,7 @@ test('incident recovery stays paused when reconciliation attempts an order submi
     reconciliation_status: 'active', error_class: 'reconciliation_status_active',
   }));
   fs.writeFileSync(value.paths.statePath, JSON.stringify(before));
-  const dueAt = new Date('2026-07-21T00:10:00Z');
+  const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   const incident = Object.values(paused.incidents)
@@ -5940,8 +6082,8 @@ async function pendingRecoveryFixture(options = {}) {
     },
   });
   await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
-  value.setClock('2026-07-21T00:10:00Z');
-  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:10:00Z') });
+  value.setClock('2026-07-21T00:15:00Z');
+  const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   const incident = Object.values(paused.incidents).find((entry) => entry.error_class === 'preflight_or_reconciliation_invalid');
   assert.ok(incident);
   return { ...value, sent, incident, calls: () => ({ recoveryCalls, orderRuns }), approve: () => value.task.approveIncident({
@@ -5955,14 +6097,14 @@ test('approved read-only recovery waits for later ticks and is bounded to three 
   assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
   await value.task.tick();
   assert.equal(value.calls().recoveryCalls, 1);
-  value.setClock('2026-07-21T00:11:00Z');
+  value.setClock('2026-07-21T00:16:00Z');
   await value.task.tick();
   assert.equal(value.calls().recoveryCalls, 2);
-  value.setClock('2026-07-21T00:12:00Z');
+  value.setClock('2026-07-21T00:17:00Z');
   const state = await value.task.tick();
   assert.equal(state.incidents[value.incident.incident_id].status, 'escalated');
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
-  value.setClock('2026-07-21T00:13:00Z');
+  value.setClock('2026-07-21T00:18:00Z');
   await value.task.tick();
   assert.deepEqual(value.calls(), { recoveryCalls: 3, orderRuns: 1 });
   assert.equal(value.sent.filter((message) => message.content.includes('[KIS 복구]')).length, 1);
@@ -5981,7 +6123,7 @@ test('successful reconciliation is checkpointed before a transient safety failur
   assert.equal(waiting.status, 'waiting_recheck');
   assert.equal(waiting.reconciliation_verified, true);
   safetyBlocked = false;
-  value.setClock('2026-07-21T00:11:00Z');
+  value.setClock('2026-07-21T00:16:00Z');
   const resumed = await value.task.tick();
   assert.equal(resumed.incidents[value.incident.incident_id].status, 'resolved');
   assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'ACTIVE');
@@ -6139,7 +6281,7 @@ test('unknown or inconsistent evidence never schedules an automatic recheck', as
   for (const recoveryReason of ['reconciliation_evidence_invalid', 'reconciliation_quantity_mismatch', 'reconciliation_auth_failed']) {
     const value = await pendingRecoveryFixture({ recoveryReason });
     await assert.rejects(value.approve(), new RegExp(recoveryReason));
-    value.setClock('2026-07-21T00:11:00Z');
+    value.setClock('2026-07-21T00:16:00Z');
     await value.task.tick();
     assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 });
     assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
@@ -6185,7 +6327,7 @@ test('recovery subprocess protocol failures are classified without retries or or
       stderr_usage: /(?:^|\n)usage:\s/im.test(stderr),
     }, name);
     for (const raw of [stdout, stderr]) if (raw) assert.equal(JSON.stringify(incident).includes(raw), false, name);
-    value.setClock('2026-07-21T00:11:00Z');
+    value.setClock('2026-07-21T00:16:00Z');
     await value.task.tick();
     assert.deepEqual(value.calls(), { recoveryCalls: 1, orderRuns: 1 }, name);
     assert.equal(value.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED', name);
@@ -6265,7 +6407,7 @@ test('expired and changed approvals stop rechecking without executing recovery',
       state.tasks[mod.TASKS[4].id].pause_reason = 'order_submission_unknown';
       fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
     }
-    value.setClock(changed ? '2026-07-21T00:11:00Z' : '2026-07-21T00:21:00Z');
+    value.setClock(changed ? '2026-07-21T00:16:00Z' : '2026-07-21T00:26:00Z');
     const state = await value.task.tick();
     assert.equal(state.incidents[value.incident.incident_id].status, changed ? 'stale' : 'escalated');
     assert.equal(value.calls().recoveryCalls, 1);
@@ -6286,7 +6428,7 @@ test('concurrent recovery clicks cannot execute twice and ticks wait for recover
 test('denied incident prevents unattended order reactivation', async () => {
   const value = await pendingRecoveryFixture();
   value.task.denyIncident({ incidentId: value.incident.incident_id, denial: `복구 거절 ${value.incident.incident_id}` });
-  value.setClock('2026-07-21T00:11:00Z');
+  value.setClock('2026-07-21T00:16:00Z');
   const state = await value.task.tick();
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.deepEqual(value.calls(), { recoveryCalls: 0, orderRuns: 1 });
@@ -6314,7 +6456,7 @@ test('checkpoint is restartable before safety begins and restart skips broker re
   const restarted = mod.createKisAiMarketOpenDryRunTask({
     ...value.paths,
     enforceSchedulerOwnership: false,
-    now: () => new Date('2026-07-21T00:11:00Z'),
+    now: () => new Date('2026-07-21T00:16:00Z'),
     runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
     runtimeHealthCheck: async () => true,
     sourceParityCheck: () => true,
