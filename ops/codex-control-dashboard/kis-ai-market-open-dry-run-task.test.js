@@ -824,6 +824,141 @@ test('delayed post-close learning retains the canonical due key without a same-d
   assert.equal(after.tasks[mod.TASKS[2].id].last_due_at, observedDueKey);
 });
 
+test('supervisor safety completion at 09:01 dispatches the original 09:00 slot once', async () => {
+  let value;
+  let supervisorRuns = 0;
+  value = await active({
+    schedulerRegistered: true,
+    onExec: ({ args }) => {
+      if (args.includes('ai-market-open-dry-run-once') && args.includes(mod.TASKS[0].id)) supervisorRuns += 1;
+    },
+    safetyOutput() {
+      value.setClock('2026-07-21T00:01:00Z');
+      return safetyOutput();
+    },
+  });
+  supervisorRuns = 0;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-21T00:00:00.000Z';
+  for (const task of mod.TASKS.slice(1)) state.tasks[task.id].next_run_at = '2026-07-22T00:00:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:00:00Z');
+
+  const after = await value.task.tick();
+  const supervisor = after.tasks[mod.TASKS[0].id];
+  assert.equal(supervisorRuns, 1);
+  assert.equal(supervisor.last_due_at, `${mod.TASKS[0].id}:2026-07-21:09:00`);
+  assert.equal(supervisor.last_run.started_at, '2026-07-21T00:01:00.000Z');
+  await value.task.tick();
+  assert.equal(supervisorRuns, 1);
+});
+
+test('supervisor does not start at or after 09:10', async () => {
+  let value;
+  let supervisorRuns = 0;
+  value = await active({
+    schedulerRegistered: true,
+    onExec: ({ args }) => {
+      if (args.includes('ai-market-open-dry-run-once') && args.includes(mod.TASKS[0].id)) supervisorRuns += 1;
+    },
+    safetyOutput() {
+      value.setClock('2026-07-21T00:10:00Z');
+      return safetyOutput();
+    },
+  });
+  supervisorRuns = 0;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-21T00:00:00.000Z';
+  for (const task of mod.TASKS.slice(1)) state.tasks[task.id].next_run_at = '2026-07-22T00:00:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:00:00Z');
+
+  const after = await value.task.tick();
+  const supervisor = after.tasks[mod.TASKS[0].id];
+  assert.equal(supervisorRuns, 0);
+  assert.equal(supervisor.last_run.action_type, 'missed_window_no_op');
+  assert.equal(supervisor.last_due_at, null);
+});
+
+test('safety completion after an order slot does not enable delayed order dispatch', async () => {
+  let value;
+  let orderRuns = 0;
+  value = await active({
+    schedulerRegistered: true,
+    onExec: ({ args }) => {
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) orderRuns += 1;
+    },
+    safetyOutput() {
+      value.setClock('2026-07-21T00:16:00Z');
+      return safetyOutput();
+    },
+  });
+  markOrderActive(value);
+  const state = value.task.status();
+  for (const task of mod.TASKS.slice(0, 4)) state.tasks[task.id].next_run_at = '2026-07-22T00:00:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:15:00Z');
+
+  const after = await value.task.tick();
+  assert.equal(orderRuns, 0);
+  assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_window_no_op');
+  assert.equal(after.tasks[mod.TASKS[4].id].last_due_at, null);
+});
+
+for (const scenario of [
+  { name: 'previous date', scheduledAt: '2026-07-20T00:00:00.000Z', invokedAt: '2026-07-21T00:01:00Z' },
+  { name: 'weekend', scheduledAt: '2026-07-25T00:00:00.000Z', invokedAt: '2026-07-25T00:01:00Z' },
+  { name: 'officially closed session', scheduledAt: '2026-07-21T00:00:00.000Z', invokedAt: '2026-07-21T00:01:00Z', isTradingDay: false },
+]) test(`supervisor delayed start rejects ${scenario.name}`, async () => {
+  let runs = 0;
+  let closed = false;
+  const value = await active({
+    calendarProofResolver: () => calendarProof(!closed),
+    onExec: ({ args }) => {
+      if (args.includes('ai-market-open-dry-run-once') && args.includes(mod.TASKS[0].id)) runs += 1;
+    },
+  });
+  runs = 0;
+  closed = scenario.isTradingDay === false;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = scenario.scheduledAt;
+  for (const task of mod.TASKS.slice(1)) state.tasks[task.id].next_run_at = '2026-07-27T00:00:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(scenario.invokedAt);
+
+  const after = await value.task.tick();
+  assert.equal(runs, 0);
+  assert.equal(after.tasks[mod.TASKS[0].id].last_run.action_type, 'missed_window_no_op');
+  assert.equal(after.tasks[mod.TASKS[0].id].last_due_at, null);
+});
+
+test('an async supervisor attempt crossing 09:10 is not replayed for the same due key', async () => {
+  let runs = 0;
+  let value;
+  value = await active({ execFile(c, args, o, cb) {
+    if (args.includes('--task-id') && args.includes(mod.TASKS[0].id)) {
+      runs += 1;
+      value.setClock('2026-07-21T00:10:00Z');
+      return cb(null, good(mod.TASKS[0].id, 'no_op', {
+        action_type: 'transport_degraded_no_op', error_class: 'http_transport_failed',
+        transport_degraded: true, failure_phase: 'open_orders_read_request',
+        failure_exception_type: 'HTTPError', failure_errno: 500, failure_attempt_number: 1,
+      }));
+    }
+    cb(null, good(args[args.indexOf('--task-id') + 1]));
+  } });
+  value.setClock('2026-07-21T00:09:00Z');
+  let after = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:09:00Z') });
+  assert.equal(runs, 1);
+  assert.equal(after.tasks[mod.TASKS[0].id].last_due_at, `${mod.TASKS[0].id}:2026-07-21:09:00`);
+  assert.equal(after.tasks[mod.TASKS[0].id].last_run.started_at, '2026-07-21T00:09:00.000Z');
+  assert.equal(after.tasks[mod.TASKS[0].id].last_run.completed_at, '2026-07-21T00:10:00.000Z');
+  value.setClock('2026-07-21T00:11:00Z');
+  after = await value.task.runOnce({ taskId: mod.TASKS[0].id, dueAt: new Date('2026-07-21T00:11:00Z') });
+  assert.equal(runs, 1);
+  assert.equal(after.tasks[mod.TASKS[0].id].last_due_at, `${mod.TASKS[0].id}:2026-07-21:09:00`);
+});
+
 for (const scenario of [
   { name: 'disabled order task', orderState: 'DISABLED', completedAt: '2026-07-21T07:22:09.000Z', refresh: true },
   { name: 'paused order task', orderState: 'PAUSED', completedAt: '2026-07-21T07:22:09.000Z', refresh: true },

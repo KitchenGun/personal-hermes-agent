@@ -408,14 +408,16 @@ function isDue(task, date) {
     && task.minutes.includes((Number(parts.hour) * 60) + Number(parts.minute));
 }
 
-function isDelayedPostCloseStart(task, scheduledAt, invokedAt, calendarProofResolver) {
-  if (![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id) || !isDue(task, scheduledAt)
+function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResolver) {
+  const supervisorStart = task.id === TASKS[0].id;
+  if ((!supervisorStart && ![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id)) || !isDue(task, scheduledAt)
     || (task.id === ORDER_TASK.id && !isPostCloseRefreshSlot(task, scheduledAt))) return false;
   const scheduled = seoulParts(scheduledAt);
   const invoked = seoulParts(invokedAt);
   const invokedMinute = (Number(invoked.hour) * 60) + Number(invoked.minute);
   if (scheduled.year !== invoked.year || scheduled.month !== invoked.month || scheduled.day !== invoked.day
-    || invokedMinute < 980 || invokedMinute >= 1070) return false;
+    || invokedMinute < (supervisorStart ? 540 : 980)
+    || invokedMinute >= (supervisorStart ? 550 : 1070)) return false;
   try {
     return calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`)?.isTradingDay === true;
   } catch {
@@ -2956,9 +2958,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
     const scheduled = new Date(taskState.next_run_at || 0);
-    const delayedPostCloseStart = !sameMinute(taskState.next_run_at, dueTime)
-      && isDelayedPostCloseStart(task, scheduled, dueTime, calendarProofResolver);
-    const scheduledDueTime = delayedPostCloseStart ? scheduled : dueTime;
+    const delayedNonOrderStart = !sameMinute(taskState.next_run_at, dueTime)
+      && isDelayedNonOrderStart(task, scheduled, now(), calendarProofResolver);
+    const scheduledDueTime = delayedNonOrderStart ? scheduled : dueTime;
     if (!isDue(task, scheduledDueTime) || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
       if (scheduled.getTime() < dueTime.getTime()) {
         const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
@@ -3239,7 +3241,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const refreshDueKey = dueKey(ORDER_TASK, scheduledDueTime);
         const scheduledRefreshConsumed = liveOrderTask.last_due_at === refreshDueKey
           || liveOrderTask.pending_invocation?.due_key === refreshDueKey;
-        if (isDelayedPostCloseStart(ORDER_TASK, scheduledDueTime, refreshDispatchAt, calendarProofResolver)
+        if (isDelayedNonOrderStart(ORDER_TASK, scheduledDueTime, refreshDispatchAt, calendarProofResolver)
           && refreshDispatchTradeDate === officialTradeDate
           && !scheduledRefreshConsumed && liveOrderTask.state !== 'ACTIVE') {
           const refresh = await execute(buildIndependentShadowRefreshCommand());
