@@ -1071,7 +1071,7 @@ test('post-close shadow refresh reuses the existing order task and never invokes
   assert.equal(Object.keys(after.tasks).length, 5);
 });
 
-test('post-close backfill transport failure defers refresh without pausing or retrying', async () => {
+test('independent provider post-close refresh transport no-op preserves the next intraday slot', async () => {
   let refreshRuns = 0;
   const value = await active({
     shadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
@@ -1095,12 +1095,127 @@ test('post-close backfill transport failure defers refresh without pausing or re
   assert.equal(after.state, 'ACTIVE');
   assert.equal(orderTask.state, 'ACTIVE');
   assert.equal(orderTask.pending_invocation, null);
-  assert.equal(orderTask.refresh_only_pending, true);
+  assert.equal(orderTask.refresh_only_pending, false);
   assert.equal(orderTask.last_run.action_type, 'transport_degraded_no_op');
   assert.equal(orderTask.last_run.error_class, 'model_v3_backfill_transport_unavailable');
   assert.equal(orderTask.last_run.fail_closed, false);
   assert.equal(orderTask.last_run.no_same_slot_retry, true);
+  assert.equal(orderTask.next_run_at, '2026-07-22T00:15:00.000Z');
+});
+
+test('legacy provider post-close refresh transport no-op remains refresh-only', async () => {
+  let refreshRuns = 0;
+  const value = await active({
+    shadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    shadowRefreshOutput: orderGood('blocked', {
+      error_class: 'model_v3_backfill_transport_unavailable', artifact_hash: null,
+    }),
+    onShadowRefresh() { refreshRuns += 1; },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const current = value.task.status();
+  Object.assign(current.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
+  current.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T07:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+  const due = new Date('2026-07-21T07:20:00.000Z');
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: due });
+  const orderTask = after.tasks[mod.TASKS[4].id];
+
+  assert.equal(refreshRuns, 1);
+  assert.equal(orderTask.state, 'ACTIVE');
+  assert.equal(orderTask.refresh_only_pending, true);
+  assert.equal(orderTask.last_run.action_type, 'transport_degraded_no_op');
   assert.equal(orderTask.next_run_at, '2026-07-22T07:20:00.000Z');
+});
+
+test('active independent stale refresh latch normalizes to the next order slot without dispatch', async () => {
+  let llmCalls = 0;
+  let orderRuns = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
+    onExec({ args }) {
+      if (args.includes('vps-autonomous-order') && !args.includes('safety-monitor')) orderRuns += 1;
+    },
+  });
+  const state = value.task.status();
+  state.order_activated_at = '2026-07-21T00:00:00.000Z';
+  const orderTask = state.tasks[mod.TASKS[4].id];
+  orderTask.state = 'ACTIVE';
+  orderTask.activation_artifact_hash = 'a'.repeat(64);
+  orderTask.refresh_only_pending = true;
+  orderTask.next_run_at = '2026-07-22T07:20:00.000Z';
+  orderTask.last_run = {
+    status: 'no_op', action_type: 'transport_degraded_no_op',
+    error_class: 'model_v3_backfill_transport_unavailable', fail_closed: false,
+    no_same_slot_retry: true, order_api_calls: 0, vps_live_orders: 0, reconciliations: 0,
+  };
+  const originalNoOp = { ...orderTask.last_run };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:01:00Z');
+
+  const normalized = await value.task.tick();
+  const after = normalized.tasks[mod.TASKS[4].id];
+
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(after.refresh_only_pending, false);
+  assert.equal(after.next_run_at, '2026-07-21T00:15:00.000Z');
+  assert.deepEqual(after.last_run, originalNoOp);
+  assert.equal(llmCalls, 0);
+  assert.equal(orderRuns, 0);
+});
+
+test('stale latch normalization does not enable paused or disabled order tasks', async () => {
+  for (const taskState of ['PAUSED', 'DISABLED']) {
+    const value = await active({ schedulerRegistered: true });
+    const state = value.task.status();
+    const orderTask = state.tasks[mod.TASKS[4].id];
+    orderTask.state = taskState;
+    orderTask.refresh_only_pending = true;
+    orderTask.next_run_at = taskState === 'PAUSED' ? null : '2026-07-22T07:20:00.000Z';
+    if (taskState === 'PAUSED') orderTask.pause_reason = 'operator_hold';
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock('2026-07-21T00:01:00Z');
+
+    const after = await value.task.tick();
+
+    assert.equal(after.tasks[mod.TASKS[4].id].state, taskState);
+    assert.equal(after.tasks[mod.TASKS[4].id].refresh_only_pending, true);
+    assert.equal(after.tasks[mod.TASKS[4].id].next_run_at, orderTask.next_run_at);
+  }
+});
+
+test('stale latch normalization requires exact independent attestation and clear safety', async () => {
+  for (const block of ['legacy_attestation', 'safety']) {
+    const value = await active({
+      schedulerRegistered: true,
+      ...(block === 'safety' ? { safetyOutput: safetyOutput('blocked', { process_lock: 'active' }) } : {}),
+    });
+    const state = value.task.status();
+    state.order_activated_at = '2026-07-21T00:00:00.000Z';
+    const orderTask = state.tasks[mod.TASKS[4].id];
+    orderTask.state = 'ACTIVE';
+    orderTask.activation_artifact_hash = 'a'.repeat(64);
+    orderTask.refresh_only_pending = true;
+    orderTask.next_run_at = '2026-07-22T07:20:00.000Z';
+    if (block === 'legacy_attestation') Object.assign(orderTask, LEGACY_INTRADAY_ATTESTATION);
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock('2026-07-21T00:01:00Z');
+
+    const after = await value.task.tick();
+    const result = after.tasks[mod.TASKS[4].id];
+
+    assert.equal(result.refresh_only_pending, true);
+    if (block === 'legacy_attestation') {
+      assert.equal(result.state, 'ACTIVE');
+      assert.equal(result.next_run_at, '2026-07-22T07:20:00.000Z');
+    } else {
+      assert.equal(result.state, 'PAUSED');
+      assert.equal(result.pause_reason, 'safe_block');
+    }
+  }
 });
 
 test('post-close refresh command is attested and exposes no order approval', () => {
@@ -1119,6 +1234,7 @@ test('invalid legacy 16:40 refresh slot recovers only into the next attested 16:
     }),
   });
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'scheduled_shadow_refresh_slot_invalid';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -1510,6 +1626,7 @@ test('post-close refresh failure waits for the next refresh slot without enablin
     },
   });
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_shadow_batch_failed';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -1553,6 +1670,7 @@ test('refresh-only recovery survives an expired refresh window and restart witho
     onShadowRefresh() { shadowRuns += 1; },
   });
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_shadow_batch_failed';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -1599,6 +1717,7 @@ test('post-close waiting recovery refuses to rotate the attested artifact', asyn
     }),
   });
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_shadow_batch_failed';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -1615,6 +1734,7 @@ test('post-close waiting recovery refuses to rotate the attested artifact', asyn
 test('activation check success cannot clear an existing refresh-only marker', async () => {
   const value = await active();
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_shadow_batch_failed';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -1752,7 +1872,7 @@ test('legacy autonomous runtime pause requires exact approved activation before 
   assert.equal(recovered.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
 });
 
-test('global recovery preserves a disabled failed refresh for the next post-close slot', async () => {
+test('legacy provider recovery preserves a disabled failed refresh for the next post-close slot', async () => {
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
     activationCheckOutput: orderGood('blocked', {
@@ -1765,6 +1885,7 @@ test('global recovery preserves a disabled failed refresh for the next post-clos
   recovered.tasks[mod.TASKS[4].id].next_run_at = null;
   recovered.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
   recovered.tasks[mod.TASKS[4].id].refresh_only_pending = false;
+  Object.assign(recovered.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   recovered.tasks[mod.TASKS[4].id].last_run = {
     status: 'blocked', error_class: 'model_v3_shadow_execution_failed', fail_closed: true,
   };
@@ -1781,7 +1902,7 @@ test('global recovery preserves a disabled failed refresh for the next post-clos
   assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
 });
 
-test('recovered post-close failure arms refresh-only activation from canonical evidence', async () => {
+test('independent provider does not activate when activation preflight reports missing daily batch', async () => {
   const value = await active({
     activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
     activationCheckOutput: orderGood('blocked', {
@@ -1805,14 +1926,42 @@ test('recovered post-close failure arms refresh-only activation from canonical e
   fs.writeFileSync(value.paths.statePath, JSON.stringify(recovered));
   value.setClock('2026-07-21T07:50:00Z');
 
-  const state = await value.task.enableOrderTask({
+  await assert.rejects(value.task.enableOrderTask({
     confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
-  });
+  }), /model_v3_prediction_batch_incomplete/);
+  const after = value.task.status().tasks[mod.TASKS[4].id];
+  assert.equal(after.state, 'DISABLED');
+  assert.equal(after.refresh_only_pending, false);
+  assert.notEqual(after.last_run?.action_type, 'activation_waiting_post_close');
+});
 
-  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
-  assert.equal(state.tasks[mod.TASKS[4].id].refresh_only_pending, true);
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_waiting_post_close');
-  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, '2026-07-22T07:20:00.000Z');
+test('independent paused or disabled order stays blocked on incomplete activation preflight', async () => {
+  for (const taskState of ['PAUSED', 'DISABLED']) {
+    const value = await active({
+      activationCheckError: Object.assign(new Error('blocked'), { code: 2 }),
+      activationCheckOutput: orderGood('blocked', {
+        error_class: 'model_v3_prediction_batch_incomplete',
+      }),
+    });
+    const state = value.task.status();
+    const order = state.tasks[mod.TASKS[4].id];
+    order.state = taskState;
+    order.pause_reason = taskState === 'PAUSED' ? 'model_v3_shadow_batch_failed' : undefined;
+    order.next_run_at = null;
+    order.activation_artifact_hash = 'a'.repeat(64);
+    order.refresh_only_pending = true;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock('2026-07-21T07:50:00Z');
+
+    await assert.rejects(value.task.enableOrderTask({
+      confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL,
+    }), /model_v3_prediction_batch_incomplete/);
+    const after = value.task.status().tasks[mod.TASKS[4].id];
+    assert.equal(after.state, taskState);
+    assert.equal(after.refresh_only_pending, true);
+    assert.equal(after.next_run_at, null);
+    assert.notEqual(after.last_run?.action_type, 'activation_waiting_post_close');
+  }
 });
 
 test('provider cutover is blocked while a refresh-only gate is pending', async () => {
@@ -1845,6 +1994,7 @@ test('refresh-only recovery stays refresh-only after a market-closed no-op', asy
     }),
   });
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
   paused.tasks[mod.TASKS[4].id].pause_reason = 'model_v3_shadow_batch_failed';
   paused.tasks[mod.TASKS[4].id].next_run_at = null;
@@ -3492,6 +3642,7 @@ test('partial IO resume never overwrites a concurrent scheduler state change', a
 test('exact IO resume preserves a post-close shadow refresh without enabling orders', async () => {
   const value = await active();
   const paused = value.task.status();
+  Object.assign(paused.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
   paused.state = 'PAUSED'; paused.pause_reason = 'process_error';
   paused.last_error_notification = {
     task_id: mod.TASKS[2].id,
@@ -3920,7 +4071,7 @@ print(json.dumps(scope['message']))
   const scope = {
     trade_date: '2026-07-21', trade_text: '없음', holding_text: '없음',
     pnl_text: '0원 (매도 체결 없음)', operating_text: '정상',
-    counts: { decisions: 3, trained_runs: 1, scheduled_promotions: 0 },
+    counts: { decisions: 3, trained_runs: 1, scheduled_promotions: 0, incidents: 2 },
   };
   const python = process.env.KIS_REPORT_TEST_PYTHON || 'python3';
   const stdout = await new Promise((resolve, reject) => execFile(python,
@@ -3931,6 +4082,8 @@ print(json.dumps(scope['message']))
   const parsed = mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
     decisions: 3, report_message: message,
   }), mod.TASKS[3].id, () => calendarProof());
+  assert.equal(message.split('\n')[5], '모델 출력: 3건 / 학습 1회 / 모델 승격 예정 0회');
+  assert.equal(message.split('\n')[6], '수집·학습 기록: 오류 2건');
   assert.equal(parsed.reportMessage, message);
 });
 
@@ -3960,6 +4113,36 @@ test('daily report validates current learning counts and preserves legacy compat
   ]) {
     assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
       decisions: 3, report_message: report.replace(currentLine, line),
+    }), mod.TASKS[3].id, () => calendarProof()), /invalid_report_message/);
+  }
+});
+
+test('daily report accepts the bounded model-output and incident-count format', () => {
+  const message = report
+    .replace('AI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회', '모델 출력: 3건 / 학습 1회 / 모델 승격 예정 0회')
+    .replace('운영 상태: 정상', '수집·학습 기록: 오류 2건');
+  const parsed = mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
+    decisions: 3, report_message: message,
+  }), mod.TASKS[3].id, () => calendarProof());
+  assert.equal(parsed.reportMessage, message);
+});
+
+test('daily report rejects malformed new-format counts and line placement', () => {
+  const valid = report
+    .replace('AI 검증: 판단 3건 / 학습 1회 / 모델 승격 예정 0회', '모델 출력: 3건 / 학습 1회 / 모델 승격 예정 0회')
+    .replace('운영 상태: 정상', '수집·학습 기록: 오류 0건');
+  for (const [from, to] of [
+    ['오류 0건', '오류 -1건'],
+    ['오류 0건', '오류 1.5건'],
+    ['오류 0건', '오류 9007199254740992건'],
+    ['모델 출력: 3건', '모델 출력: 4건'],
+    ['모델 승격 예정 0회', '모델 승격 예정 9007199254740992회'],
+    ['학습 1회 / 모델 승격 예정 0회', '학습 0회 / 모델 승격 예정 1회'],
+    ['수집·학습 기록: 오류 0건', '수집 기록: 오류 0건'],
+  ]) {
+    const malformed = valid.replace(from, to);
+    assert.throws(() => mod.parseKisAiMarketOpenOutput(good(mod.TASKS[3].id, 'report_ready', {
+      decisions: 3, report_message: malformed,
     }), mod.TASKS[3].id, () => calendarProof()), /invalid_report_message/);
   }
 });
@@ -6183,6 +6366,11 @@ async function pendingRecoveryFixture(options = {}) {
   const paused = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
   const incident = Object.values(paused.incidents).find((entry) => entry.error_class === 'preflight_or_reconciliation_invalid');
   assert.ok(incident);
+  if (options.legacyProvider === true) {
+    const state = value.task.status();
+    Object.assign(state.tasks[mod.TASKS[4].id], LEGACY_INTRADAY_ATTESTATION);
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  }
   return { ...value, sent, incident, calls: () => ({ recoveryCalls, orderRuns }), approve: () => value.task.approveIncident({
     incidentId: incident.incident_id, approval: `복구 승인 ${incident.incident_id}`, invokedBy: 'discord:operator',
   }) };
@@ -6232,6 +6420,7 @@ test('post-close checkpoint completion uses refresh-only activation without brok
   let safetyCalls = 0;
   let activationCheckOutput = orderGood('success', { action_type: 'activation_check' });
   const value = await pendingRecoveryFixture({
+    legacyProvider: true,
     safetyOutput: () => { safetyCalls += 1; return safetyOutput(); },
     activationCheckOutput: () => activationCheckOutput,
   });
@@ -6348,6 +6537,7 @@ test('checkpoint completion rejects wrong incidents and unresolved broker eviden
 test('a fifth approval is denied after one checkpoint completion reapproval', async () => {
   let activationCheckOutput = orderGood('success', { action_type: 'activation_check' });
   const value = await pendingRecoveryFixture({
+    legacyProvider: true,
     activationCheckOutput: () => activationCheckOutput,
   });
   activationCheckOutput = orderGood('blocked', {
