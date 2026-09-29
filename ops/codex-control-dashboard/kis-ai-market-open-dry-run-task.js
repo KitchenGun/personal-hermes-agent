@@ -132,6 +132,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['llm_candidate_decision_missing', { slotDegradeOnly: true, orderRecovery: true }],
   ['llm_held_position_action_invalid', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
+  ['intraday_decision_slot_expired', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_slot_invalid', { persistent: true, orderRecovery: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
@@ -269,8 +270,8 @@ const TASKS = Object.freeze([
   {
     id: 'kis-vps-model-v3-autonomous-pilot-v1',
     kind: 'order',
-    schedule: 'weekdays 09:10-14:40 KST every 10m; deterministic risk-off 14:41-14:42 KST; shadow refresh 16:20 KST',
-    minutes: [...Array.from({ length: 34 }, (_, i) => 550 + (i * 10)), 881, 882, 980],
+    schedule: 'weekdays 09:15-14:35 KST every 10m; deterministic risk-off 14:41-14:42 KST; shadow refresh 16:20 KST',
+    minutes: [...Array.from({ length: 33 }, (_, i) => 555 + (i * 10)), 881, 882, 980],
   },
 ]);
 const TASK_BY_ID = new Map(TASKS.map((task) => [task.id, task]));
@@ -3254,7 +3255,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const slot = seoulParts(scheduledDueTime);
       const horizonExitOrderSlot = task.kind === 'order'
         && Number(slot.hour) === 14
-        && Number(slot.minute) >= 40
+        && Number(slot.minute) >= 41
         && Number(slot.minute) <= 42;
       const entryCutoffReached = task.kind === 'order'
         && (Number(slot.hour) > 14 || (Number(slot.hour) === 14 && Number(slot.minute) >= 30));
@@ -3411,7 +3412,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && !postCloseRefresh
         && parsed.status === 'blocked'
         && parsed.failClosed
-        && ['llm_position_decision_missing', 'llm_candidate_decision_missing', 'llm_held_position_action_invalid']
+        && ['llm_position_decision_missing', 'llm_candidate_decision_missing', 'llm_held_position_action_invalid', 'intraday_decision_slot_expired']
           .includes(parsed.errorClass)
         && ERROR_POLICY[parsed.errorClass]?.slotDegradeOnly === true
         && parsed.orderApiCalls === 0
@@ -3710,6 +3711,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
       const time = now();
+      const orderTaskState = current.tasks[ORDER_TASK.id];
+      const persistedOrderSlot = orderTaskState?.next_run_at && new Date(orderTaskState.next_run_at);
+      if (orderTaskState?.state === 'ACTIVE' && persistedOrderSlot && !Number.isNaN(persistedOrderSlot.getTime())
+        && isDue(INTRADAY_SHADOW_TASK, persistedOrderSlot) && !isDue(ORDER_TASK, persistedOrderSlot)) {
+        const shiftedSlot = new Date(persistedOrderSlot.getTime() + (5 * 60_000));
+        const nextOrderSlot = isDue(ORDER_TASK, shiftedSlot) && shiftedSlot.getTime() > time.getTime()
+          ? shiftedSlot.toISOString()
+          : nextRunAt(ORDER_TASK, time);
+        current = save({ ...current, tasks: { ...current.tasks, [ORDER_TASK.id]: {
+          ...orderTaskState, schedule: ORDER_TASK.schedule, next_run_at: nextOrderSlot,
+        } } });
+      }
       const pausedOrder = current.tasks?.[ORDER_TASK.id];
       if (pausedOrder?.state === 'PAUSED'
         && pausedOrder.pause_reason === 'order_not_fully_filled'
