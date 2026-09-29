@@ -471,6 +471,10 @@ function fixture(options = {}) {
   const execFile = (command, args, execOptions, callback) => {
     if (typeof options.onExec === 'function') options.onExec({ command, args, execOptions });
     if (args.includes('safety-monitor')) {
+      if (typeof options.onSafetyMonitor === 'function') {
+        options.onSafetyMonitor({ command, args, execOptions, callback });
+        return;
+      }
       callback(options.safetyError || null, typeof options.safetyOutput === 'function'
         ? options.safetyOutput()
         : options.safetyOutput || safetyOutput());
@@ -5221,6 +5225,191 @@ test('one-minute safety monitor keeps supervision active and pauses only orders 
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'safe_block');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
+});
+
+test('delayed healthy safety monitor preserves a concurrent approved order activation', async () => {
+  let releaseMonitor;
+  let monitorStarted;
+  const started = new Promise((resolve) => { monitorStarted = resolve; });
+  const value = await active({
+    schedulerRegistered: true,
+    onSafetyMonitor({ callback }) {
+      monitorStarted();
+      releaseMonitor = () => callback(null, safetyOutput());
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const ticking = value.task.tick();
+  await started;
+
+  const activated = await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  assert.equal(activated.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  releaseMonitor();
+
+  const state = await ticking;
+  const stored = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(stored.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(stored.order_activated_at, activated.order_activated_at);
+  assert.equal(stored.tasks[mod.TASKS[4].id].last_run.action_type, 'activation_check');
+});
+
+test('delayed blocked safety monitor pauses a concurrently activated order task', async () => {
+  let releaseMonitor;
+  let monitorStarted;
+  const started = new Promise((resolve) => { monitorStarted = resolve; });
+  const value = await active({
+    schedulerRegistered: true,
+    onSafetyMonitor({ callback }) {
+      monitorStarted();
+      releaseMonitor = () => callback(null, safetyOutput('blocked', { open_order_status: 'active' }));
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const ticking = value.task.tick();
+  await started;
+  const activated = await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  releaseMonitor();
+
+  const state = await ticking;
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[4].id].pause_reason, 'safe_block');
+  assert.equal(state.order_activated_at, activated.order_activated_at);
+});
+
+test('delayed healthy safety monitor preserves latest pause, incident, and pending invocation', async () => {
+  let releaseMonitor;
+  let monitorStarted;
+  const started = new Promise((resolve) => { monitorStarted = resolve; });
+  const value = await active({
+    schedulerRegistered: true,
+    onSafetyMonitor({ callback }) {
+      monitorStarted();
+      releaseMonitor = () => callback(null, safetyOutput());
+    },
+  });
+  value.setClock('2026-07-21T00:01:00Z');
+  const ticking = value.task.tick();
+  await started;
+  const latest = value.task.status();
+  latest.state = 'PAUSED';
+  latest.pause_reason = 'safety_monitor_failed';
+  latest.tasks[mod.TASKS[4].id].pending_invocation = { token_hash: 'latest-pending' };
+  latest.incidents.latest = { incident_id: 'latest', status: 'awaiting_approval' };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(latest));
+  releaseMonitor();
+
+  const state = await ticking;
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, 'safety_monitor_failed');
+  assert.deepEqual(state.tasks[mod.TASKS[4].id].pending_invocation, { token_hash: 'latest-pending' });
+  assert.deepEqual(state.incidents.latest, { incident_id: 'latest', status: 'awaiting_approval' });
+});
+
+test('same-minute safety monitor check remains deduplicated', async () => {
+  let safetyCalls = 0;
+  const value = await active({ schedulerRegistered: true, safetyOutput() { safetyCalls += 1; return safetyOutput(); } });
+  const current = value.task.status();
+  current.last_safety_monitor = { checked_at: '2026-07-21T00:01:42.000Z', status: 'success' };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(current));
+  value.setClock('2026-07-21T00:01:59Z');
+
+  await value.task.tick();
+
+  assert.equal(safetyCalls, 0);
+});
+
+test('safety monitor lock contention preserves state and skips task dispatch', async () => {
+  let releaseMonitor;
+  let monitorStarted;
+  const started = new Promise((resolve) => { monitorStarted = resolve; });
+  const value = await active({
+    schedulerRegistered: true,
+    onSafetyMonitor({ callback }) {
+      monitorStarted();
+      releaseMonitor = () => callback(null, safetyOutput());
+    },
+  });
+  const before = fs.readFileSync(value.paths.statePath, 'utf8');
+  value.setClock('2026-07-21T00:01:00Z');
+  const ticking = value.task.tick();
+  await started;
+  fs.writeFileSync(value.paths.runLockPath, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }));
+  releaseMonitor();
+
+  const state = await ticking;
+  assert.equal(state.last_safety_monitor.error_class, 'process_lock_active');
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(fs.readFileSync(value.paths.statePath, 'utf8'), before);
+  fs.unlinkSync(value.paths.runLockPath);
+});
+
+test('safety pause holds the state lock until queued notification state is written', async () => {
+  let releaseRepair;
+  let repairStarted;
+  const started = new Promise((resolve) => { repairStarted = resolve; });
+  const value = await active({
+    schedulerRegistered: true,
+    repairTaskSender() {
+      repairStarted();
+      return new Promise((resolve) => { releaseRepair = () => resolve({ queued: true, task_id: 'repair-1' }); });
+    },
+    onSafetyMonitor({ callback }) {
+      callback(null, safetyOutput('blocked', { process_lock: 'active', error_class: 'process_error' }));
+    },
+  });
+  markOrderActive(value);
+  const prior = value.task.status();
+  prior.consecutive_safety_monitor_failures = 1;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(prior));
+  value.setClock('2026-07-21T00:01:00Z');
+  const ticking = value.task.tick();
+  await started;
+
+  assert.equal(fs.existsSync(value.paths.runLockPath), true);
+  await assert.rejects(
+    value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }),
+    /scheduler_lock_active/,
+  );
+  releaseRepair();
+
+  const state = await ticking;
+  assert.equal(state.last_self_heal.queued, true);
+  assert.equal(state.last_self_heal.task_id, 'repair-1');
+  assert.equal(fs.existsSync(value.paths.runLockPath), false);
+});
+
+test('safety monitor releases the state lock when latest state reload fails', async () => {
+  const value = await active({ schedulerRegistered: true });
+  value.setClock('2026-07-21T00:01:00Z');
+  const readFileSync = fs.readFileSync;
+  fs.readFileSync = function failLatestStateRead(file, ...args) {
+    if (file === value.paths.statePath) throw Object.assign(new Error('read failed'), { code: 'EIO' });
+    return readFileSync.call(this, file, ...args);
+  };
+  try {
+    await value.task.tick();
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+  assert.equal(fs.existsSync(value.paths.runLockPath), false);
+});
+
+test('safety monitor releases the state lock when state save fails', async () => {
+  const value = await active({ schedulerRegistered: true });
+  value.setClock('2026-07-21T00:01:00Z');
+  const renameSync = fs.renameSync;
+  fs.renameSync = function failStateSave(from, to) {
+    if (to === value.paths.statePath) throw Object.assign(new Error('write failed'), { code: 'EIO' });
+    return renameSync.call(this, from, to);
+  };
+  try {
+    await value.task.tick();
+  } finally {
+    fs.renameSync = renameSync;
+  }
+  assert.equal(fs.existsSync(value.paths.runLockPath), false);
 });
 
 test('official non-trading days do not query account risk or pause an active order task', async () => {
