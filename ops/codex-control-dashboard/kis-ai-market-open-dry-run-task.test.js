@@ -4386,6 +4386,32 @@ test('decision-context child timeout degrades one slot without pausing or invoki
   assert.equal(orderRuns, 0);
 });
 
+test('blocked decision-context preserves sanitized failure phase and rejects unsafe phases', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const blocked = JSON.parse(decisionContext(slotId, []));
+  blocked.status = 'blocked';
+  blocked.fail_closed = true;
+  blocked.error_class = 'decision_context_timeout';
+  blocked.failure_phase = 'account_balance_request';
+  blocked.candidates = [];
+  blocked.holdings = [];
+  blocked.account_aggregate = {};
+  blocked.risk_aggregate = {};
+  blocked.event_metadata = [];
+  const value = await active({
+    decisionContextOutput: JSON.stringify(blocked),
+    execFile(command, args, options, callback) { callback(null, orderGood()); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+  const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.failure_phase, 'account_balance_request');
+
+  blocked.failure_phase = 'secret_token_value';
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(blocked), slotId), /invalid_decision_context/);
+});
+
 test('non-timeout decision-context process failure remains fail-closed', async () => {
   let orderRuns = 0;
   const value = await active({

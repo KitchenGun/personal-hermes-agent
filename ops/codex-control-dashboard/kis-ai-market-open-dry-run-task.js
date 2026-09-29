@@ -1204,10 +1204,15 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     'holdings', 'account_aggregate', 'risk_aggregate', 'event_metadata', 'fail_closed',
     'error_class', 'raw_response_persisted', 'secret_exposure',
   ];
+  const decisionContextFailurePhases = ['none', 'auth_token_request', 'account_balance_request', 'open_orders_read_request', 'decision_context'];
   if (!value || Array.isArray(value) || typeof value !== 'object'
     || Object.keys(value).length < keys.length
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
-    || Object.keys(value).some((key) => !keys.includes(key) && key !== 'intraday_candidate_counts')
+    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase'].includes(key))
+    || (Object.prototype.hasOwnProperty.call(value, 'failure_phase')
+      && (!decisionContextFailurePhases.includes(value.failure_phase)
+        || (value.status === 'success' && value.failure_phase !== 'none')
+        || (value.status === 'blocked' && value.failure_phase === 'none')))
     || value.task_id !== 'kis-llm-decision-context-v1'
     || !['success', 'blocked'].includes(value.status)
     || value.slot_id !== expectedSlotId || value.model_id !== LLM_MODEL_ID
@@ -1221,7 +1226,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
       || value.candidates.length !== 0 || value.holdings.length !== 0
       || Object.keys(value.account_aggregate).length !== 0 || Object.keys(value.risk_aggregate).length !== 0
       || value.event_metadata.length !== 0) throw new Error('invalid_decision_context');
-    return Object.freeze({ blocked: true, errorClass: safeText(value.error_class, 80) });
+    return Object.freeze({ blocked: true, errorClass: safeText(value.error_class, 80), failurePhase: value.failure_phase });
   }
   if (value.fail_closed !== false || value.error_class !== 'none') throw new Error('invalid_decision_context');
   const candidates = normalizedAiCandidates(value.candidates, runtimeContract);
@@ -1754,7 +1759,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       throw new Error(contextRun.error.killed ? 'decision_context_timeout' : 'decision_context_process_error');
     }
     const context = parseDecisionContextOutput(contextRun.stdout, slotId, runtimeContract);
-    if (context.blocked) throw new Error(context.errorClass);
+    if (context.blocked) {
+      const error = new Error(context.errorClass);
+      error.failurePhase = context.failurePhase;
+      throw error;
+    }
     if (context.candidates.length === 0) {
       return Object.freeze({
         path: null,
@@ -3127,6 +3136,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
             status: 'no_op', action_type: 'transport_degraded_no_op',
             error_class: reason, fail_closed: true, retry: false,
+            ...(error.failurePhase ? { failure_phase: error.failurePhase } : {}),
             decision_context_candidate_count: decisionContextCandidateCount,
             llm_invoked: llmInvoked,
             llm_verdict_status: llmVerdictStatus,
