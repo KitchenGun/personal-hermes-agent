@@ -408,14 +408,16 @@ function isDue(task, date) {
     && task.minutes.includes((Number(parts.hour) * 60) + Number(parts.minute));
 }
 
-function isDelayedPostCloseStart(task, scheduledAt, invokedAt, calendarProofResolver) {
-  if (![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id) || !isDue(task, scheduledAt)
+function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResolver) {
+  const supervisorStart = task.id === TASKS[0].id;
+  if ((!supervisorStart && ![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id)) || !isDue(task, scheduledAt)
     || (task.id === ORDER_TASK.id && !isPostCloseRefreshSlot(task, scheduledAt))) return false;
   const scheduled = seoulParts(scheduledAt);
   const invoked = seoulParts(invokedAt);
   const invokedMinute = (Number(invoked.hour) * 60) + Number(invoked.minute);
   if (scheduled.year !== invoked.year || scheduled.month !== invoked.month || scheduled.day !== invoked.day
-    || invokedMinute < 980 || invokedMinute >= 1070) return false;
+    || invokedMinute < (supervisorStart ? 540 : 980)
+    || invokedMinute >= (supervisorStart ? 550 : 1070)) return false;
   try {
     return calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`)?.isTradingDay === true;
   } catch {
@@ -567,9 +569,13 @@ function validateReportList(value, emptyValues, itemPattern, maxItems) {
 function validateReportMessage(value, officialTradeDate, decisions, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   const reportMessage = String(value || '');
   const lines = reportMessage.split('\n');
+  const modelOutputMatch = /^모델 출력: (\d+)건 \/ 학습 (\d+)회 \/ 모델 승격 예정 (\d+)회$/.exec(lines[5] || '');
+  const collectionMatch = /^수집·학습 기록: 오류 (\d+)건$/.exec(lines[6] || '');
   const learningMatch = /^AI 검증: 판단 (\d+)건 \/ 학습 (\d+)회 \/ 모델 승격 예정 (\d+)회$/.exec(lines[5] || '');
   const decisionMatch = learningMatch
+    || modelOutputMatch
     || /^AI 검증: 판단 (\d+)건(?: \/ 게이트 (\d+)회)? \/ 모델 변경 (\d+)회$/.exec(lines[5] || '');
+  const newFormat = modelOutputMatch !== null;
   if (reportMessage.length > 600 || lines.length !== 8
     || lines[0] !== '[KIS VPS 모의투자 일일 결과]'
     || lines[1] !== `기준일: ${officialTradeDate}`
@@ -577,10 +583,14 @@ function validateReportMessage(value, officialTradeDate, decisions, runtimeContr
     || !lines[3].startsWith('현재 보유: ')
     || !lines[4].startsWith('오늘 실현손익: ')
     || decisionMatch === null
-    || decisionMatch.slice(1).some((count) => count !== undefined && !Number.isSafeInteger(Number(count)))
+    || decisionMatch.slice(1).some((count) => count !== undefined
+      && (!Number.isSafeInteger(Number(count)) || Number(count) < 0))
     || Number(decisionMatch[1]) !== decisions
     || (learningMatch !== null && Number(learningMatch[3]) > Number(learningMatch[2]))
-    || !/^운영 상태: (?:정상|확인 필요 [1-9]\d*건)$/.test(lines[6])
+    || (modelOutputMatch !== null && Number(modelOutputMatch[3]) > Number(modelOutputMatch[2]))
+    || (newFormat
+      ? !collectionMatch || !Number.isSafeInteger(Number(collectionMatch[1]))
+      : !/^운영 상태: (?:정상|확인 필요 [1-9]\d*건)$/.test(lines[6]))
     || lines[7] !== '실전계좌: 주문 없음') throw new Error('invalid_report_message');
   validateReportList(lines[2].slice('오늘 체결: '.length), new Set(['없음', '확인 불가 (주문 원장 없음)']), VPS_FILL_ITEM_RE, 10);
   validateReportList(lines[3].slice('현재 보유: '.length), new Set(['없음', '확인 불가']), VPS_HOLDING_ITEM_RE, runtimeContract.max_open_positions);
@@ -2625,7 +2635,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           state: task.kind === 'order' ? 'DISABLED' : 'ACTIVE',
           pause_reason: undefined,
           next_run_at: task.kind === 'order' ? null : nextRunAt(task, resumedAt),
-          ...(task.kind === 'order' && postCloseRefreshPending ? { refresh_only_pending: true } : {}),
+          ...(task.kind === 'order' && hasIntradayProviderAttestation(prior)
+            ? { refresh_only_pending: false }
+            : task.kind === 'order' && postCloseRefreshPending ? { refresh_only_pending: true } : {}),
           consecutive_transport_failures: 0,
         }];
       }));
@@ -2699,7 +2711,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.actionType === 'activation_check';
       const disabledAfterRefreshFailure = prior.state === 'DISABLED'
         && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.last_run?.error_class);
-      const waitingForPostCloseRefresh = (
+      const waitingForPostCloseRefresh = !hasIntradayProviderAttestation(prior) && (
         (prior.state === 'PAUSED' && POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(prior.pause_reason))
         || (prior.state === 'DISABLED' && prior.refresh_only_pending === true)
         || disabledAfterRefreshFailure
@@ -2714,10 +2726,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.reconciliations === 0
         && parsed.openPositions === 0
         && parsed.dailyEntryCount === 0;
-      const refreshOnlyPending = refreshAdoption
-        ? !activationReady
-        : prior.refresh_only_pending === true || waitingForPostCloseRefresh;
-      if (refreshOnlyPending
+      const refreshOnlyPending = hasIntradayProviderAttestation(prior)
+        ? false
+        : refreshAdoption
+          ? !activationReady
+          : prior.refresh_only_pending === true || waitingForPostCloseRefresh;
+      if ((refreshOnlyPending || waitingForPostCloseRefresh)
         && (prior.activation_artifact_hash === null
           || parsed.artifactHash !== prior.activation_artifact_hash)) {
         throw new Error('artifact_recovery_hash_changed');
@@ -2944,12 +2958,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const dueTime = dueAt instanceof Date ? dueAt : new Date(dueAt);
     if (Number.isNaN(dueTime.getTime())) return pauseForTask(current, 'due_time_invalid', { error_class: 'due_time_invalid', fail_closed: true });
     const scheduled = new Date(taskState.next_run_at || 0);
-    const delayedPostCloseStart = !sameMinute(taskState.next_run_at, dueTime)
-      && isDelayedPostCloseStart(task, scheduled, dueTime, calendarProofResolver);
-    const scheduledDueTime = delayedPostCloseStart ? scheduled : dueTime;
+    const delayedNonOrderStart = !sameMinute(taskState.next_run_at, dueTime)
+      && isDelayedNonOrderStart(task, scheduled, now(), calendarProofResolver);
+    const scheduledDueTime = delayedNonOrderStart ? scheduled : dueTime;
     if (!isDue(task, scheduledDueTime) || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
       if (scheduled.getTime() < dueTime.getTime()) {
         const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
+          && !hasIntradayProviderAttestation(taskState)
           ? REFRESH_ONLY_ORDER_TASK : task;
         return save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, next_run_at: nextRunAt(scheduleTask, dueTime), last_run: { status: taskState.refresh_only_pending ? 'waiting' : 'no_op', action_type: taskState.refresh_only_pending ? 'missed_refresh_window_no_op' : 'missed_window_no_op', error_class: taskState.refresh_only_pending ? 'model_v3_prediction_batch_incomplete' : 'none', fail_closed: taskState.refresh_only_pending === true, catch_up: false, invoked_by: safeText(invokedBy), completed_at: now().toISOString() } } } });
       }
@@ -3084,6 +3099,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let llmVerdictSummary = null;
     try {
       const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
+        && !hasIntradayProviderAttestation(taskState)
         ? REFRESH_ONLY_ORDER_TASK : task;
       save({ ...current, tasks: { ...current.tasks, [taskId]: {
         ...taskState, last_due_at: key, next_run_at: nextRunAt(scheduleTask, scheduledDueTime), pending_invocation: pendingInvocation,
@@ -3225,7 +3241,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const refreshDueKey = dueKey(ORDER_TASK, scheduledDueTime);
         const scheduledRefreshConsumed = liveOrderTask.last_due_at === refreshDueKey
           || liveOrderTask.pending_invocation?.due_key === refreshDueKey;
-        if (isDelayedPostCloseStart(ORDER_TASK, scheduledDueTime, refreshDispatchAt, calendarProofResolver)
+        if (isDelayedNonOrderStart(ORDER_TASK, scheduledDueTime, refreshDispatchAt, calendarProofResolver)
           && refreshDispatchTradeDate === officialTradeDate
           && !scheduledRefreshConsumed && liveOrderTask.state !== 'ACTIVE') {
           const refresh = await execute(buildIndependentShadowRefreshCommand());
@@ -3451,14 +3467,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         && parsed.orderSymbol === null;
       if (postCloseBackfillTransportNoOp) {
         const postNotificationTask = postNotificationState.tasks[taskId];
+        const refreshOnlyPending = !hasIntradayProviderAttestation(taskState);
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
           ...postNotificationTask,
           state: 'ACTIVE',
           pause_reason: undefined,
           consecutive_transport_failures: 0,
           pending_invocation: null,
-          refresh_only_pending: true,
-          next_run_at: nextRunAt(REFRESH_ONLY_ORDER_TASK, scheduledDueTime),
+          refresh_only_pending: refreshOnlyPending,
+          next_run_at: nextRunAt(refreshOnlyPending ? REFRESH_ONLY_ORDER_TASK : task, scheduledDueTime),
           last_run: {
             ...lastRun,
             status: 'no_op',
@@ -3513,7 +3530,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (task.kind === 'order') {
         const postNotificationTask = postNotificationState.tasks[taskId];
         const refreshCompleted = postCloseRefresh && parsed.actionType === 'shadow_refreshed';
-        const refreshOnlyPending = postNotificationTask.refresh_only_pending === true && !refreshCompleted;
+        const refreshOnlyPending = postNotificationTask.refresh_only_pending === true
+          && !refreshCompleted && !hasIntradayProviderAttestation(postNotificationTask);
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
           ...postNotificationTask,
           state: 'ACTIVE',
@@ -3707,7 +3725,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           ...orderTask,
           state: resumeOrder ? 'ACTIVE' : orderTask.state,
           pause_reason: resumeOrder ? undefined : orderTask.pause_reason,
-          next_run_at: nextRunAt(orderTask.refresh_only_pending ? REFRESH_ONLY_ORDER_TASK : ORDER_TASK, checkedAt),
+          next_run_at: nextRunAt(orderTask.refresh_only_pending
+            && !hasIntradayProviderAttestation(orderTask) ? REFRESH_ONLY_ORDER_TASK : ORDER_TASK, checkedAt),
           consecutive_transport_failures: 0,
           pending_invocation: null,
         },
@@ -3791,6 +3810,33 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (current.state !== 'ACTIVE') return current;
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
           && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) return current;
+        const orderTask = current.tasks[ORDER_TASK.id];
+        const pendingSlot = orderTask?.next_run_at ? new Date(orderTask.next_run_at) : null;
+        const safety = current.last_safety_monitor;
+        const safetyClear = safety?.status === 'success'
+          && safety.execution_owner === 'vps'
+          && safety.process_lock === 'clear'
+          && safety.kill_state === 'clear'
+          && safety.open_order_status === 'clear'
+          && safety.reconciliation_status === 'clear'
+          && safety.account_risk_status === 'clear';
+        if (current.state === 'ACTIVE' && orderTask?.state === 'ACTIVE'
+          && orderTask.refresh_only_pending === true
+          && hasIntradayProviderAttestation(orderTask)
+          && current.order_activated_at
+          && /^[a-f0-9]{64}$/.test(orderTask.activation_artifact_hash || '')
+          && orderTask.pending_invocation === null
+          && pendingSlot && !Number.isNaN(pendingSlot.getTime())
+          && isPostCloseRefreshSlot(ORDER_TASK, pendingSlot)
+          && !blockingIncident(current) && safetyClear) {
+          const normalizedAt = now();
+          current = save({ ...current, tasks: { ...current.tasks, [ORDER_TASK.id]: {
+            ...orderTask,
+            refresh_only_pending: false,
+            next_run_at: nextRunAt(ORDER_TASK, normalizedAt),
+          } } });
+          return current;
+        }
         const dispatchTime = now();
         for (const task of TASKS) {
           const item = current.tasks[task.id];
