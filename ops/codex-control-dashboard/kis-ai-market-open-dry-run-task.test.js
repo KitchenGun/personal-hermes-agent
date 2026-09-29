@@ -241,6 +241,35 @@ test('market evidence is bounded, point-in-time and included in the prompt hash'
   }
 });
 
+test('offset order market evidence uses its paired ten-minute shadow slot', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:12:55`;
+  const context = JSON.parse(decisionContext(slotId));
+  const setEvidenceTime = (decisionTime, dataCutoffAt) => {
+    context.candidates[0].market_evidence = {
+      ...marketEvidence(), decision_time: decisionTime, data_cutoff_at: dataCutoffAt,
+    };
+  };
+  const build = () => mod.buildSanitizedAiPacket({
+    slotId, context: mod.parseDecisionContextOutput(JSON.stringify(context), slotId),
+  });
+
+  setEvidenceTime('2026-07-21T12:52:00+09:00', '2026-07-21T12:51:59+09:00');
+  assert.doesNotThrow(build);
+  setEvidenceTime('2026-07-21T12:49:00+09:00', '2026-07-21T12:48:59+09:00');
+  assert.throws(build, /invalid_ai_candidates/);
+  setEvidenceTime('2026-07-21T13:00:00+09:00', '2026-07-21T12:59:59+09:00');
+  assert.throws(build, /invalid_ai_candidates/);
+
+  const duplicate = JSON.parse(decisionContext(slotId, ['005930', '005930']));
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(duplicate), slotId), /invalid_ai_candidates/);
+  const rawCandidate = JSON.parse(decisionContext(slotId));
+  rawCandidate.candidates[0].raw_response = 'untrusted';
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(rawCandidate), slotId), /invalid_ai_candidates/);
+  setEvidenceTime('2026-07-21T12:52:00+09:00', '2026-07-21T12:51:59+09:00');
+  context.candidates[0].market_evidence.unexpected = true;
+  assert.throws(build, /invalid_ai_candidates/);
+});
+
 test('validated verdict aggregates persist on no-op without counting a duplicate slot', async () => {
   const symbols = ['005930', '000660', '005380', '035720'];
   let calls = 0;
@@ -2083,6 +2112,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     'duplicate_order_blocked',
     'intraday_prediction_attestation_mismatch',
     'intraday_decision_slot_invalid',
+    'invalid_ai_candidates',
     'order_not_fully_filled',
     'order_submission_unknown',
     'invalid_order_output_contract',
@@ -2105,7 +2135,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
     paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
     paused.tasks[mod.TASKS[4].id].pause_reason = pauseReason;
     paused.tasks[mod.TASKS[4].id].next_run_at = null;
-    if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid'].includes(pauseReason)) {
+    if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid', 'invalid_ai_candidates'].includes(pauseReason)) {
       paused.tasks[mod.TASKS[4].id].activation_artifact_hash = 'a'.repeat(64);
     }
     fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
@@ -2119,7 +2149,7 @@ test('explicit enable check reactivates an order task paused for known reconcili
 });
 
 test('explicit rejected-order recovery requires fresh clear VPS safety and never executes an order', async () => {
-  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid']) {
+  for (const pauseReason of ['order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid', 'invalid_ai_candidates']) {
   for (const extra of [null, { open_order_status: 'active' }, { reconciliation_status: 'active' },
     { account_risk_status: 'active' }, { kill_state: 'active' }, { process_lock: 'active' },
     { execution_owner: 'prod' }]) {
@@ -2151,7 +2181,7 @@ test('explicit rejected-order recovery requires fresh clear VPS safety and never
 });
 
 test('artifact mismatch recovery refuses to rotate the attested artifact', async () => {
-  for (const pauseReason of ['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid']) {
+  for (const pauseReason of ['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid', 'invalid_ai_candidates']) {
   const value = await active({
     activationCheckOutput: orderGood('success', {
       action_type: 'activation_check', artifact_hash: 'b'.repeat(64),
@@ -2177,6 +2207,7 @@ test('attestation contract recovery requires runtime source parity', async () =>
     'model_v3_artifact_attestation_mismatch',
     'hermes_scheduler_attestation_unavailable',
     'intraday_decision_slot_invalid',
+    'invalid_ai_candidates',
   ]) {
     const value = await active({ sourceParityCheck: () => false });
     const paused = value.task.status();
@@ -5633,6 +5664,46 @@ test('invalid decision slot stays paused without automatic recovery or order exe
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.autoResume, false);
   assert.equal(mod.ERROR_POLICY.intraday_decision_slot_invalid.orderRecovery, true);
   assert.equal(orderRuns, 0);
+});
+
+test('invalid candidate recovery requires exact approval and all fresh attestation gates', async () => {
+  assert.equal(mod.ERROR_POLICY.invalid_ai_candidates.persistent, true);
+  assert.equal(mod.ERROR_POLICY.invalid_ai_candidates.autoResume, false);
+  assert.equal(mod.ERROR_POLICY.invalid_ai_candidates.orderRecovery, true);
+  let orderSubmissions = 0;
+  const pausedTask = async (options = {}) => {
+    const value = await active({
+      ...options,
+      onExec({ args }) {
+        if (args.includes('run-once')) orderSubmissions += 1;
+      },
+    });
+    const state = value.task.status();
+    Object.assign(state.tasks[mod.TASKS[4].id], {
+      state: 'PAUSED', pause_reason: 'invalid_ai_candidates', next_run_at: null,
+      activation_artifact_hash: 'a'.repeat(64),
+    });
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    return value;
+  };
+
+  const exact = await pausedTask();
+  await assert.rejects(exact.task.enableOrderTask({ confirm: true, approval: 'wrong' }), /exact_order_activation_approval_required/);
+  assert.equal(exact.task.status().tasks[mod.TASKS[4].id].state, 'PAUSED');
+  const blockedSafety = await pausedTask({
+    safetyOutput: safetyOutput('blocked', { open_order_status: 'active', error_class: 'open_order_status_active' }),
+  });
+  await assert.rejects(blockedSafety.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }), /open_order_status_active/);
+  const badParity = await pausedTask({ sourceParityCheck: () => false });
+  await assert.rejects(badParity.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }), /runtime_source_parity_failed/);
+  const changedArtifact = await pausedTask({
+    activationCheckOutput: orderGood('success', { action_type: 'activation_check', artifact_hash: 'b'.repeat(64) }),
+  });
+  await assert.rejects(changedArtifact.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL }), /artifact_recovery_hash_changed/);
+
+  const recovered = await exact.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  assert.equal(recovered.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  assert.equal(orderSubmissions, 0);
 });
 
 test('independent provider cutover adopts a new verified hash once and requires fresh VPS safety', async () => {

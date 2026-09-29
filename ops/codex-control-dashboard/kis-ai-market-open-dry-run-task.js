@@ -134,6 +134,7 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['intraday_decision_stale_or_missing', { slotDegradeOnly: true, orderRecovery: true, resumable: true }],
   ['intraday_decision_slot_expired', { slotDegradeOnly: true, orderRecovery: true }],
   ['intraday_decision_slot_invalid', { persistent: true, orderRecovery: true }],
+  ['invalid_ai_candidates', { persistent: true, orderRecovery: true }],
   ['llm_candidate_limit_exceeded', { orderRecovery: true }],
   ['scheduler_state_fault', { autoRepair: true, persistent: true, scope: 'global' }],
   ['runtime_io_failed', { autoRepair: true, resumable: true }],
@@ -1037,7 +1038,8 @@ function buildSanitizedAiPacket({ slotId, context, runtimeContract = REQUIRED_RU
   if (!context || Array.isArray(context) || typeof context !== 'object') throw new Error('invalid_decision_context');
   const candidates = normalizedAiCandidates(context.candidates, runtimeContract);
   const [, day, hour, minute] = slotId.split(':');
-  const slotStart = Date.parse(`${day}T${hour}:${minute}:00+09:00`);
+  const sourceMinute = String(Math.floor(Number(minute) / 10) * 10).padStart(2, '0');
+  const slotStart = Date.parse(`${day}T${hour}:${sourceMinute}:00+09:00`);
   if (candidates.some((item) => item.market_evidence
     && (Date.parse(item.market_evidence.decision_time) < slotStart
       || Date.parse(item.market_evidence.decision_time) >= slotStart + 10 * 60_000))) {
@@ -2669,7 +2671,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
-      if (['tls_failed', 'order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid'].includes(prior.pause_reason)) {
+      if (['tls_failed', 'order_rejected', 'duplicate_order_blocked', 'intraday_prediction_attestation_mismatch', 'llm_held_position_action_invalid', 'intraday_decision_slot_invalid', 'invalid_ai_candidates'].includes(prior.pause_reason)) {
         const safetyRun = await execute(buildSafetyMonitorCommand());
         if (safetyRun.error) throw new Error('safety_monitor_process_error');
         const safety = parseSafetyMonitorOutput(safetyRun.stdout);
@@ -2721,10 +2723,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (prior.pause_reason === 'model_v3_artifact_attestation_mismatch'
         || prior.pause_reason === 'hermes_scheduler_attestation_unavailable'
-        || prior.pause_reason === 'intraday_decision_slot_invalid') {
+        || prior.pause_reason === 'intraday_decision_slot_invalid'
+        || prior.pause_reason === 'invalid_ai_candidates') {
         if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
       }
-      if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid'].includes(prior.pause_reason)) {
+      if (['model_v3_artifact_attestation_mismatch', 'intraday_prediction_attestation_mismatch', 'intraday_decision_slot_invalid', 'invalid_ai_candidates'].includes(prior.pause_reason)) {
         if (prior.activation_artifact_hash === null
           || parsed.artifactHash !== prior.activation_artifact_hash) {
           throw new Error('artifact_recovery_hash_changed');
