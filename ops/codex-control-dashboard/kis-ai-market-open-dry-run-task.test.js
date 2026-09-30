@@ -304,6 +304,166 @@ test('validated verdict aggregates persist on no-op without counting a duplicate
   assert.equal(value.task.status().tasks[mod.TASKS[4].id].llm_daily_summary.slot_count, 1);
 });
 
+test('latency samples persist sanitized candidate outcomes and bounded daily statistics', async () => {
+  const value = await active({
+    llmExecutor: async ({ packet }) => aiVerdict(packet, [{
+      symbol: '005930', action: 'HOLD', target_weight_pct: 0,
+      confidence_bucket: 'low', reason_codes: ['NO_EDGE'],
+    }]),
+    execFile(command, args, options, callback) {
+      callback(null, orderGood('blocked', { error_class: 'daily_loss_limit_reached' }));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  const summary = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary;
+  assert.equal(summary.slot_count, 1);
+  assert.equal(summary.llm.sample_count, 1);
+  assert.ok(summary.llm.avg_ms >= 0);
+  assert.equal(summary.llm.p50_ms, summary.samples[0].llm_duration_ms);
+  assert.equal(summary.samples[0].llm_outcome, 'validated_hold');
+  assert.equal(summary.samples[0].collection_slot_time, '2026-07-21T09:10:00+09:00');
+  assert.deepEqual(summary.samples[0].candidates, [{
+    collection_slot_time: '2026-07-21T09:10:00+09:00',
+    symbol: '005930', outcome: 'HOLD', llm_duration_ms: summary.samples[0].llm_duration_ms,
+  }]);
+  assert.equal(summary.samples[0].order_outcome, 'risk_veto');
+  assert.ok(summary.samples[0].decision_context_duration_ms >= 0);
+  assert.ok(summary.samples[0].decision_context_started_at.endsWith('Z'));
+  assert.ok(summary.samples[0].order_child_started_at.endsWith('Z'));
+  assert.doesNotMatch(JSON.stringify(summary), /account|price|token|prompt_hash|target_weight/);
+});
+
+test('latency telemetry records complete ENTER and EXIT candidate outcomes', async () => {
+  for (const action of ['ENTER', 'EXIT']) {
+    const value = await active({
+      llmExecutor: async ({ packet }) => aiVerdict(packet, [{
+        symbol: '005930', action, target_weight_pct: action === 'ENTER' ? 10 : 0,
+        confidence_bucket: 'medium', reason_codes: [action === 'ENTER' ? 'MOMENTUM_CONFIRMATION' : 'EXIT_SIGNAL'],
+      }]),
+      execFile(_command, _args, _options, callback) { callback(null, orderGood('no_op')); },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    value.setClock('2026-07-21T00:15:10Z');
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+    const sample = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary.samples[0];
+    assert.equal(sample.llm_outcome, 'validated');
+    assert.deepEqual(sample.candidates.map(({ symbol, outcome }) => ({ symbol, outcome })), [{
+      symbol: '005930', outcome: action,
+    }]);
+    assert.ok(sample.llm_duration_ms >= 0);
+  }
+});
+
+test('LLM timeout is counted separately from missing duration and does not call order child', async () => {
+  let orderCalls = 0;
+  const value = await active({
+    llmExecutor: async () => { throw new Error('llm_response_timeout'); },
+    execFile(command, args, options, callback) {
+      orderCalls += 1;
+      callback(null, orderGood('no_op'));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  const summary = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary;
+  assert.equal(orderCalls, 0);
+  assert.equal(summary.slot_count, 1);
+  assert.equal(summary.llm.sample_count, 1);
+  assert.equal(summary.samples[0].llm_outcome, 'timeout');
+  assert.ok(summary.samples[0].llm_duration_ms >= 0);
+  assert.deepEqual(summary.samples[0].candidates, [{
+    collection_slot_time: '2026-07-21T09:10:00+09:00',
+    symbol: '005930', outcome: 'timeout', llm_duration_ms: summary.samples[0].llm_duration_ms,
+  }]);
+  assert.equal(summary.samples[0].order_child_started_at, null);
+  assert.equal(summary.samples[0].order_outcome, null);
+});
+
+test('generic LLM error records its measured latency and candidate error outcome', async () => {
+  const value = await active({
+    llmExecutor: async () => { throw new Error('llm_verdict_contract_unavailable'); },
+    execFile(_command, _args, _options, callback) { callback(null, orderGood('no_op')); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  const sample = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary.samples[0];
+  assert.equal(sample.llm_outcome, 'error');
+  assert.ok(sample.llm_duration_ms >= 0);
+  assert.deepEqual(sample.candidates.map(({ symbol, outcome }) => ({ symbol, outcome })), [{
+    symbol: '005930', outcome: 'error',
+  }]);
+  assert.equal(sample.order_child_started_at, null);
+});
+
+test('latency state save failure is best-effort and preserves the order-child result', async () => {
+  let orderCalls = 0;
+  const value = await active({
+    llmExecutor: async ({ packet }) => aiVerdict(packet),
+    execFile(_command, _args, _options, callback) {
+      orderCalls += 1;
+      callback(null, orderGood('no_op'));
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  const originalWrite = fs.writeFileSync;
+  let telemetryWriteFailed = false;
+  fs.writeFileSync = function failOneTelemetryStateWrite(file, data, ...args) {
+    if (!telemetryWriteFailed && typeof data === 'string' && data.includes('"llm_latency_daily_summary"')) {
+      telemetryWriteFailed = true;
+      throw Object.assign(new Error('injected telemetry state write failure'), { code: 'EIO' });
+    }
+    return originalWrite.call(this, file, data, ...args);
+  };
+  try {
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+    assert.equal(telemetryWriteFailed, true);
+    assert.equal(orderCalls, 1);
+    assert.equal(result.tasks[mod.TASKS[4].id].state, 'ACTIVE');
+  } finally {
+    fs.writeFileSync = originalWrite;
+  }
+});
+
+test('order child terminal telemetry distinguishes failures, rejection, and unknown submission', async () => {
+  const cases = [
+    ['UNKNOWN', 'timeout', (callback) => callback(Object.assign(new Error('timeout'), { killed: true, code: 'ETIMEDOUT' }), '', '')],
+    ['UNKNOWN', 'process_error', (callback) => callback(Object.assign(new Error('failed'), { code: 1 }), '', '')],
+    ['UNKNOWN', 'invalid_order_json', (callback) => callback(null, 'not-json', '')],
+    ['rejected', 'order_rejected', (callback) => callback(null, orderGood('blocked', {
+      error_class: 'order_rejected', order_symbol: '005930', order_name: 'Samsung',
+      order_side: 'buy', requested_quantity: 1, unfilled_quantity: 1,
+      lifecycle_status: 'rejected', notification_idempotency_key: 'b'.repeat(64),
+    }), '')],
+    ['UNKNOWN', 'order_submission_unknown', (callback) => callback(null, orderGood('blocked', {
+      error_class: 'order_submission_unknown',
+    }), '')],
+  ];
+  for (const [expectedOutcome, expectedErrorClass, finishOrderChild] of cases) {
+    const value = await active({
+      llmExecutor: async ({ packet }) => aiVerdict(packet),
+      execFile(_command, _args, _options, callback) { finishOrderChild(callback); },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    value.setClock('2026-07-21T00:15:10Z');
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+    const sample = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary.samples[0];
+    assert.equal(sample.order_outcome, expectedOutcome);
+    assert.equal(sample.order_error_class, expectedErrorClass);
+    assert.ok(sample.order_child_started_at.endsWith('Z'));
+    assert.ok(sample.order_child_completed_at.endsWith('Z'));
+    assert.equal(sample.collection_slot_time, '2026-07-21T09:10:00+09:00');
+    assert.deepEqual(sample.candidates.map(({ collection_slot_time, symbol }) => ({ collection_slot_time, symbol })), [{
+      collection_slot_time: '2026-07-21T09:10:00+09:00', symbol: '005930',
+    }]);
+    assert.equal(Object.hasOwn(sample, 'order_submit_started_at'), false);
+  }
+});
+
 test('verdict audit accumulates within a day, resets next day and survives downstream failure', async () => {
   const value = await active({
     llmExecutor: async ({ packet }) => aiVerdict(packet, [{

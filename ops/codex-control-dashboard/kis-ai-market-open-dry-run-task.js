@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 
 const ACTIVATION_APPROVAL = 'APPROVE_KIS_HERMES_AI_MARKET_OPEN_DRY_RUN_V1';
 const RESUME_AFTER_IO_FIX_APPROVAL = 'APPROVE_KIS_HERMES_AI_DRY_RUN_RESUME_AFTER_IO_FIX_V1';
@@ -429,6 +430,16 @@ function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResol
 function dueKey(task, date) {
   const parts = seoulParts(date);
   return `${task.id}:${parts.year}-${parts.month}-${parts.day}:${parts.hour}:${parts.minute}`;
+}
+
+function collectionSlotTimeFromDueKey(slotId) {
+  const match = /^[^:]+:(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$/.exec(slotId);
+  if (!match) return null;
+  const [, year, month, day, hour, minute] = match;
+  const slot = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute) - 5));
+  if (slot.getUTCFullYear() !== Number(year) || slot.getUTCMonth() !== Number(month) - 1
+    || slot.getUTCDate() !== Number(day)) return null;
+  return `${year}-${month}-${day}T${String(slot.getUTCHours()).padStart(2, '0')}:${String(slot.getUTCMinutes()).padStart(2, '0')}:00+09:00`;
 }
 
 function sameMinute(left, right) {
@@ -1189,6 +1200,32 @@ function accumulateAiSummary(previous, slotId, summary) {
   return total;
 }
 
+function percentile(values, fraction) {
+  if (values.length === 0) return null;
+  return values[Math.ceil(values.length * fraction) - 1];
+}
+
+function accumulateAiLatency(previous, slotId, sample) {
+  const tradeDate = slotId.split(':')[1];
+  const prior = previous?.trade_date === tradeDate ? previous : {};
+  const samples = [...(prior.samples || []).filter((item) => item.due_key !== slotId), sample]
+    .slice(-40);
+  const durations = samples.map((item) => item.llm_duration_ms)
+    .filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+  return {
+    trade_date: tradeDate,
+    slot_count: samples.length,
+    samples,
+    llm: {
+      sample_count: durations.length,
+      avg_ms: durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length) : null,
+      p50_ms: percentile(durations, 0.50),
+      p95_ms: percentile(durations, 0.95),
+      max_ms: durations.length ? durations[durations.length - 1] : null,
+    },
+  };
+}
+
 function buildDecisionContextCommand(schedulerToken, invocationDueKey) {
   if (!/^[a-f0-9]{32}$/.test(schedulerToken)
     || !invocationDueKey.startsWith(`${ORDER_TASK.id}:`)) throw new Error('scheduler_attestation_required');
@@ -1762,52 +1799,140 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
 
   async function createAiVerdictFile(taskId, slotId, dueTime, schedulerToken) {
+    const sample = {
+      due_key: slotId,
+      collection_slot_time: collectionSlotTimeFromDueKey(slotId),
+      decision_context_duration_ms: null,
+      decision_context_started_at: now().toISOString(),
+      decision_context_completed_at: null,
+      llm_duration_ms: null,
+      llm_started_at: null,
+      llm_completed_at: null,
+      llm_outcome: 'not_invoked',
+      candidates: [],
+      order_child_started_at: null,
+      order_child_completed_at: null,
+      order_outcome: null,
+      order_error_class: null,
+    };
     if (typeof llmExecutor !== 'function' || typeof verdictDir !== 'string' || verdictDir.length === 0) {
-      throw new Error('llm_verdict_contract_unavailable');
+      const error = new Error('llm_verdict_contract_unavailable');
+      sample.llm_outcome = 'error';
+      error.llmLatencySample = sample;
+      throw error;
     }
-    const contextRun = await execute(buildDecisionContextCommand(schedulerToken, slotId));
+    const contextStarted = performance.now();
+    let contextRun;
+    try {
+      contextRun = await execute(buildDecisionContextCommand(schedulerToken, slotId));
+      sample.decision_context_duration_ms = Math.max(0, Math.round(performance.now() - contextStarted));
+      sample.decision_context_completed_at = now().toISOString();
+    } catch (error) {
+      sample.decision_context_duration_ms = Math.max(0, Math.round(performance.now() - contextStarted));
+      sample.decision_context_completed_at = now().toISOString();
+      sample.llm_outcome = error?.killed ? 'timeout' : 'error';
+      const failure = error instanceof Error ? error : new Error('decision_context_process_error');
+      failure.llmLatencySample = sample;
+      throw failure;
+    }
     if (contextRun.error && Number(contextRun.error.code) !== 2) {
-      throw new Error(contextRun.error.killed ? 'decision_context_timeout' : 'decision_context_process_error');
+      const error = new Error(contextRun.error.killed ? 'decision_context_timeout' : 'decision_context_process_error');
+      sample.llm_outcome = contextRun.error.killed ? 'timeout' : 'error';
+      error.llmLatencySample = sample;
+      throw error;
     }
-    const context = parseDecisionContextOutput(contextRun.stdout, slotId, runtimeContract);
+    let context;
+    try { context = parseDecisionContextOutput(contextRun.stdout, slotId, runtimeContract); }
+    catch (error) {
+      sample.llm_outcome = 'error';
+      error.llmLatencySample = sample;
+      throw error;
+    }
     if (context.blocked) {
       const error = new Error(context.errorClass);
       error.failurePhase = context.failurePhase;
+      sample.llm_outcome = context.errorClass.includes('timeout') ? 'timeout' : 'error';
+      error.llmLatencySample = sample;
       throw error;
     }
     if (context.candidates.length === 0) {
+      sample.llm_outcome = 'no_candidates';
       return Object.freeze({
         path: null,
         promptHash: '',
         candidateCount: 0,
         llmInvoked: false,
         verdictStatus: 'skipped_no_candidates',
+        llmLatencySample: sample,
       });
     }
     const packet = buildSanitizedAiPacket({ slotId, context, runtimeContract });
+    sample.candidates = packet.candidates.map(({ symbol }) => ({
+      collection_slot_time: sample.collection_slot_time,
+      symbol,
+      outcome: 'pending',
+      llm_duration_ms: null,
+    }));
     let timeout;
     const timed = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('llm_response_timeout')), LLM_RESPONSE_TIMEOUT_MS); });
     let response;
+    const llmStarted = performance.now();
+    sample.llm_started_at = now().toISOString();
+    sample.llm_outcome = 'error';
     try {
       response = await Promise.race([Promise.resolve(llmExecutor({ model: LLM_MODEL_ID, timeoutMs: LLM_RESPONSE_TIMEOUT_MS, packet })), timed]);
     } catch (error) {
-      throw attachAiVerdictFailure(error, context.candidates.length, undefined, 'failed');
+      sample.llm_duration_ms = Math.max(0, Math.round(performance.now() - llmStarted));
+      sample.llm_completed_at = now().toISOString();
+      sample.llm_outcome = error?.message === 'llm_response_timeout' ? 'timeout' : 'error';
+      sample.candidates = sample.candidates.map((candidate) => ({
+        ...candidate, outcome: sample.llm_outcome, llm_duration_ms: sample.llm_duration_ms,
+      }));
+      const failure = attachAiVerdictFailure(error, context.candidates.length, undefined, 'failed');
+      failure.llmLatencySample = sample;
+      throw failure;
     } finally { clearTimeout(timeout); }
+    sample.llm_duration_ms = Math.max(0, Math.round(performance.now() - llmStarted));
+    sample.llm_completed_at = now().toISOString();
     let responseValue;
     try {
       responseValue = typeof response === 'string' ? JSON.parse(response) : response;
     } catch {
-      throw attachAiVerdictFailure(new Error('invalid_ai_verdict'), context.candidates.length, undefined, 'incomplete');
+      sample.candidates = sample.candidates.map((candidate) => ({
+        ...candidate, outcome: 'invalid_verdict', llm_duration_ms: sample.llm_duration_ms,
+      }));
+      const failure = attachAiVerdictFailure(new Error('invalid_ai_verdict'), context.candidates.length, undefined, 'incomplete');
+      failure.llmLatencySample = sample;
+      throw failure;
     }
     if (now().getTime() >= dueTime.getTime() + (10 * 60_000)) {
-      throw attachAiVerdictFailure(new Error('late_ai_verdict'), context.candidates.length, responseValue, 'late');
+      sample.candidates = sample.candidates.map((candidate) => ({
+        ...candidate, outcome: 'late', llm_duration_ms: sample.llm_duration_ms,
+      }));
+      const failure = attachAiVerdictFailure(new Error('late_ai_verdict'), context.candidates.length, responseValue, 'late');
+      failure.llmLatencySample = sample;
+      throw failure;
     }
     let serialized;
     try {
       serialized = parseAiVerdict(responseValue, packet, runtimeContract);
     } catch (error) {
-      throw attachAiVerdictFailure(error, context.candidates.length, responseValue, 'incomplete');
+      sample.candidates = sample.candidates.map((candidate) => ({
+        ...candidate, outcome: 'invalid_verdict', llm_duration_ms: sample.llm_duration_ms,
+      }));
+      const failure = attachAiVerdictFailure(error, context.candidates.length, responseValue, 'incomplete');
+      failure.llmLatencySample = sample;
+      throw failure;
     }
+    const candidateActions = new Map(responseValue.decisions.map(({ symbol, action }) => [symbol, action]));
+    sample.candidates = sample.candidates.map(({ symbol }) => ({
+      collection_slot_time: sample.collection_slot_time,
+      symbol,
+      outcome: candidateActions.get(symbol) || 'missing',
+      llm_duration_ms: sample.llm_duration_ms,
+    }));
+    sample.llm_outcome = sample.candidates.some(({ outcome }) => outcome === 'HOLD' || outcome === 'HOLD_OVERNIGHT')
+      ? 'validated_hold' : 'validated';
     fs.mkdirSync(verdictDir, { recursive: true, mode: 0o700 });
     const file = path.join(verdictDir, `${crypto.randomBytes(16).toString('hex')}.json`);
     const fd = fs.openSync(file, 'wx', 0o600);
@@ -1823,6 +1948,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       llmInvoked: true,
       verdictStatus: 'validated',
       summary: summarizeAiVerdict(JSON.parse(serialized), context.candidates.length),
+      llmLatencySample: sample,
     });
   }
 
@@ -1905,6 +2031,28 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (value.incidents === undefined) value.incidents = {};
     atomicWrite(statePath, value);
     return value;
+  }
+  function persistAiLatency(slotId, sample, orderOutcome, orderErrorClass) {
+    if (!sample) return;
+    try {
+      const latest = loadStrict();
+      const taskState = latest.tasks[ORDER_TASK.id];
+      const prior = taskState.llm_latency_daily_summary;
+      const samples = prior?.trade_date === slotId.split(':')[1] ? prior.samples || [] : [];
+      const existing = samples.find((item) => item.due_key === slotId);
+      const updated = {
+        ...(existing || sample),
+        ...sample,
+        order_outcome: orderOutcome !== undefined ? orderOutcome : existing?.order_outcome ?? sample.order_outcome,
+        order_error_class: orderOutcome !== undefined
+          ? (orderErrorClass == null ? null : sanitizeErrorClass(orderErrorClass))
+          : existing?.order_error_class ?? sample.order_error_class,
+      };
+      save({ ...latest, tasks: { ...latest.tasks, [ORDER_TASK.id]: {
+        ...taskState,
+        llm_latency_daily_summary: accumulateAiLatency(prior, slotId, updated),
+      } } });
+    } catch { /* Telemetry must never affect the trading result. */ }
   }
   function incidentStateHash(current, taskId, errorClass) {
     const taskState = current.tasks?.[taskId] || {};
@@ -3098,6 +3246,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let llmInvoked = false;
     let llmVerdictStatus = requiresAiVerdict ? 'pending' : 'not_required';
     let llmVerdictSummary = null;
+    let llmLatencySample = null;
     try {
       const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
         && !hasIntradayProviderAttestation(taskState)
@@ -3118,6 +3267,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           llmInvoked = verdict?.llmInvoked === true;
           llmVerdictStatus = verdict?.verdictStatus || 'invalid';
           llmVerdictSummary = verdict?.summary || null;
+          llmLatencySample = verdict?.llmLatencySample || null;
 
           const contextState = loadStrict();
           const contextTask = contextState.tasks[taskId];
@@ -3137,6 +3287,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
               llm_daily_summary: accumulateAiSummary(contextTask.llm_daily_summary, key, llmVerdictSummary),
             } : {}),
           } } });
+          persistAiLatency(key, llmLatencySample);
           atomicWrite(attestationPath, pendingInvocation);
         }
         catch (error) {
@@ -3149,6 +3300,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             ? error.llmVerdictStatus
             : llmVerdictStatus;
           llmVerdictSummary = error.llmVerdictSummary || llmVerdictSummary;
+          llmLatencySample = error.llmLatencySample || llmLatencySample;
+          persistAiLatency(key, llmLatencySample);
           const lastRun = {
             invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
             status: 'no_op', action_type: 'transport_degraded_no_op',
@@ -3208,9 +3361,29 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
       const command = buildCommand(taskId, { schedulerToken, dueKey: key, verdictPath, promptHash });
-      const { error, stdout, stderr } = await execute(command);
+      if (llmLatencySample) {
+        llmLatencySample.order_child_started_at = now().toISOString();
+        persistAiLatency(key, llmLatencySample);
+      }
+      let childResult;
+      try { childResult = await execute(command); }
+      catch (childError) {
+        if (llmLatencySample) {
+          llmLatencySample.order_child_completed_at = now().toISOString();
+          persistAiLatency(key, llmLatencySample, 'UNKNOWN', 'process_error');
+        }
+        throw childError;
+      }
+      finally {
+        if (llmLatencySample) {
+          llmLatencySample.order_child_completed_at = now().toISOString();
+          persistAiLatency(key, llmLatencySample, undefined);
+        }
+      }
+      const { error, stdout, stderr } = childResult;
       if (error && Number(error.code) !== 2) {
         const errorClass = error.killed ? 'timeout' : 'process_error';
+        if (llmLatencySample) persistAiLatency(key, llmLatencySample, 'UNKNOWN', errorClass);
         const lastRun = {
           invoked_by: safeText(invokedBy),
           started_at: startedAt,
@@ -3231,7 +3404,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver, runtimeContract);
       } catch (parseError) {
         const errorClass = safeText(parseError.message, 80);
+        if (llmLatencySample) persistAiLatency(key, llmLatencySample, 'UNKNOWN', errorClass);
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
+      }
+      if (llmLatencySample) {
+        const riskVeto = parsed.status === 'blocked'
+          && ['risk_guard_blocked', 'daily_loss_limit_reached', 'daily_risk_budget_insufficient'].includes(parsed.errorClass);
+        const orderOutcome = parsed.errorClass === 'order_submission_unknown' ? 'UNKNOWN'
+          : parsed.lifecycleStatus === 'rejected' ? 'rejected'
+            : riskVeto ? 'risk_veto'
+              : parsed.status === 'blocked' ? 'blocked'
+                : parsed.lifecycleStatus || parsed.actionType;
+        persistAiLatency(key, llmLatencySample, orderOutcome, parsed.errorClass === 'none' ? null : parsed.errorClass);
       }
       if (task.id === POST_CLOSE_TASK.id && parsed.status === 'success'
         && parsed.actionType === 'post_close_learning' && parsed.failClosed === false) {
