@@ -69,6 +69,8 @@ const APPROVED_SOURCE_TASK_PATH = process.env.KIS_HERMES_APPROVED_SOURCE_PATH
   || '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js';
 const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
+const COLLECTION_SLOT_WINDOW_MS = 10 * 60_000;
+const COLLECTION_SLOT_LEDGER_LIMIT = 68;
 const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const LLM_RESPONSE_TIMEOUT_MS = 120_000;
@@ -318,6 +320,10 @@ const INTRADAY_OUTPUT_KEYS = new Set([
 const INTRADAY_CANDIDATE_COUNT_KEYS = Object.freeze([
   'analyzed', 'observation_ready', 'data_excluded', 'model_unavailable', 'risk_excluded', 'llm_eligible',
 ]);
+const DECISION_FAILURE_DIAGNOSTICS = new Set([
+  'decision_batch_missing', 'decision_batch_age_exceeded', 'decision_batch_slot_mismatch',
+  'decision_batch_hash_invalid', 'decision_batch_future_timestamp',
+]);
 const POST_CLOSE_OUTPUT_KEYS = new Set([
   ...OUTPUT_KEYS,
   'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
@@ -430,6 +436,17 @@ function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResol
 function dueKey(task, date) {
   const parts = seoulParts(date);
   return `${task.id}:${parts.year}-${parts.month}-${parts.day}:${parts.hour}:${parts.minute}`;
+}
+
+function collectionSlotDueTime(slotId) {
+  const match = /^kis-ai-intraday-shadow-validation-v1:(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$/.exec(slotId);
+  if (!match) return null;
+  const [, year, month, day, hour, minute] = match;
+  const value = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour) - 9, Number(minute)));
+  const parts = seoulParts(value);
+  if (`${parts.year}-${parts.month}-${parts.day}:${parts.hour}:${parts.minute}` !== `${year}-${month}-${day}:${hour}:${minute}`
+    || !isDue(INTRADAY_SHADOW_TASK, value)) return null;
+  return value;
 }
 
 function collectionSlotTimeFromDueKey(slotId) {
@@ -1252,11 +1269,11 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     'holdings', 'account_aggregate', 'risk_aggregate', 'event_metadata', 'fail_closed',
     'error_class', 'raw_response_persisted', 'secret_exposure',
   ];
-  const decisionContextFailurePhases = ['none', 'auth_token_request', 'account_balance_request', 'open_orders_read_request', 'decision_context'];
+  const decisionContextFailurePhases = ['none', 'auth_token_request', 'account_balance_request', 'open_orders_read_request', 'decision_context', 'intraday_decision_lookup'];
   if (!value || Array.isArray(value) || typeof value !== 'object'
     || Object.keys(value).length < keys.length
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
-    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase'].includes(key))
+    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase', 'failure_diagnostic'].includes(key))
     || (Object.prototype.hasOwnProperty.call(value, 'failure_phase')
       && (!decisionContextFailurePhases.includes(value.failure_phase)
         || (value.status === 'success' && value.failure_phase !== 'none')
@@ -1269,12 +1286,22 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     throw new Error('invalid_decision_context');
   }
   const intradayCandidateCounts = parseIntradayCandidateCounts(value.intraday_candidate_counts, runtimeContract);
+  const failureDiagnostic = value.failure_diagnostic;
+  if (failureDiagnostic !== undefined
+    && (value.status !== 'blocked' || !DECISION_FAILURE_DIAGNOSTICS.has(failureDiagnostic))) {
+    throw new Error('invalid_decision_context');
+  }
   if (value.status === 'blocked') {
     if (value.fail_closed !== true || typeof value.error_class !== 'string' || value.error_class === 'none'
       || value.candidates.length !== 0 || value.holdings.length !== 0
       || Object.keys(value.account_aggregate).length !== 0 || Object.keys(value.risk_aggregate).length !== 0
       || value.event_metadata.length !== 0) throw new Error('invalid_decision_context');
-    return Object.freeze({ blocked: true, errorClass: safeText(value.error_class, 80), failurePhase: value.failure_phase });
+    return Object.freeze({
+      blocked: true,
+      errorClass: safeText(value.error_class, 80),
+      failurePhase: value.failure_phase,
+      ...(failureDiagnostic !== undefined ? { failure_diagnostic: failureDiagnostic } : {}),
+    });
   }
   if (value.fail_closed !== false || value.error_class !== 'none') throw new Error('invalid_decision_context');
   const candidates = normalizedAiCandidates(value.candidates, runtimeContract);
@@ -1547,6 +1574,8 @@ function buildCommand(taskId, { activationPreflight = false, schedulerToken = ''
   const args = ['-m', 'kis_trading_lab', 'ai-market-open-dry-run-once', '--approval', ACTIVATION_APPROVAL, '--task-id', taskId, '--strategy-manifest', STRATEGY_MANIFEST, '--db', VPS_DB_PATH];
   if (activationPreflight) args.push('--activation-preflight');
   return { command: KIS_VENV_PYTHON, args, cwd: KIS_REPO, env: {
+    ...(taskId === INTRADAY_SHADOW_TASK.id && !activationPreflight && collectionSlotDueTime(invocationDueKey)
+      ? { KIS_HERMES_DUE_KEY: invocationDueKey } : {}),
     ...(taskId === POST_CLOSE_TASK.id ? { KIS_HERMES_DUE_KEY: invocationDueKey } : {}),
     ...(verdictPath ? { KIS_LLM_VERDICT_PATH: verdictPath } : {}),
   } };
@@ -1769,6 +1798,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   let schedulerFaulted = false;
   let releaseSchedulerOwnership = null;
   let stateFaultNotificationPromise = null;
+  const deferredCollectionLockSlots = new Map();
 
   async function queueSelfHeal(key, taskId, errorClass, lastRun = {}) {
     if (!AUTO_REPAIRABLE_ERROR_CLASSES.has(errorClass) || typeof repairTaskSender !== 'function') {
@@ -1851,6 +1881,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (context.blocked) {
       const error = new Error(context.errorClass);
       error.failurePhase = context.failurePhase;
+      error.failureDiagnostic = context.failure_diagnostic;
       sample.llm_outcome = context.errorClass.includes('timeout') ? 'timeout' : 'error';
       error.llmLatencySample = sample;
       throw error;
@@ -1953,7 +1984,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
 
   function disabledState() {
-    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, incidents: {}, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.kind === 'order' ? { activation_artifact_hash: null, refresh_only_pending: false, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
+    return { canonical_task_id: CANONICAL_TASK_ID, task_owner: TASK_OWNER, state: 'DISABLED', activation_approval: ACTIVATION_APPROVAL, timezone: TIMEZONE, state_path: statePath, max_concurrent_runs: 1, retry: false, catch_up: false, backfill: false, os_cron_used: false, scheduler_registered: false, server_registered: false, incidents: {}, tasks: Object.fromEntries(TASKS.map((task) => [task.id, { state: 'DISABLED', schedule: task.schedule, next_run_at: null, last_due_at: null, last_run: null, consecutive_transport_failures: 0, pending_invocation: null, ...(task.id === INTRADAY_SHADOW_TASK.id ? { collection_slot_ledger: [] } : {}), ...(task.kind === 'order' ? { activation_artifact_hash: null, refresh_only_pending: false, daily_entry_cap: INTRADAY_PROVIDER_ATTESTATION.daily_entry_cap, daily_entry_cap_approval_hash: null, ...INTRADAY_PROVIDER_ATTESTATION } : {}) }])) };
   }
   function loadStrict() {
     try {
@@ -1986,6 +2017,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         };
       }
       const orderTask = value.tasks[ORDER_TASK.id];
+      const collectionTask = value.tasks[INTRADAY_SHADOW_TASK.id];
+      if (collectionTask.collection_slot_ledger === undefined) collectionTask.collection_slot_ledger = [];
+      if (!Array.isArray(collectionTask.collection_slot_ledger)
+        || collectionTask.collection_slot_ledger.length > COLLECTION_SLOT_LEDGER_LIMIT
+        || collectionTask.collection_slot_ledger.some((entry) => !entry || typeof entry !== 'object'
+          || typeof entry.due_key !== 'string' || !collectionSlotDueTime(entry.due_key)
+          || !['RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED'].includes(entry.status))) {
+        throw new Error('state_contract_invalid');
+      }
       if (orderTask.refresh_only_pending === undefined) orderTask.refresh_only_pending = false;
       if (typeof orderTask.refresh_only_pending !== 'boolean') throw new Error('state_contract_invalid');
       const providerFieldsPresent = Object.keys(INTRADAY_PROVIDER_ATTESTATION)
@@ -2031,6 +2071,158 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (value.incidents === undefined) value.incidents = {};
     atomicWrite(statePath, value);
     return value;
+  }
+  function mergeCollectionLedger(taskState, entry) {
+    const ledger = (taskState.collection_slot_ledger || [])
+      .filter((item) => item.due_key !== entry.due_key);
+    ledger.push(entry);
+    ledger.sort((left, right) => left.scheduled_due_at.localeCompare(right.scheduled_due_at));
+    if (ledger.length <= COLLECTION_SLOT_LEDGER_LIMIT) return ledger;
+    const running = ledger.filter((item) => item.status === 'RUNNING');
+    const terminal = ledger.filter((item) => item.status !== 'RUNNING');
+    // Keep the newest two trading-day windows (68 scheduled slots); RUNNING entries always survive pruning.
+    return [...terminal.slice(-(COLLECTION_SLOT_LEDGER_LIMIT - running.length)), ...running]
+      .sort((left, right) => left.scheduled_due_at.localeCompare(right.scheduled_due_at));
+  }
+  function persistCollectionSlot(entry, { lockHeld = false, lastRunStartedAt = null, expectedStatus = null } = {}) {
+    let release;
+    try {
+      if (!lockHeld) release = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      const taskState = latest.tasks[INTRADAY_SHADOW_TASK.id];
+      const priorEntry = (taskState.collection_slot_ledger || []).find((item) => item.due_key === entry.due_key);
+      if (expectedStatus && priorEntry?.status !== expectedStatus) return latest;
+      const ledger = mergeCollectionLedger(taskState, entry);
+      const { due_key, scheduled_due_at, dispatch_started_at, run_started_at,
+        run_completed_at, skip_reason, failure_reason } = entry;
+      const lastRun = lastRunStartedAt && taskState.last_run?.started_at === lastRunStartedAt
+        ? {
+            ...taskState.last_run, due_key, scheduled_due_at, dispatch_started_at,
+            run_started_at, run_completed_at, skip_reason, failure_reason,
+          }
+        : taskState.last_run;
+      return save({ ...latest, tasks: { ...latest.tasks, [INTRADAY_SHADOW_TASK.id]: {
+        ...taskState, collection_slot_ledger: ledger, last_run: lastRun,
+      } } });
+    } catch (error) {
+      if (error.message === 'scheduler_lock_active') return null;
+      throw error;
+    } finally { if (release) release(); }
+  }
+  function finalizeExpiredCollectionSlots(referenceTime, {
+    dueFrom = null, skipReason = 'scheduler_late', fallbackSafetyMonitor = null,
+  } = {}) {
+    const retainMonitorResult = (state) => {
+      if (!fallbackSafetyMonitor) return state;
+      const persistedAt = Date.parse(state.last_safety_monitor?.checked_at || '');
+      const fallbackAt = Date.parse(fallbackSafetyMonitor.checked_at || '');
+      return !Number.isFinite(persistedAt) || (Number.isFinite(fallbackAt) && fallbackAt >= persistedAt)
+        ? { ...state, last_safety_monitor: fallbackSafetyMonitor }
+        : state;
+    };
+    const actual = referenceTime instanceof Date ? referenceTime : new Date(referenceTime);
+    if (Number.isNaN(actual.getTime())) return retainMonitorResult(loadStrict());
+    const parts = seoulParts(actual);
+    if (['Sat', 'Sun'].includes(parts.weekday)) return retainMonitorResult(loadStrict());
+    const dueStart = dueFrom || loadStrict().tasks[INTRADAY_SHADOW_TASK.id].next_run_at;
+    const earliest = dueStart ? new Date(dueStart) : null;
+    if (!earliest || Number.isNaN(earliest.getTime())) return retainMonitorResult(loadStrict());
+    const dates = [];
+    const isOfficialTradeDate = (date) => {
+      if (['Sat', 'Sun'].includes(date.weekday)) return false;
+      try { return calendarProofResolver(`${date.year}-${date.month}-${date.day}`)?.isTradingDay === true; }
+      catch { return false; }
+    };
+    if (isOfficialTradeDate(parts)) dates.push(parts);
+    for (let offset = 1; offset <= 10; offset += 1) {
+      const prior = seoulParts(new Date(actual.getTime() - (offset * 24 * 60 * 60_000)));
+      if (isOfficialTradeDate(prior)) { dates.unshift(prior); break; }
+    }
+    const candidates = [];
+    for (const date of dates) {
+      for (const minute of INTRADAY_SHADOW_TASK.minutes) {
+        const scheduled = new Date(Date.UTC(Number(date.year), Number(date.month) - 1, Number(date.day), Math.floor(minute / 60) - 9, minute % 60));
+        if (scheduled < earliest || scheduled.getTime() + COLLECTION_SLOT_WINDOW_MS > actual.getTime()) continue;
+        candidates.push({ due_key: dueKey(INTRADAY_SHADOW_TASK, scheduled), scheduled_due_at: scheduled.toISOString() });
+      }
+    }
+    if (!candidates.length) return retainMonitorResult(loadStrict());
+    let release;
+    try {
+      release = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      const taskState = latest.tasks[INTRADAY_SHADOW_TASK.id];
+      const existing = taskState.collection_slot_ledger || [];
+      const skipped = [];
+      for (const candidate of candidates) {
+        const { due_key: key, scheduled_due_at } = candidate;
+        if (existing.some((entry) => entry.due_key === key)) {
+          deferredCollectionLockSlots.delete(key);
+          continue;
+        }
+        const scheduled = new Date(scheduled_due_at);
+        const previousActive = existing.some((entry) => entry.run_started_at
+          && entry.run_completed_at && Date.parse(entry.run_started_at) <= scheduled.getTime()
+          && Date.parse(entry.run_completed_at) > scheduled.getTime() + COLLECTION_SLOT_WINDOW_MS);
+        const deferredLock = deferredCollectionLockSlots.get(key);
+        const reason = ['safety_blocked', 'service_blocked'].includes(skipReason) || deferredLock
+          ? (deferredLock ? 'lock_held' : skipReason)
+          : previousActive ? 'previous_run_active' : skipReason;
+        skipped.push({
+          due_key: key, status: 'SKIPPED', scheduled_due_at,
+          dispatch_started_at: deferredLock?.dispatchAttempted ? deferredLock.at : null,
+          run_started_at: null, run_completed_at: null,
+          audited_at: actual.toISOString(), skip_reason: reason, failure_reason: null,
+        });
+        deferredCollectionLockSlots.delete(key);
+      }
+      if (!skipped.length) return retainMonitorResult(latest);
+      let ledger = existing;
+      for (const entry of skipped) ledger = mergeCollectionLedger({ collection_slot_ledger: ledger }, entry);
+      const latestTask = latest.tasks[INTRADAY_SHADOW_TASK.id];
+      const tail = skipped[skipped.length - 1];
+      const nextAfterExpired = nextRunAt(INTRADAY_SHADOW_TASK, new Date(tail.scheduled_due_at));
+      const nextRun = latestTask.next_run_at && new Date(latestTask.next_run_at) <= new Date(tail.scheduled_due_at)
+        ? nextAfterExpired : latestTask.next_run_at;
+      const latestRun = {
+        status: 'no_op', action_type: 'missed_window_no_op', due_key: tail.due_key,
+        scheduled_due_at: tail.scheduled_due_at, dispatch_started_at: tail.dispatch_started_at,
+        run_started_at: null, run_completed_at: null, skip_reason: tail.skip_reason,
+        failure_reason: null, catch_up: false, audited_at: actual.toISOString(),
+      };
+      return save({ ...latest, tasks: { ...latest.tasks, [INTRADAY_SHADOW_TASK.id]: {
+        ...latestTask, collection_slot_ledger: ledger, next_run_at: nextRun, last_run: latestRun,
+      } } });
+    } catch (error) {
+      if (error.message === 'scheduler_lock_active') {
+        for (const { due_key: key } of candidates) {
+          if (!deferredCollectionLockSlots.has(key)) {
+            deferredCollectionLockSlots.set(key, { at: actual.toISOString(), dispatchAttempted: false });
+          }
+        }
+        return retainMonitorResult(loadStrict());
+      }
+      throw error;
+    } finally { if (release) release(); }
+  }
+  function failInterruptedCollectionSlots() {
+    let release;
+    try {
+      release = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      const taskState = latest.tasks[INTRADAY_SHADOW_TASK.id];
+      const auditedAt = now().toISOString();
+      const ledger = (taskState.collection_slot_ledger || []).map((entry) => entry.status === 'RUNNING'
+        ? { ...entry, status: 'FAILED', run_completed_at: null, audited_at: auditedAt, failure_reason: 'process_interrupted' }
+        : entry);
+      if (ledger.every((entry, index) => entry === taskState.collection_slot_ledger[index])) return latest;
+      return save({ ...latest, tasks: { ...latest.tasks, [INTRADAY_SHADOW_TASK.id]: {
+        ...taskState, collection_slot_ledger: ledger,
+      } } });
+    } catch (error) {
+      if (error.message === 'scheduler_lock_active') return loadStrict();
+      throw error;
+    } finally { if (release) release(); }
   }
   function persistAiLatency(slotId, sample, orderOutcome, orderErrorClass) {
     if (!sample) return;
@@ -3034,7 +3226,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (current.state !== 'ACTIVE') return current;
     return { ...current, scheduler_registered: Boolean(timer) && schedulerRegistered, server_registered: Boolean(timer) && schedulerRegistered && serverRegistered };
   }
-  async function runOnce({ taskId, invokedBy = 'hermes_scheduler', dueAt = now() } = {}) {
+  async function runOnce({ taskId, invokedBy = 'hermes_scheduler', dueAt = now(), collectionDispatch = false } = {}) {
     if (!TASK_BY_ID.has(taskId)) throw new Error('unknown_task_id');
     if (enforceSchedulerOwnership && typeof releaseSchedulerOwnership !== 'function') {
       throw new Error('scheduler_owner_required');
@@ -3109,8 +3301,13 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const scheduled = new Date(taskState.next_run_at || 0);
     const delayedNonOrderStart = !sameMinute(taskState.next_run_at, dueTime)
       && isDelayedNonOrderStart(task, scheduled, now(), calendarProofResolver);
-    const scheduledDueTime = delayedNonOrderStart ? scheduled : dueTime;
+    const isCollection = taskId === INTRADAY_SHADOW_TASK.id;
+    const withinCollectionSlot = isCollection && collectionDispatch && isDue(task, scheduled)
+      && dueTime.getTime() >= scheduled.getTime()
+      && dueTime.getTime() < scheduled.getTime() + COLLECTION_SLOT_WINDOW_MS;
+    const scheduledDueTime = delayedNonOrderStart || withinCollectionSlot ? scheduled : dueTime;
     if (!isDue(task, scheduledDueTime) || !sameMinute(taskState.next_run_at, scheduledDueTime)) {
+      if (isCollection) return finalizeExpiredCollectionSlots(dueTime, { dueFrom: taskState.next_run_at });
       if (scheduled.getTime() < dueTime.getTime()) {
         const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
           && !hasIntradayProviderAttestation(taskState)
@@ -3126,6 +3323,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       assertLegacyPaused();
     } catch (error) {
       if (release) release();
+      if (isCollection && error.message === 'scheduler_lock_active') {
+        deferredCollectionLockSlots.set(dueKey(task, scheduledDueTime), { at: startedAt, dispatchAttempted: true });
+        return loadStrict();
+      }
       const errorClass = sanitizeErrorClass(error.message);
       return pauseForTask(loadStrict(), errorClass, {
         invoked_by: safeText(invokedBy),
@@ -3149,6 +3350,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       return current;
     }
     const key = dueKey(task, scheduledDueTime);
+    if (isCollection && taskState.collection_slot_ledger?.some((entry) => entry.due_key === key)) {
+      release();
+      return current;
+    }
     const postCloseRefresh = isPostCloseRefreshSlot(task, scheduledDueTime);
     const scheduledParts = seoulParts(scheduledDueTime);
     const officialTradeDate = `${scheduledParts.year}-${scheduledParts.month}-${scheduledParts.day}`;
@@ -3247,13 +3452,31 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     let llmVerdictStatus = requiresAiVerdict ? 'pending' : 'not_required';
     let llmVerdictSummary = null;
     let llmLatencySample = null;
+    let collectionSlotEntry = null;
+    let collectionRunStartedAt = null;
+    let collectionFinalStatus = null;
+    let collectionFailureReason = null;
     try {
       const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
         && !hasIntradayProviderAttestation(taskState)
         ? REFRESH_ONLY_ORDER_TASK : task;
-      save({ ...current, tasks: { ...current.tasks, [taskId]: {
-        ...taskState, last_due_at: key, next_run_at: nextRunAt(scheduleTask, scheduledDueTime), pending_invocation: pendingInvocation,
-      } } });
+      const latestBeforeStart = loadStrict();
+      const latestTaskBeforeStart = latestBeforeStart.tasks[taskId];
+      if (latestTaskBeforeStart.next_run_at !== taskState.next_run_at
+        || latestBeforeStart.state !== 'ACTIVE' || latestTaskBeforeStart.state !== 'ACTIVE') return latestBeforeStart;
+      const nextTaskState = {
+        ...latestTaskBeforeStart, last_due_at: key,
+        next_run_at: nextRunAt(scheduleTask, scheduledDueTime), pending_invocation: pendingInvocation,
+      };
+      if (isCollection) {
+        collectionSlotEntry = {
+          due_key: key, status: 'RUNNING', scheduled_due_at: scheduledDueTime.toISOString(),
+          dispatch_started_at: startedAt, run_started_at: null, run_completed_at: null,
+          skip_reason: null, failure_reason: null,
+        };
+        nextTaskState.collection_slot_ledger = mergeCollectionLedger(latestTaskBeforeStart, collectionSlotEntry);
+      }
+      save({ ...latestBeforeStart, tasks: { ...latestBeforeStart.tasks, [taskId]: nextTaskState } });
       if (task.kind === 'order') {
         attestationPath = attestationFileForDueKey(key, orderAttestationDir);
         atomicWrite(attestationPath, pendingInvocation);
@@ -3307,6 +3530,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             status: 'no_op', action_type: 'transport_degraded_no_op',
             error_class: reason, fail_closed: true, retry: false,
             ...(error.failurePhase ? { failure_phase: error.failurePhase } : {}),
+            ...(error.failureDiagnostic ? { failure_diagnostic: error.failureDiagnostic } : {}),
             decision_context_candidate_count: decisionContextCandidateCount,
             llm_invoked: llmInvoked,
             llm_verdict_status: llmVerdictStatus,
@@ -3365,9 +3589,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         llmLatencySample.order_child_started_at = now().toISOString();
         persistAiLatency(key, llmLatencySample);
       }
+      if (isCollection) {
+        collectionRunStartedAt = now().toISOString();
+        persistCollectionSlot({ ...collectionSlotEntry, run_started_at: collectionRunStartedAt }, {
+          lockHeld: true, expectedStatus: 'RUNNING',
+        });
+      }
       let childResult;
       try { childResult = await execute(command); }
       catch (childError) {
+        if (isCollection) collectionFailureReason = 'collector_process_error';
         if (llmLatencySample) {
           llmLatencySample.order_child_completed_at = now().toISOString();
           persistAiLatency(key, llmLatencySample, 'UNKNOWN', 'process_error');
@@ -3383,6 +3614,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const { error, stdout, stderr } = childResult;
       if (error && Number(error.code) !== 2) {
         const errorClass = error.killed ? 'timeout' : 'process_error';
+        if (isCollection) collectionFailureReason = errorClass;
         if (llmLatencySample) persistAiLatency(key, llmLatencySample, 'UNKNOWN', errorClass);
         const lastRun = {
           invoked_by: safeText(invokedBy),
@@ -3404,8 +3636,23 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           : parseKisAiMarketOpenOutput(stdout, taskId, calendarProofResolver, runtimeContract);
       } catch (parseError) {
         const errorClass = safeText(parseError.message, 80);
+        if (isCollection) collectionFailureReason = errorClass;
         if (llmLatencySample) persistAiLatency(key, llmLatencySample, 'UNKNOWN', errorClass);
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
+      }
+      if (isCollection) {
+        if (parsed.status === 'blocked' || parsed.failClosed) {
+          collectionFinalStatus = 'FAILED';
+          collectionFailureReason = parsed.errorClass || 'collector_blocked';
+        } else if (parsed.actionType === 'market_closed_no_op') {
+          collectionFinalStatus = 'SKIPPED';
+          collectionFailureReason = 'market_closed';
+        } else if (['idempotent_no_op', 'duplicate_slot'].includes(parsed.actionType)) {
+          collectionFinalStatus = 'SKIPPED';
+          collectionFailureReason = 'duplicate_slot';
+        } else {
+          collectionFinalStatus = 'COMPLETED';
+        }
       }
       if (llmLatencySample) {
         const riskVeto = parsed.status === 'blocked'
@@ -3751,6 +3998,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       return save({ ...finalState, tasks: { ...finalState.tasks, [taskId]: { ...finalState.tasks[taskId], state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } } });
     } finally {
+      if (collectionSlotEntry) {
+        const terminalStatus = collectionFinalStatus || 'FAILED';
+        try {
+          persistCollectionSlot({
+            ...collectionSlotEntry,
+            status: terminalStatus,
+            run_started_at: collectionRunStartedAt,
+            run_completed_at: collectionRunStartedAt ? now().toISOString() : null,
+            skip_reason: terminalStatus === 'SKIPPED' ? collectionFailureReason : null,
+            failure_reason: terminalStatus === 'FAILED' ? sanitizeErrorClass(collectionFailureReason || 'collector_failed') : null,
+          }, { lockHeld: true, lastRunStartedAt: startedAt, expectedStatus: 'RUNNING' });
+        } catch { schedulerFaulted = true; }
+      }
       if (attestationPath) {
         try {
           const stored = JSON.parse(fs.readFileSync(attestationPath, 'utf8'));
@@ -3774,7 +4034,11 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (proof.isTradingDay === false && orderTask?.state === 'ACTIVE'
         && !orderTask.pending_invocation && !blockingIncident(current)) return current;
     } catch { /* Unknown calendar coverage must continue through the fail-closed monitor. */ }
-    const monitorRun = { checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false };
+    const monitorRun = {
+      checked_at: checkedAt.toISOString(), monitor_started_at: now().toISOString(),
+      action_type: 'safety_monitor', retry: false, catch_up: false,
+    };
+    const monitorStartedMonotonic = performance.now();
     let result;
     let monitorError;
     let dailyLossEntryBlock = false;
@@ -3820,6 +4084,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
       }
     } catch (error) { monitorError = error; }
+    Object.assign(monitorRun, {
+      monitor_completed_at: now().toISOString(),
+      monitor_duration_ms: Math.max(0, Math.round(performance.now() - monitorStartedMonotonic)),
+    });
     let release;
     try { release = acquireExclusiveLock(runLockPath); }
     catch (error) {
@@ -3939,6 +4207,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       let current = withRegistration(loadStrict());
       if (JSON.stringify(current) !== JSON.stringify(loadStrict())) current = save(current);
       const time = now();
+      const collectionDueAt = current.tasks[INTRADAY_SHADOW_TASK.id]?.next_run_at || null;
       const orderTaskState = current.tasks[ORDER_TASK.id];
       const persistedOrderSlot = orderTaskState?.next_run_at && new Date(orderTaskState.next_run_at);
       if (orderTaskState?.state === 'ACTIVE' && persistedOrderSlot && !Number.isNaN(persistedOrderSlot.getTime())
@@ -3955,11 +4224,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (pausedOrder?.state === 'PAUSED'
         && pausedOrder.pause_reason === 'order_not_fully_filled'
         && !blockingIncident(current)) {
+        current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt, skipReason: 'service_blocked' });
         return notifyPause(current, ORDER_TASK.id, pausedOrder.pause_reason, pausedOrder.last_run || {});
       }
       const waiting = Object.values(current.incidents || {}).find((entry) => entry.status === 'waiting_recheck');
       if (waiting) {
-        if (Date.parse(waiting.next_recheck_at) > time.getTime()) return current;
+        if (Date.parse(waiting.next_recheck_at) > time.getTime()) {
+          return finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt, skipReason: 'service_blocked' });
+        }
         try {
           await approveIncident({ incidentId: waiting.incident_id, approval: `복구 승인 ${waiting.incident_id}`, invokedBy: waiting.approved_by }, true);
         } catch { /* The incident retains the exact blocker; market slots stay paused. */ }
@@ -3973,12 +4245,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
                 : `[KIS 복구] 중단 유지: ${sanitizeErrorClass(entry.sanitized_error_class || 'stale_incident_approval')}. 추가 자동 재확인 없음. 주문 재전송 없음.` });
           } catch { /* Notification failure never repeats recovery. */ }
         }
-        return after;
+        return finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt, skipReason: 'service_blocked' });
       }
       if (current.state === 'PAUSED' && AUTO_RESUME_AFTER_CLEAR_SAFETY.has(current.pause_reason)
         && !blockingIncident(current)) {
         current = await runSafetyMonitor(current, time);
-        if (current.last_safety_monitor?.status !== 'success') return current;
+        if (current.last_safety_monitor?.status !== 'success') {
+          return finalizeExpiredCollectionSlots(now(), {
+            dueFrom: collectionDueAt, skipReason: 'safety_blocked',
+            fallbackSafetyMonitor: current.last_safety_monitor,
+          });
+        }
         const orderWasActivated = Boolean(current.order_activated_at);
         const tasks = Object.fromEntries(TASKS.map((task) => [task.id, {
           ...current.tasks[task.id],
@@ -4003,9 +4280,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (current.state === 'ACTIVE') {
         current = await runSafetyMonitor(current, time);
-        if (current.state !== 'ACTIVE') return current;
+        if (current.state !== 'ACTIVE') {
+          return finalizeExpiredCollectionSlots(now(), {
+            dueFrom: collectionDueAt, skipReason: 'safety_blocked',
+            fallbackSafetyMonitor: current.last_safety_monitor,
+          });
+        }
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
-          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) return current;
+          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) {
+          return finalizeExpiredCollectionSlots(now(), {
+            dueFrom: collectionDueAt, skipReason: 'safety_blocked',
+            fallbackSafetyMonitor: current.last_safety_monitor,
+          });
+        }
+        current = failInterruptedCollectionSlots();
+        current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt });
         const orderTask = current.tasks[ORDER_TASK.id];
         const pendingSlot = orderTask?.next_run_at ? new Date(orderTask.next_run_at) : null;
         const safety = current.last_safety_monitor;
@@ -4037,10 +4326,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= dispatchTime.getTime()) {
-            current = await runOnce({ taskId: task.id, dueAt: now() });
+            current = await runOnce({
+              taskId: task.id, dueAt: now(),
+              ...(task.id === INTRADAY_SHADOW_TASK.id ? { collectionDispatch: true } : {}),
+            });
             if (current.state !== 'ACTIVE') break;
           }
         }
+      }
+      if (current.state !== 'ACTIVE') {
+        const reason = current.pause_reason && /safety|risk|kill|reconcil/i.test(current.pause_reason)
+          ? 'safety_blocked' : 'service_blocked';
+        current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt, skipReason: reason });
       }
       return current;
     } catch (error) {

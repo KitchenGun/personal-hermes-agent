@@ -3403,16 +3403,27 @@ test('official calendar proof is bound to the versioned local snapshot', () => {
   assert.throws(() => mod.loadOfficialCalendarProof('2026-07-21', snapshot), /proof/);
 });
 
-test('missed slot is not executed but advances so the next slot runs once', async () => {
+test('same-slot late collector runs once; expired prior slot is skipped before current-slot execution', async () => {
   let calls = 0;
   const value = await active({ execFile(c, a, o, cb) { calls += 1; cb(null, good(a[a.indexOf('--task-id') + 1])); } });
   value.setClock('2026-07-21T00:11:12Z');
   await value.task.tick();
-  assert.equal(calls, 0);
+  assert.equal(calls, 1);
+  const current = value.task.status().tasks[mod.TASKS[1].id];
+  assert.equal(current.collection_slot_ledger.find((entry) => entry.due_key.endsWith(':09:10')).status, 'COMPLETED');
   assert.equal(value.task.status().tasks[mod.TASKS[1].id].next_run_at, '2026-07-21T00:20:00.000Z');
   value.setClock('2026-07-21T00:20:31Z');
   await value.task.tick();
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
+
+  let lateCalls = 0;
+  const late = await active({ execFile(c, a, o, cb) { lateCalls += 1; cb(null, good(a[a.indexOf('--task-id') + 1])); } });
+  late.setClock('2026-07-21T00:20:31Z');
+  await late.task.tick();
+  const lateTask = late.task.status().tasks[mod.TASKS[1].id];
+  assert.equal(lateCalls, 1);
+  assert.equal(lateTask.collection_slot_ledger.find((entry) => entry.due_key.endsWith(':09:10')).skip_reason, 'scheduler_late');
+  assert.equal(lateTask.collection_slot_ledger.find((entry) => entry.due_key.endsWith(':09:20')).status, 'COMPLETED');
 });
 
 test('active filesystem lock persistently pauses without duplicate child execution', async () => {
@@ -4949,7 +4960,8 @@ test('blocked decision-context preserves sanitized failure phase and rejects uns
   blocked.status = 'blocked';
   blocked.fail_closed = true;
   blocked.error_class = 'decision_context_timeout';
-  blocked.failure_phase = 'account_balance_request';
+  blocked.failure_phase = 'intraday_decision_lookup';
+  blocked.failure_diagnostic = 'decision_batch_age_exceeded';
   blocked.candidates = [];
   blocked.holdings = [];
   blocked.account_aggregate = {};
@@ -4963,9 +4975,13 @@ test('blocked decision-context preserves sanitized failure phase and rejects uns
   const dueAt = new Date('2026-07-21T00:15:00Z');
   value.setClock(dueAt);
   const state = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
-  assert.equal(state.tasks[mod.TASKS[4].id].last_run.failure_phase, 'account_balance_request');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.failure_phase, 'intraday_decision_lookup');
+  assert.equal(state.tasks[mod.TASKS[4].id].last_run.failure_diagnostic, 'decision_batch_age_exceeded');
 
   blocked.failure_phase = 'secret_token_value';
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(blocked), slotId), /invalid_decision_context/);
+  blocked.failure_phase = 'intraday_decision_lookup';
+  blocked.failure_diagnostic = 'age_exceeded';
   assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(blocked), slotId), /invalid_decision_context/);
 });
 
@@ -5241,7 +5257,7 @@ test('mismatched AI verdict blocks before KIS execution without fallback', async
 
 for (const scenario of [
   { name: 'clear inside the new slot', finishedAt: '2026-07-21T02:20:08Z', blocked: false, collections: 1 },
-  { name: 'clear after the start window', finishedAt: '2026-07-21T02:21:08Z', blocked: false, collections: 0 },
+  { name: 'clear after the start minute within the data slot', finishedAt: '2026-07-21T02:21:08Z', blocked: false, collections: 1 },
   { name: 'blocked inside the new slot', finishedAt: '2026-07-21T02:20:08Z', blocked: true, collections: 0 },
 ]) test(`dispatch rechecks the clock after safety monitoring: ${scenario.name}`, async () => {
   let advanceClock = false;
@@ -7318,4 +7334,218 @@ test('checkpoint is restartable before safety begins and restart skips broker re
   assert.equal(state.incidents[value.incident.incident_id].attempts, 2);
   assert.equal(state.incidents[value.incident.incident_id].recheck_expires_at, checkpoint.recheck_expires_at);
   assert.equal(repeatedRecovery, 0);
+});
+
+test('slot reliability B: monitor crossing due minute dispatches original key within same data slot', async () => {
+  let finishMonitor;
+  let collections = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    onSafetyMonitor({ callback }) { finishMonitor = callback; },
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) {
+        collections += 1;
+      }
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : safetyOutput());
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T02:19:00Z');
+  const priorTick = value.task.tick();
+  await new Promise((resolve) => setImmediate(resolve));
+  value.setClock('2026-07-21T02:20:00Z');
+  await value.task.tick();
+  value.setClock('2026-07-21T02:21:00Z');
+  finishMonitor(null, safetyOutput());
+  await priorTick;
+  const after = value.task.status();
+  assert.equal(collections, 1);
+  assert.equal(after.last_safety_monitor.monitor_started_at, '2026-07-21T02:19:00.000Z');
+  assert.equal(after.last_safety_monitor.monitor_completed_at, '2026-07-21T02:21:00.000Z');
+  assert.equal(Number.isInteger(after.last_safety_monitor.monitor_duration_ms), true);
+  assert.equal(after.last_safety_monitor.monitor_duration_ms >= 0, true);
+  assert.equal(after.tasks[mod.TASKS[1].id].last_due_at, `${mod.TASKS[1].id}:2026-07-21:11:20`);
+  assert.equal(after.tasks[mod.TASKS[1].id].collection_slot_ledger.at(-1).status, 'COMPLETED');
+  assert.equal(after.tasks[mod.TASKS[1].id].collection_slot_ledger.at(-1).scheduled_due_at, '2026-07-21T02:20:00.000Z');
+});
+
+test('slot reliability C: active collector skips crossed next slot, then dispatches only the current slot', async () => {
+  let finishCollector;
+  let collections = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) {
+        collections += 1;
+        if (collections === 1) { finishCollector = callback; return; }
+      }
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : safetyOutput());
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T02:20:00Z');
+  const runningTick = value.task.tick();
+  await new Promise((resolve) => setImmediate(resolve));
+  value.setClock('2026-07-21T02:30:00Z');
+  const during = await value.task.tick();
+  assert.equal(during.tasks[mod.TASKS[1].id].last_due_at, `${mod.TASKS[1].id}:2026-07-21:11:20`);
+  assert.equal(during.tasks[mod.TASKS[1].id].next_run_at, '2026-07-21T02:30:00.000Z');
+  value.setClock('2026-07-21T02:41:00Z');
+  finishCollector(null, good(mod.TASKS[1].id));
+  await runningTick;
+  await value.task.tick();
+  const ledger = value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger;
+  assert.equal(collections, 2);
+  assert.equal(ledger.find((entry) => entry.due_key.endsWith(':11:20')).status, 'COMPLETED');
+  assert.equal(ledger.find((entry) => entry.due_key.endsWith(':11:30')).skip_reason, 'previous_run_active');
+  assert.equal(ledger.find((entry) => entry.due_key.endsWith(':11:40')).status, 'COMPLETED');
+});
+
+test('slot reliability D: held scheduler lock defers, then terminally skips expired due key', async () => {
+  const value = await active();
+  const state = value.task.status();
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  fs.writeFileSync(value.paths.runLockPath, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }));
+  value.setClock('2026-07-21T02:20:00Z');
+  const deferred = await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T02:20:00Z'), collectionDispatch: true });
+  assert.equal(deferred.tasks[mod.TASKS[1].id].pause_reason, undefined);
+  fs.unlinkSync(value.paths.runLockPath);
+  value.setClock('2026-07-21T02:30:00Z');
+  await value.task.tick();
+  const after = value.task.status();
+  const skipped = after.tasks[mod.TASKS[1].id].collection_slot_ledger.find((entry) => entry.due_key === `${mod.TASKS[1].id}:2026-07-21:11:20`);
+  assert.equal(skipped.status, 'SKIPPED');
+  assert.equal(skipped.skip_reason, 'lock_held');
+  assert.equal(skipped.dispatch_started_at, '2026-07-21T02:20:00.000Z');
+});
+
+test('slot reliability D2: failed ledger-lock commit is retried as a terminal skip without false dispatch time', async () => {
+  const value = await active();
+  const state = value.task.status();
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  fs.writeFileSync(value.paths.runLockPath, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }));
+  value.setClock('2026-07-21T02:30:00Z');
+  await value.task.tick();
+  fs.unlinkSync(value.paths.runLockPath);
+  value.setClock('2026-07-21T02:31:00Z');
+  await value.task.tick();
+  const entry = value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger
+    .find((item) => item.due_key.endsWith(':11:20'));
+  assert.equal(entry.status, 'SKIPPED');
+  assert.equal(entry.skip_reason, 'lock_held');
+  assert.equal(entry.dispatch_started_at, null);
+});
+
+test('persisted RUNNING slot is failed as interrupted and never re-executed after restart', async () => {
+  let collections = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) collections += 1;
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : safetyOutput());
+    },
+  });
+  const state = value.task.status();
+  const dueKey = `${mod.TASKS[1].id}:2026-07-21:11:20`;
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  state.tasks[mod.TASKS[1].id].collection_slot_ledger = [{
+    due_key: dueKey, status: 'RUNNING', scheduled_due_at: '2026-07-21T02:20:00.000Z',
+    dispatch_started_at: '2026-07-21T02:20:00.000Z', run_started_at: '2026-07-21T02:20:01.000Z',
+    run_completed_at: null, skip_reason: null, failure_reason: null,
+  }];
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T02:21:00Z');
+  await value.task.tick();
+  const slot = value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger[0];
+  assert.equal(collections, 0);
+  assert.equal(slot.status, 'FAILED');
+  assert.equal(slot.failure_reason, 'process_interrupted');
+});
+
+test('slot reliability E: late tick skips expired identity and dispatches only current data slot', async () => {
+  let collections = 0;
+  let observedDueKey;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) {
+        collections += 1;
+        observedDueKey = options.env.KIS_HERMES_DUE_KEY;
+      }
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : safetyOutput());
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T02:31:00Z');
+  await value.task.tick();
+  const after = value.task.status();
+  const task = after.tasks[mod.TASKS[1].id];
+  assert.equal(collections, 1);
+  assert.equal(task.collection_slot_ledger.find((entry) => entry.due_key.endsWith(':11:20')).skip_reason, 'scheduler_late');
+  assert.equal(task.last_due_at, `${mod.TASKS[1].id}:2026-07-21:11:30`);
+  assert.equal(task.collection_slot_ledger.find((entry) => entry.due_key.endsWith(':11:30')).status, 'COMPLETED');
+  assert.equal(observedDueKey, `${mod.TASKS[1].id}:2026-07-21:11:30`);
+});
+
+test('four consecutive collector slots reach terminal ledger records and a repeated key is not invoked', async () => {
+  let collections = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[1].id)) collections += 1;
+      callback(null, args.includes('--task-id') ? good(args[args.indexOf('--task-id') + 1]) : safetyOutput());
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  for (const minute of [20, 30, 40, 50]) {
+    value.setClock(`2026-07-21T02:${minute}:00Z`);
+    await value.task.tick();
+  }
+  const after = value.task.status().tasks[mod.TASKS[1].id];
+  const slots = after.collection_slot_ledger.filter((entry) => entry.due_key.includes('2026-07-21'));
+  assert.equal(collections, 4);
+  assert.deepEqual(slots.map((entry) => entry.status), ['COMPLETED', 'COMPLETED', 'COMPLETED', 'COMPLETED']);
+  assert.deepEqual(slots.map((entry) => entry.due_key.slice(-5)), ['11:20', '11:30', '11:40', '11:50']);
+
+  const duplicateState = value.task.status();
+  duplicateState.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(duplicateState));
+  value.setClock('2026-07-21T02:20:00Z');
+  await value.task.runOnce({ taskId: mod.TASKS[1].id, dueAt: new Date('2026-07-21T02:20:00Z'), collectionDispatch: true });
+  assert.equal(collections, 4);
+});
+
+test('market-closed collector no-op is terminally skipped, not completed', async () => {
+  let tradingDay = true;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id')) {
+        const output = JSON.parse(good(args[args.indexOf('--task-id') + 1], 'no_op', { action_type: 'market_closed_no_op' }));
+        output.official_session_state = 'closed';
+        return callback(null, JSON.stringify(output));
+      }
+      callback(null, safetyOutput());
+    },
+    calendarProofResolver: () => calendarProof(tradingDay),
+  });
+  tradingDay = false;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-07-22T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-07-21T02:20:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T02:20:00Z');
+  await value.task.tick();
+  const slot = value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger.at(-1);
+  assert.equal(slot.status, 'SKIPPED', JSON.stringify(slot));
+  assert.equal(slot.skip_reason, 'market_closed');
 });
