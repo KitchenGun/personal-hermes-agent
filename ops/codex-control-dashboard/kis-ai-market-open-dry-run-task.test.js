@@ -4546,6 +4546,62 @@ test('daily report uses existing sender exactly once and stores status only', as
   assert.equal(JSON.stringify(state).includes('삼성전자'), false);
 });
 
+test('daily report starts once after its 16:30 due minute within the KIS window', async () => {
+  let runs = 0;
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(c, a, o, cb) {
+      if (a.includes('--task-id') && a[a.indexOf('--task-id') + 1] === mod.TASKS[3].id) runs += 1;
+      cb(null, good(mod.TASKS[3].id, 'report_ready', { action_type: 'daily_learning_report', decisions: 3, report_message: report }));
+    },
+  });
+  const state = value.task.status();
+  state.tasks[mod.TASKS[3].id].next_run_at = '2026-07-21T07:30:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:31:00.000Z');
+  const after = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:31:00.000Z') });
+  assert.equal(runs, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(after.tasks[mod.TASKS[3].id].last_run.status, 'report_sent');
+  assert.equal(after.tasks[mod.TASKS[3].id].last_due_at, `${mod.TASKS[3].id}:2026-07-21:16:30`);
+});
+
+test('daily report tick catches the crossed minute once and expires at 17:30 KST', async () => {
+  let runs = 0;
+  let sends = 0;
+  let crossMinute;
+  const value = await active({
+    reportSender: async (message) => { if (message.content === report) sends += 1; return { discord_sent: true }; },
+    onSafetyMonitor({ callback }) { crossMinute(); callback(null, safetyOutput()); },
+    execFile(c, a, o, cb) {
+      if (a.includes('--task-id') && a[a.indexOf('--task-id') + 1] === mod.TASKS[3].id) runs += 1;
+      cb(null, good(mod.TASKS[3].id, 'report_ready', { action_type: 'daily_learning_report', decisions: 3, report_message: report }));
+    },
+  });
+  crossMinute = () => value.setClock('2026-07-21T07:31:00.000Z');
+  const state = value.task.status();
+  state.tasks[mod.TASKS[3].id].next_run_at = '2026-07-21T07:30:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:30:00.000Z');
+  await value.task.tick();
+  assert.equal(runs, 1);
+  assert.equal(sends, 1);
+
+  let expiredRuns = 0;
+  const expired = await active({
+    execFile(c, a, o, cb) { if (a.includes('--task-id') && a[a.indexOf('--task-id') + 1] === mod.TASKS[3].id) expiredRuns += 1; cb(null, good(mod.TASKS[3].id)); },
+  });
+  const expiredState = expired.task.status();
+  expiredState.tasks[mod.TASKS[3].id].next_run_at = '2026-07-21T07:30:00.000Z';
+  fs.writeFileSync(expired.paths.statePath, JSON.stringify(expiredState));
+  expired.setClock('2026-07-21T08:30:00.000Z');
+  const expiredResult = await expired.task.tick();
+  assert.equal(expiredRuns, 0);
+  assert.equal(expiredResult.tasks[mod.TASKS[3].id].last_run.action_type, 'missed_window_no_op');
+  assert.equal(expiredResult.tasks[mod.TASKS[3].id].last_run.catch_up, false);
+});
+
 test('daily report rejects unapproved symbols, price details, and mismatched facts before delivery', async () => {
   for (const unsafeReport of (
     [
@@ -4605,6 +4661,7 @@ test('report failure pauses only reporting and never retries the KIS cycle', asy
   });
   value.setClock('2026-07-21T07:30:00Z');
   const state = await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:30:00Z') });
+  await value.task.runOnce({ taskId: mod.TASKS[3].id, dueAt: new Date('2026-07-21T07:31:00Z') });
   assert.equal(sends, 1); assert.equal(runs, 1); assert.equal(state.state, 'ACTIVE');
   assert.equal(state.tasks[mod.TASKS[3].id].state, 'PAUSED');
   assert.equal(state.tasks[mod.TASKS[0].id].state, 'ACTIVE');
