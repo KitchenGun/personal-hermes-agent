@@ -438,9 +438,11 @@ function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResol
     || invokedMinute < startMinute
     || invokedMinute >= (supervisorStart ? 550 : dailyReportStart ? 1050 : 1070)) return false;
   try {
-    return calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`)?.isTradingDay === true;
+    const proof = calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`);
+    return proof?.isTradingDay === true
+      || (task.id === POST_CLOSE_TASK.id && proof?.isTradingDay !== false);
   } catch {
-    return false;
+    return task.id === POST_CLOSE_TASK.id;
   }
 }
 
@@ -713,6 +715,8 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     && value.status === 'success' && value.action_type === 'intraday_shadow';
   const hasPostCloseResult = value.task_id === POST_CLOSE_TASK.id
     && value.status === 'success' && value.action_type === 'post_close_learning';
+  const hasPostCloseCalendarSummary = value.task_id === POST_CLOSE_TASK.id
+    && Object.prototype.hasOwnProperty.call(value, 'calendar_refresh_summary');
   const expectedOutputKeys = hasIntradayResult
     ? INTRADAY_OUTPUT_KEYS
     : hasPostCloseResult
@@ -722,7 +726,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))
     || Object.keys(value).some((key) => !expectedOutputKeys.has(key)
       && key !== 'intraday_candidate_counts'
-      && !(hasPostCloseResult && key === 'calendar_refresh_summary'))) {
+      && !(hasPostCloseCalendarSummary && key === 'calendar_refresh_summary'))) {
     throw new Error('invalid_output_fields');
   }
   if (value.task_id !== expectedTaskId || !TASK_BY_ID.has(value.task_id)) throw new Error('invalid_output_task_id');
@@ -763,6 +767,10 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
       || (value.task_id === TASKS[1].id && value.failure_symbol !== null)
       || (value.error_class === 'database_busy'
         && value.failure_phase === 'database_begin'
+        && value.failure_symbol === null)
+      || (value.task_id === POST_CLOSE_TASK.id
+        && value.error_class === 'database_busy'
+        && value.failure_phase === 'database_open'
         && value.failure_symbol === null)
     )
   );
@@ -837,7 +845,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
       'kind_calendar_month_overlap', 'kind_calendar_publication_unverified',
       'kind_calendar_coverage_insufficient',
     ]);
-    const validOptionalSummary = hasPostCloseResult && summary && !Array.isArray(summary) && typeof summary === 'object'
+    const validOptionalSummary = hasPostCloseCalendarSummary && summary && !Array.isArray(summary) && typeof summary === 'object'
       && Object.keys(summary).length === CALENDAR_REFRESH_SUMMARY_KEYS.size
       && Object.keys(summary).every((key) => CALENDAR_REFRESH_SUMMARY_KEYS.has(key))
       && datesValid
@@ -3536,6 +3544,62 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       daily_entry_cap: taskState.daily_entry_cap,
       daily_entry_cap_approval_hash: taskState.daily_entry_cap_approval_hash,
     } : null;
+    const persistCalendarSummary = async (summary, runRecord) => {
+      if (!summary || task.id !== POST_CLOSE_TASK.id) return null;
+      const state = loadStrict();
+      if (!ownsCurrentInvocation(state, pendingInvocation)) return null;
+      const previousCalendarStatus = state.calendar_status || {};
+      const warningKey = summary.status === 'warning'
+        ? crypto.createHash('sha256').update(JSON.stringify([
+          summary.coverage_start, summary.coverage_end, summary.source, summary.error_class,
+        ])).digest('hex')
+        : null;
+      const sameWarning = warningKey && previousCalendarStatus.warning_key === warningKey;
+      const persistedRun = { ...runRecord, calendar_refresh_summary: summary,
+        ...(warningKey ? {
+          calendar_refresh_warning_key: warningKey,
+          calendar_refresh_warning_notified: sameWarning && previousCalendarStatus.warning_notified === true,
+        } : {}),
+      };
+      const calendarStatus = { ...previousCalendarStatus };
+      for (const [field, value] of Object.entries({
+        coverage_start: summary.coverage_start, coverage_end: summary.coverage_end,
+        remaining_days: summary.remaining_days, status: summary.status, source: summary.source,
+        source_hash: summary.source_hash, last_refresh_attempted_at: summary.attempted_at,
+        last_refresh_succeeded_at: summary.succeeded_at, error_class: summary.error_class,
+      })) if (value !== null && value !== undefined) calendarStatus[field] = value;
+      if (warningKey) Object.assign(calendarStatus, {
+        warning_key: warningKey,
+        warning_delivery_attempted: sameWarning && previousCalendarStatus.warning_delivery_attempted === true,
+        warning_notified: sameWarning && previousCalendarStatus.warning_notified === true,
+      });
+      let updated = save({ ...state, calendar_status: calendarStatus,
+        tasks: { ...state.tasks, [taskId]: { ...state.tasks[taskId], last_run: persistedRun } },
+      });
+      if (warningKey && calendarStatus.warning_delivery_attempted !== true && typeof reportSender === 'function') {
+        calendarStatus.warning_delivery_attempted = true;
+        updated = save({ ...updated, calendar_status: calendarStatus });
+        let delivery;
+        try {
+          delivery = await reportSender({
+            targetChannelId: REPORT_TARGET_CHANNEL_ID,
+            content: `[KIS 시장 일정 갱신 경고]\n범위: ${summary.coverage_start || '확인 불가'} ~ ${summary.coverage_end || '확인 불가'}\n남은 일수: ${summary.remaining_days ?? '확인 불가'}\n상태: ${summary.status}\n오류: ${summary.error_class}`,
+            deliveryLayer: 'hermes_calendar_refresh_warning',
+          });
+        } catch { /* warning delivery must not change calendar or trading state */ }
+        const latest = loadStrict();
+        if (!ownsCurrentInvocation(latest, pendingInvocation)
+          || latest.calendar_status?.warning_key !== warningKey) return { state: latest, runRecord: persistedRun };
+        if (delivery?.discord_sent === true) {
+          persistedRun.calendar_refresh_warning_notified = true;
+          const latestCalendarStatus = { ...latest.calendar_status, warning_notified: true };
+          updated = save({ ...latest, calendar_status: latestCalendarStatus,
+            tasks: { ...latest.tasks, [taskId]: { ...latest.tasks[taskId], last_run: persistedRun } },
+          });
+        } else updated = latest;
+      }
+      return { state: updated, runRecord: persistedRun };
+    };
     let attestationPath = null;
     let verdictPath = null;
     let promptHash = '';
@@ -3732,6 +3796,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (llmLatencySample) persistAiLatency(key, llmLatencySample, 'UNKNOWN', errorClass);
         return pauseForTask(loadStrict(), errorClass, { invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(), error_class: errorClass, fail_closed: true });
       }
+      const calendarRunRecord = {
+        invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+        status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate,
+        action_type: parsed.actionType, error_class: parsed.errorClass,
+        failure_phase: parsed.failurePhase, failure_symbol: parsed.failureSymbol,
+        failure_exception_type: parsed.failureExceptionType, failure_errno: parsed.failureErrno,
+        failure_attempt_number: parsed.failureAttemptNumber,
+      };
+      const calendarEvidence = parsed.calendarRefreshSummary
+        ? await persistCalendarSummary(parsed.calendarRefreshSummary, calendarRunRecord)
+        : null;
+      const afterProducer = loadStrict();
+      if (!ownsCurrentInvocation(afterProducer, pendingInvocation)
+        || afterProducer.state !== 'ACTIVE'
+        || afterProducer.tasks[taskId]?.state !== 'ACTIVE') return afterProducer;
       if (isCollection) {
         if (parsed.status === 'blocked' || parsed.failClosed) {
           collectionFinalStatus = 'FAILED';
@@ -3857,6 +3936,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         action_type: parsed.actionType, error_class: parsed.errorClass,
         ...(parsed.intradayCandidateCounts ? { intraday_candidate_counts: parsed.intradayCandidateCounts } : {}),
         ...(parsed.calendarRefreshSummary ? { calendar_refresh_summary: parsed.calendarRefreshSummary } : {}),
+        ...(calendarEvidence ? {
+          calendar_refresh_warning_key: calendarEvidence.runRecord.calendar_refresh_warning_key,
+          calendar_refresh_warning_notified: calendarEvidence.runRecord.calendar_refresh_warning_notified,
+        } : {}),
       };
       if (task.kind === 'order' && !ownsCurrentOrderInvocation(latest, pendingInvocation)) {
         return pauseForTask(latest, 'scheduler_attestation_state_changed', {
@@ -3904,12 +3987,17 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           const refreshBlocker = sanitizeErrorClass(
             independentShadowRefresh.errorClass || 'post_close_shadow_failed',
           );
+          const warningState = loadStrict();
+          if (calendarEvidence) Object.assign(lastRun, {
+            calendar_refresh_warning_key: calendarEvidence.runRecord.calendar_refresh_warning_key,
+            calendar_refresh_warning_notified: calendarEvidence.runRecord.calendar_refresh_warning_notified,
+          });
           if (!POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(refreshBlocker)) {
-            return pauseForTask(latest, refreshBlocker, lastRun);
+            return pauseForTask(warningState, refreshBlocker, lastRun);
           }
           const recordedRun = { ...lastRun, no_same_slot_retry: true };
-          const refreshedTask = latest.tasks[taskId];
-          const active = save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
+          const refreshedTask = warningState.tasks[taskId];
+          const active = save({ ...warningState, tasks: { ...warningState.tasks, [taskId]: {
             ...refreshedTask,
             state: 'ACTIVE',
             pause_reason: undefined,
@@ -4010,6 +4098,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           },
         } } });
       }
+      const calendarRecoveryBlocked = parsed.status === 'blocked'
+        && ((parsed.errorClass === 'post_close_observation_window_expired')
+          || (parsed.errorClass === 'official_calendar_revalidation_failed'
+            && parsed.calendarRefreshSummary?.status === 'warning'));
+      if (taskId === POST_CLOSE_TASK.id && calendarRecoveryBlocked) {
+        const postNotificationTask = postNotificationState.tasks[taskId];
+        return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
+          ...postNotificationTask,
+          state: 'ACTIVE',
+          pause_reason: undefined,
+          consecutive_transport_failures: 0,
+          next_run_at: nextRunAt(task, scheduledDueTime),
+          last_run: { ...lastRun, no_same_slot_retry: true },
+        } } });
+      }
       if (dailyLossEntryOnlyBlock) {
         const postNotificationTask = postNotificationState.tasks[taskId];
         return save({ ...postNotificationState, tasks: { ...postNotificationState.tasks, [taskId]: {
@@ -4089,55 +4192,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
         });
       }
-      const previousRun = finalState.tasks[taskId]?.last_run;
-      const summary = parsed.calendarRefreshSummary;
-      const warningKey = summary?.status === 'warning' && summary.coverage_start && summary.coverage_end
-        ? crypto.createHash('sha256').update(`${summary.coverage_start}:${summary.coverage_end}:${summary.error_class}`).digest('hex')
-        : null;
-      if (warningKey) Object.assign(lastRun, {
-        calendar_refresh_warning_key: warningKey,
-        calendar_refresh_warning_notified: previousRun?.calendar_refresh_warning_key === warningKey
-          && previousRun?.calendar_refresh_warning_notified === true,
-      });
-      const previousCalendarStatus = finalState.calendar_status || {};
-      const calendarStatus = summary ? { ...previousCalendarStatus } : previousCalendarStatus;
-      if (summary) {
-        for (const [key, value] of Object.entries({
-          coverage_start: summary.coverage_start,
-          coverage_end: summary.coverage_end,
-          remaining_days: summary.remaining_days,
-          status: summary.status,
-          source: summary.source,
-          source_hash: summary.source_hash,
-          last_refresh_attempted_at: summary.attempted_at,
-          last_refresh_succeeded_at: summary.succeeded_at,
-          error_class: summary.error_class,
-        })) {
-          if (value !== null && value !== undefined) calendarStatus[key] = value;
-        }
-      }
       const completedState = save({ ...finalState,
-        ...(summary ? { calendar_status: calendarStatus } : {}),
         tasks: { ...finalState.tasks, [taskId]: { ...finalState.tasks[taskId], state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } },
       });
-      if (warningKey && lastRun.calendar_refresh_warning_notified !== true && typeof reportSender === 'function') {
-        try {
-          const delivery = await reportSender({
-            targetChannelId: REPORT_TARGET_CHANNEL_ID,
-            content: `[KIS 시장 일정 갱신 경고]\n범위: ${summary.coverage_start} ~ ${summary.coverage_end}\n남은 일수: ${summary.remaining_days}\n상태: ${summary.status}\n오류: ${summary.error_class}`,
-            deliveryLayer: 'hermes_calendar_refresh_warning',
-          });
-          if (delivery?.discord_sent === true) {
-            const current = loadStrict();
-            if (current.tasks[taskId]?.last_run?.calendar_refresh_warning_key === warningKey) {
-              return save({ ...current, tasks: { ...current.tasks, [taskId]: {
-                ...current.tasks[taskId],
-                last_run: { ...current.tasks[taskId].last_run, calendar_refresh_warning_notified: true },
-              } } });
-            }
-          }
-        } catch { /* warning delivery must not change calendar or trading state */ }
-      }
       return completedState;
     } finally {
       if (collectionSlotEntry) {

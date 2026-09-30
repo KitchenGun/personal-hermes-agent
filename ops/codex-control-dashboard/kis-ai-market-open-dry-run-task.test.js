@@ -1299,6 +1299,152 @@ test('tick does not delayed-dispatch an active order refresh at the exclusive wi
   assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_window_no_op');
 });
 
+test('expired KIS producer warning flows through tick and refreshed official proof', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async (t) => {
+  const realDateNow = Date.now;
+  Date.now = () => Date.parse('2026-11-04T00:00:00Z');
+  t.after(() => { Date.now = realDateNow; });
+  const producer = process.env.KIS_REPORT_PRODUCER_SOURCE;
+  const python = process.env.KIS_REPORT_TEST_PYTHON || 'python';
+  const manifest = process.env.KIS_RUNTIME_CONTRACT_MANIFEST_PATH;
+  assert.ok(fs.existsSync(producer));
+  assert.ok(manifest && fs.existsSync(manifest));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-calendar-producer-'));
+  const database = path.join(root, 'vps.sqlite3');
+  const killSwitch = path.join(root, 'kill-switch');
+  const snapshot = path.join(root, 'calendar.json');
+  const script = `
+import importlib.util, json, sys, sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+source = Path(sys.argv[1]).resolve()
+root = source.parents[1]
+mode, directory = sys.argv[2], Path(sys.argv[3])
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location('runtime_fixture', root / 'tests/test_ai_market_open_runtime.py')
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+database = directory / 'vps.sqlite3'
+kill_switch = directory / 'kill-switch'
+snapshot = directory / 'calendar.json'
+if mode == 'init':
+    fixture._database(database)
+    kill_switch.write_text('disabled\\n', encoding='utf-8')
+    snapshot.write_bytes(fixture.CALENDAR.read_bytes())
+    print('{}')
+else:
+    day = {'expired': 2, 'restored': 3, 'busy': 4}[mode]
+    now = datetime(2026, 11, day, 7, 21, tzinfo=timezone.utc)
+    original_refresh = fixture.ai_market_open_runtime.refresh_market_calendar_snapshot
+    observation_times = iter(now + timedelta(seconds=offset) for offset in (0, 1, 10))
+    def fetch(year, month):
+        if mode == 'expired':
+            return fixture._fake_kind_month_html(year, month, None)
+        event_day, event_name = {11: (25, '성탄절'), 12: (25, '성탄절'), 1: (1, '신정')}[month]
+        return fixture._fake_kind_month_html(year, month, event_day, event_name)
+    if mode == 'busy':
+        snapshot.write_bytes(fixture.CALENDAR.read_bytes())
+        def database_busy(_path):
+            raise sqlite3.OperationalError('database is locked')
+        result = fixture._run_task(database, kill_switch, fixture.SafeClient(), fixture.TASK_IDS[2],
+            now=now, snapshot_path=str(snapshot), connection_factory=database_busy)
+    else:
+        clock_values = iter(now + timedelta(seconds=offset) for offset in range(1, 20))
+        def refresh(path, *, reference_time):
+            return original_refresh(path, reference_time=reference_time, fetch=fetch, clock=lambda: next(clock_values))
+        fixture.ai_market_open_runtime.refresh_market_calendar_snapshot = refresh
+        result = fixture._run_task(database, kill_switch, fixture.SafeClient(), fixture.TASK_IDS[2],
+            now=now, snapshot_path=str(snapshot), observation_clock=lambda: next(observation_times))
+    with fixture._connection(database) as connection:
+        session_runs = connection.execute('SELECT COUNT(*) FROM ai_session_runs').fetchone()[0]
+        learning_runs = connection.execute('SELECT COUNT(*) FROM ai_learning_runs').fetchone()[0]
+    print(json.dumps({'result': result, 'session_runs': session_runs, 'learning_runs': learning_runs}))
+`;
+  const runProducer = (mode) => new Promise((resolve, reject) => execFile(python,
+    ['-c', script, producer, mode, root], {
+      cwd: path.dirname(path.dirname(producer)), timeout: 120000, maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true,
+      env: { ...process.env, KIS_RUNTIME_CONTRACT_MANIFEST_PATH: manifest, PYTHONDONTWRITEBYTECODE: '1' },
+    }, (error, stdout) => error ? reject(error) : resolve(JSON.parse(stdout))));
+  const initialized = await runProducer('init');
+  assert.deepEqual(initialized, {});
+  const delivery = [];
+  let producerCalls = 0;
+  const producerResults = [];
+  let useActualSnapshot = false;
+  const value = await active({
+    calendarProofResolver: (date) => useActualSnapshot
+      ? mod.loadOfficialCalendarProof(date, snapshot)
+      : calendarProof(true),
+    execFile(command, args, options, callback) {
+      if (args.includes('--task-id') && args.includes(mod.TASKS[2].id)) {
+        producerCalls += 1;
+        runProducer(producerCalls === 1 ? 'expired' : 'restored').then((output) => {
+          producerResults.push(output);
+          callback(null, JSON.stringify(output.result));
+        }, callback);
+      } else callback(null, good(args[args.indexOf('--task-id') + 1] || mod.TASKS[0].id));
+    },
+    reportSender: async (message) => { delivery.push(message); return { discord_sent: true }; },
+  });
+  useActualSnapshot = true;
+  const firstDue = '2026-11-02T07:20:00.000Z';
+  const state = value.task.status();
+  for (const peer of [mod.TASKS[0].id, mod.TASKS[1].id, mod.TASKS[3].id]) {
+    state.tasks[peer].state = 'PAUSED';
+    state.tasks[peer].next_run_at = null;
+  }
+  state.tasks[mod.TASKS[2].id].next_run_at = firstDue;
+  state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[4].id].pause_reason = 'calendar_unverified';
+  state.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-11-02T07:21:00Z');
+
+  const expired = await value.task.tick();
+  assert.equal(producerCalls, 1);
+  assert.equal(expired.tasks[mod.TASKS[2].id].last_run.error_class, 'official_calendar_revalidation_failed');
+  assert.equal(expired.tasks[mod.TASKS[2].id].last_run.fail_closed, true);
+  assert.equal(expired.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(expired.calendar_status.status, 'warning');
+  assert.equal(expired.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(expired.tasks[mod.TASKS[2].id].next_run_at, '2026-11-03T07:20:00.000Z');
+  const failedProducer = producerResults[0];
+  assert.equal(failedProducer.result.status, 'blocked');
+  assert.equal(failedProducer.result.error_class, 'official_calendar_revalidation_failed');
+  assert.equal(failedProducer.result.calendar_refresh_summary.status, 'warning');
+  assert.equal(failedProducer.session_runs, 1);
+  assert.equal(failedProducer.learning_runs, 0);
+  assert.equal(delivery.filter((item) => item.deliveryLayer === 'hermes_calendar_refresh_warning').length, 1);
+  await value.task.tick();
+  assert.equal(producerCalls, 1);
+
+  value.setClock('2026-11-03T07:21:00Z');
+  const restored = await value.task.tick();
+  assert.equal(producerCalls, 2);
+  assert.equal(restored.tasks[mod.TASKS[2].id].last_run.status, 'success', JSON.stringify(producerResults[1]));
+  assert.equal(restored.calendar_status.status, 'refreshed');
+  assert.equal(restored.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  const restoredProducer = producerResults[1];
+  assert.equal(restoredProducer.result.status, 'success');
+  assert.equal(restoredProducer.result.official_calendar_verified, true);
+  assert.equal(restoredProducer.result.calendar_refresh_summary.status, 'refreshed');
+  assert.equal(restoredProducer.learning_runs, 1);
+  assert.equal(mod.loadOfficialCalendarProof('2026-11-03', snapshot).isTradingDay, true);
+  assert.equal(delivery.filter((item) => item.deliveryLayer === 'hermes_calendar_refresh_warning').length, 1);
+
+  const busyProducer = await runProducer('busy');
+  assert.equal(busyProducer.result.failure_phase, 'database_open');
+  const parsedBusy = mod.parseKisAiMarketOpenOutput(JSON.stringify(busyProducer.result), mod.TASKS[2].id,
+    (date) => mod.loadOfficialCalendarProof(date, snapshot));
+  assert.equal(parsedBusy.status, 'blocked');
+  assert.equal(parsedBusy.errorClass, 'database_busy');
+  assert.equal(parsedBusy.failClosed, true);
+  assert.equal(busyProducer.session_runs, 2);
+  assert.equal(busyProducer.learning_runs, 1);
+});
+
 test('expired KIS learning start remains parser-valid waiting with calendar evidence', {
   skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
 }, async () => {
@@ -3427,6 +3573,7 @@ test('post-close calendar refresh summary is optional, bounded, and validated', 
   const output = (value) => mod.parseKisAiMarketOpenOutput(value, mod.TASKS[2].id, () => calendarProof(true));
   assert.deepEqual(output(good(mod.TASKS[2].id)).calendarRefreshSummary, null);
   assert.deepEqual(output(good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary })).calendarRefreshSummary, summary);
+  assert.deepEqual(output(good(mod.TASKS[2].id, 'blocked', { calendar_refresh_summary: summary })).calendarRefreshSummary, summary);
   const unreadableSummary = {
     ...summary, coverage_start: null, coverage_end: null, remaining_days: null,
     attempted_at: null, succeeded_at: null, source: null, source_hash: null,
@@ -3492,7 +3639,218 @@ test('post-close calendar status retains prior refresh times and deduplicates wa
   assert.equal(messages.length, 1);
 });
 
-test('calendar refresh warning with unknown coverage is retained without a coverage notification or blocker', async () => {
+test('calendar warning survives independent shadow failure and failed warning delivery', async () => {
+  const summary = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: '2026-07-20T07:20:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  let deliveryAttempts = 0;
+  const value = await active({
+    independentShadowRefreshError: Object.assign(new Error('blocked'), { code: 2 }),
+    independentShadowRefreshOutput: orderGood('blocked', { error_class: 'model_v3_backfill_failed' }),
+    execFile(command, args, options, callback) {
+      if (args.includes('refresh-shadow')) {
+        callback(Object.assign(new Error('blocked'), { code: 2 }), orderGood('blocked', {
+          error_class: 'model_v3_backfill_failed',
+        }));
+        return;
+      }
+      callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+    },
+    reportSender: async (message) => {
+      if (message.deliveryLayer === 'hermes_calendar_refresh_warning') deliveryAttempts += 1;
+      throw new Error('delivery unavailable');
+    },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.calendar_status = { status: 'refreshed', error_class: 'none' };
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[4].id].pause_reason = 'tls_failed';
+  state.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(after.calendar_status.status, 'warning');
+  assert.equal(after.calendar_status.error_class, summary.error_class);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_summary.status, 'warning');
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_fail_closed, true);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_warning_notified, false);
+  assert.equal(after.calendar_status.warning_delivery_attempted, true);
+  assert.equal(deliveryAttempts, 1);
+});
+
+test('calendar warning sender pause prevents subsequent independent shadow execution', async () => {
+  let value;
+  let refreshCalls = 0;
+  const summary = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: '2026-07-21T07:20:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  value = await active({
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+    execFile(command, args, options, callback) {
+      callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+    },
+    reportSender: async (message) => {
+      if (message.deliveryLayer === 'hermes_calendar_refresh_warning') {
+        const state = value.task.status();
+        state.state = 'PAUSED';
+        state.pause_reason = 'operator_stop';
+        state.tasks[mod.TASKS[2].id].state = 'PAUSED';
+        state.tasks[mod.TASKS[2].id].pause_reason = 'operator_stop';
+        fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+      }
+      return { discord_sent: true };
+    },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(after.state, 'PAUSED');
+  assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
+  assert.equal(refreshCalls, 0);
+});
+
+for (const includeSummary of [true, false]) {
+  test(`producer-wait STOP prevents independent shadow execution (summary=${includeSummary})`, async () => {
+    let value;
+    let refreshCalls = 0;
+    const summary = {
+      coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+      attempted_at: '2026-07-21T07:20:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+      source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+    };
+    value = await active({
+      onIndependentShadowRefresh() { refreshCalls += 1; },
+      execFile(command, args, options, callback) {
+        const state = value.task.status();
+        state.state = 'PAUSED';
+        state.pause_reason = 'operator_stop';
+        state.tasks[mod.TASKS[2].id].state = 'PAUSED';
+        state.tasks[mod.TASKS[2].id].pause_reason = 'operator_stop';
+        fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+        callback(null, good(mod.TASKS[2].id, 'blocked', {
+          error_class: 'official_calendar_revalidation_failed',
+          ...(includeSummary ? { calendar_refresh_summary: summary } : {}),
+        }));
+      },
+    });
+    const due = '2026-07-21T07:20:00.000Z';
+    const state = value.task.status();
+    state.tasks[mod.TASKS[2].id].next_run_at = due;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+
+    const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+    assert.equal(after.state, 'PAUSED');
+    assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
+    assert.equal(refreshCalls, 0);
+  });
+}
+
+test('unknown-calendar post-close maintenance retries only at the next due slot', async () => {
+  const warning = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: '2026-07-21T07:21:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  let producerCalls = 0;
+  let deliveryAttempts = 0;
+  let calendarUnknown = false;
+  const value = await active({
+    calendarProofResolver: () => calendarUnknown ? null : calendarProof(true),
+    execFile(command, args, options, callback) {
+      if (args.includes('refresh-shadow')) {
+        callback(null, orderGood('success', { action_type: 'shadow_refreshed' }));
+        return;
+      }
+      producerCalls += 1;
+      callback(null, good(mod.TASKS[2].id, 'blocked', {
+        error_class: 'official_calendar_revalidation_failed', calendar_refresh_summary: warning,
+      }));
+    },
+    reportSender: async () => { deliveryAttempts += 1; return { discord_sent: true }; },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  calendarUnknown = true;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[4].id].pause_reason = 'calendar_unverified';
+  state.tasks[mod.TASKS[4].id].next_run_at = null;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:00Z');
+
+  const blocked = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:21:00Z') });
+  assert.equal(producerCalls, 1);
+  assert.equal(blocked.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(blocked.tasks[mod.TASKS[2].id].last_run.fail_closed, true);
+  assert.equal(blocked.tasks[mod.TASKS[2].id].last_run.error_class, 'official_calendar_revalidation_failed');
+  assert.equal(blocked.tasks[mod.TASKS[2].id].last_run.no_same_slot_retry, true);
+  assert.equal(blocked.calendar_status.status, 'warning');
+  assert.equal(blocked.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(blocked.tasks[mod.TASKS[4].id].pause_reason, 'calendar_unverified');
+  assert.equal(blocked.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+
+  const sameSlot = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:21:00Z') });
+  assert.equal(producerCalls, 1);
+  assert.equal(sameSlot.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(sameSlot.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+  assert.equal(deliveryAttempts, 1);
+});
+
+test('expired post-close observation window remains due without a calendar summary', async () => {
+  let calendarUnknown = false;
+  let producerCalls = 0;
+  let refreshCalls = 0;
+  const value = await active({
+    calendarProofResolver: () => calendarUnknown ? null : calendarProof(true),
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+    execFile(command, args, options, callback) {
+      if (args.includes('--activation-preflight')) {
+        callback(null, good(mod.TASKS[0].id, 'success', { action_type: 'activation_preflight', api_calls: 2 }));
+        return;
+      }
+      producerCalls += 1;
+      callback(null, good(mod.TASKS[2].id, 'blocked', {
+        error_class: 'post_close_observation_window_expired',
+      }));
+    },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  calendarUnknown = true;
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  state.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  state.tasks[mod.TASKS[4].id].pause_reason = 'calendar_unverified';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T07:21:00Z');
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date('2026-07-21T07:21:00Z') });
+
+  assert.equal(producerCalls, 1);
+  assert.equal(refreshCalls, 0);
+  assert.equal(after.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.error_class, 'post_close_observation_window_expired');
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.fail_closed, true);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.no_same_slot_retry, true);
+  assert.equal(after.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
+test('calendar refresh warning with unknown coverage is retained and safely notified once', async () => {
   const messages = [];
   const summary = {
     coverage_start: null, coverage_end: null, remaining_days: null,
@@ -3518,7 +3876,10 @@ test('calendar refresh warning with unknown coverage is retained without a cover
   assert.equal(after.calendar_status.coverage_end, '2026-10-31');
   assert.equal(after.calendar_status.remaining_days, 12);
   assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_summary.coverage_end, null);
-  assert.equal(messages.length, 0);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].content, /범위: 확인 불가 ~ 확인 불가/);
+  assert.equal(after.calendar_status.warning_delivery_attempted, true);
+  assert.equal(after.calendar_status.warning_notified, true);
 });
 
 test('same-slot late collector runs once; expired prior slot is skipped before current-slot execution', async () => {
