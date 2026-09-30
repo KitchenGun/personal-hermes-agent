@@ -1318,8 +1318,8 @@ with tempfile.TemporaryDirectory() as directory:
     latch.write_text('disabled\\n', encoding='utf-8')
     fixture._database(db)
     result = fixture._run_task(db, latch, fixture.SafeClient(), fixture.TASK_IDS[2],
-        now=datetime(2026, 7, 21, 8, 49, tzinfo=timezone.utc),
-        observation_clock=lambda: datetime(2026, 7, 21, 8, 50, tzinfo=timezone.utc))
+        now=datetime(2026, 10, 1, 8, 49, tzinfo=timezone.utc),
+        observation_clock=lambda: datetime(2026, 10, 1, 8, 50, tzinfo=timezone.utc))
     print(json.dumps(result))
 `;
   const stdout = await new Promise((resolve, reject) => execFile(
@@ -1332,6 +1332,9 @@ with tempfile.TemporaryDirectory() as directory:
     () => ({ isTradingDay: true, sourceHash: value.official_calendar_source_hash }));
   assert.equal(parsed.status, 'waiting');
   assert.equal(parsed.actionType, 'waiting_window');
+  assert.equal(parsed.officialTradeDate, '2026-10-01');
+  assert.equal(value.official_calendar_verified, true);
+  assert.equal(parsed.calendarRefreshSummary, null);
   assert.equal(parsed.failClosed, false);
 });
 
@@ -3393,14 +3396,129 @@ test('official calendar proof is bound to the versioned local snapshot', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-calendar-'));
   const snapshot = path.join(root, 'calendar.json');
   const payload = {
-    metadata: { source_type: 'official', environment: 'live_candidate', is_official: true, valid_for_live_manual_run: true, timezone: 'Asia/Seoul', source_hash: CALENDAR_HASH },
-    sessions: [{ trade_date: '2026-07-21', is_trading_day: true, source_hash: CALENDAR_HASH }],
+    metadata: { source_type: 'official', environment: 'live_candidate', is_official: true, valid_for_live_manual_run: true, timezone: 'Asia/Seoul', source_hash: `sha256:${'c'.repeat(64)}`, source_name: 'KRX KIND current source', source_url: 'https://kind.krx.co.kr/common/stockschedule.do?method=StockScheduleMain&index=11', observed_at: new Date().toISOString() },
+    sessions: [
+      { trade_date: '2026-07-21', is_trading_day: true, source_hash: CALENDAR_HASH, source_name: 'KRX KIND historical source', source_url: 'https://kind.krx.co.kr/common/stockschedule.do?index=11&method=StockScheduleMain', observed_at: new Date().toISOString(), available_at: new Date().toISOString(), ingested_at: new Date().toISOString() },
+      { trade_date: '2026-08-03', is_trading_day: true, source_hash: `sha256:${'b'.repeat(64)}`, source_name: 'KRX KIND refreshed source', source_url: 'https://kind.krx.co.kr/common/stockschedule.do', observed_at: new Date().toISOString(), available_at: new Date().toISOString(), ingested_at: new Date().toISOString() },
+    ],
   };
   fs.writeFileSync(snapshot, JSON.stringify(payload));
   assert.deepEqual(mod.loadOfficialCalendarProof('2026-07-21', snapshot), calendarProof(true));
-  payload.sessions[0].source_hash = `sha256:${'b'.repeat(64)}`;
+  assert.deepEqual(mod.loadOfficialCalendarProof('2026-08-03', snapshot), { isTradingDay: true, sourceHash: payload.sessions[1].source_hash });
+  payload.sessions[0].source_hash = 'invalid';
   fs.writeFileSync(snapshot, JSON.stringify(payload));
   assert.throws(() => mod.loadOfficialCalendarProof('2026-07-21', snapshot), /proof/);
+  payload.sessions[0].source_hash = CALENDAR_HASH;
+  payload.sessions[1].source_url = 'https://example.invalid/calendar';
+  fs.writeFileSync(snapshot, JSON.stringify(payload));
+  assert.throws(() => mod.loadOfficialCalendarProof('2026-08-03', snapshot), /proof/);
+  payload.sessions[1].source_url = 'https://kind.krx.co.kr/common/stockschedule.do';
+  payload.sessions[1].available_at = new Date(Date.now() + 60000).toISOString();
+  fs.writeFileSync(snapshot, JSON.stringify(payload));
+  assert.throws(() => mod.loadOfficialCalendarProof('2026-08-03', snapshot), /proof/);
+});
+
+test('post-close calendar refresh summary is optional, bounded, and validated', () => {
+  const summary = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: null, succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  const output = (value) => mod.parseKisAiMarketOpenOutput(value, mod.TASKS[2].id, () => calendarProof(true));
+  assert.deepEqual(output(good(mod.TASKS[2].id)).calendarRefreshSummary, null);
+  assert.deepEqual(output(good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary })).calendarRefreshSummary, summary);
+  const unreadableSummary = {
+    ...summary, coverage_start: null, coverage_end: null, remaining_days: null,
+    attempted_at: null, succeeded_at: null, source: null, source_hash: null,
+    status: 'warning', error_class: 'calendar_source_invalid',
+  };
+  assert.deepEqual(output(good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: unreadableSummary })).calendarRefreshSummary, unreadableSummary);
+  assert.equal(output(good(mod.TASKS[2].id, 'success', {
+    calendar_refresh_summary: { ...summary, source: 'Bearer private-secret' },
+  })).calendarRefreshSummary, null);
+  assert.throws(() => output(good(mod.TASKS[2].id, 'success', {
+    failure_exception_type: 'Bearer private-secret',
+  })), /unsafe/);
+  assert.equal(output(good(mod.TASKS[2].id, 'success', {
+    calendar_refresh_summary: { ...summary, coverage_start: '2026-11-01', coverage_end: '2026-07-20' },
+  })).calendarRefreshSummary, null);
+  const expired = {
+    ...summary, coverage_start: '2026-06-23', coverage_end: '2026-09-30',
+    remaining_days: -1, attempted_at: '2026-09-30T08:41:59.428737+00:00',
+    succeeded_at: null, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  assert.deepEqual(output(good(mod.TASKS[2].id, 'success', {
+    official_trade_date: '2026-10-01', calendar_refresh_summary: expired,
+  })).calendarRefreshSummary, expired);
+  const refreshed = {
+    ...summary, source: 'KRX_KIND_OFFICIAL', status: 'refreshed', error_class: 'none',
+    attempted_at: '2026-09-30T08:40:00Z', succeeded_at: '2026-09-30T08:41:00Z',
+  };
+  assert.deepEqual(output(good(mod.TASKS[2].id, 'success', {
+    calendar_refresh_summary: refreshed,
+  })).calendarRefreshSummary, refreshed);
+});
+
+test('post-close calendar status retains prior refresh times and deduplicates warning identity', async () => {
+  const messages = [];
+  const summary = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: null, succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  const value = await active({
+    execFile(command, args, options, callback) {
+      callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+    },
+    reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.calendar_status = {
+    last_refresh_attempted_at: '2026-07-20T07:20:00Z',
+    last_refresh_succeeded_at: '2026-07-20T07:20:02Z',
+  };
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(after.calendar_status.last_refresh_attempted_at, '2026-07-20T07:20:00Z');
+  assert.equal(after.calendar_status.last_refresh_succeeded_at, '2026-07-20T07:20:02Z');
+  assert.equal(after.calendar_status.remaining_days, 12);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_summary.status, 'warning');
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_warning_notified, true);
+  assert.equal(messages.length, 1);
+});
+
+test('calendar refresh warning with unknown coverage is retained without a coverage notification or blocker', async () => {
+  const messages = [];
+  const summary = {
+    coverage_start: null, coverage_end: null, remaining_days: null,
+    attempted_at: null, succeeded_at: null, source: null, source_hash: null,
+    status: 'warning', error_class: 'calendar_source_invalid',
+  };
+  const value = await active({
+    execFile(command, args, options, callback) {
+      callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+    },
+    reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
+  });
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.calendar_status = { coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12, source: 'KRX KIND', source_hash: CALENDAR_HASH };
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(after.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(after.calendar_status.coverage_end, '2026-10-31');
+  assert.equal(after.calendar_status.remaining_days, 12);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.calendar_refresh_summary.coverage_end, null);
+  assert.equal(messages.length, 0);
 });
 
 test('same-slot late collector runs once; expired prior slot is skipped before current-slot execution', async () => {
@@ -5854,15 +5972,32 @@ test('a clear monitor after one transient failure resumes future scheduling with
   assert.equal(held.state, 'ACTIVE');
   assert.equal(taskRuns, 0);
 
-  options.safetyOutput = safetyOutput();
+  const brokerDiagnostics = [
+    { endpoint_class: 'balance', requested_at_utc: '2026-07-21T00:02:00Z', completed_at_utc: '2026-07-21T00:02:01Z', latency_ms: 1000, http_status: 500, failure_class: 'http', success: false, diagnostic_code: 'http_500' },
+    { endpoint_class: 'open_orders', requested_at_utc: '2026-07-21T00:02:02Z', completed_at_utc: '2026-07-21T00:02:03Z', latency_ms: null, http_status: null, failure_class: 'timeout', success: false, diagnostic_code: 'timeout', timeout_stage: 'unknown' },
+    { endpoint_class: 'quote', requested_at_utc: '2026-07-21T00:02:04Z', completed_at_utc: '2026-07-21T00:02:05Z', latency_ms: null, http_status: 200, failure_class: 'timeout', success: false, diagnostic_code: 'timeout', timeout_stage: 'read' },
+  ];
+  options.safetyOutput = safetyOutput('success', { broker_http_diagnostics: brokerDiagnostics });
   value.setClock('2026-07-21T00:02:00Z');
   const recovered = await value.task.tick();
   assert.equal(recovered.state, 'ACTIVE');
   assert.equal(recovered.last_safety_monitor.status, 'success');
+  assert.deepEqual(recovered.last_safety_monitor.broker_http_diagnostics, brokerDiagnostics);
   assert.equal(recovered.consecutive_safety_monitor_failures, 0);
   assert.equal(recovered.retry, false);
   assert.equal(recovered.catch_up, false);
   assert.equal(recovered.backfill, false);
+});
+
+test('malformed broker telemetry is discarded without changing a valid safety result', () => {
+  const parsed = mod.parseSafetyMonitorOutput(safetyOutput('success', {
+    broker_http_diagnostics: [
+      { endpoint_class: 'balance', latency_ms: 'nan', secret: 'Bearer do-not-leak' },
+      { endpoint_class: 'balance', latency_ms: 0, http_status: 200, failure_class: null, success: true, diagnostic_code: 'success', requested_at_utc: null, completed_at_utc: null },
+    ],
+  }));
+  assert.equal(parsed.status, 'success');
+  assert.deepEqual(parsed.broker_http_diagnostics, []);
 });
 
 test('a paused transient safety failure auto-resumes all previously activated tasks after a clear monitor', async () => {
