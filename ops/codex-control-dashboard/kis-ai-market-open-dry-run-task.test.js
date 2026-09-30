@@ -3684,6 +3684,90 @@ test('calendar warning survives independent shadow failure and failed warning de
   assert.equal(deliveryAttempts, 1);
 });
 
+for (const recoveryStatus of ['refreshed', 'not_due']) {
+  for (const deliverySuccess of [false, true]) {
+    test(`calendar warning episode resets after ${recoveryStatus} following ${deliverySuccess ? 'successful' : 'failed'} delivery`, async () => {
+    const warning = {
+      coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+      attempted_at: '2026-07-20T07:20:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+      source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+    };
+    const recovery = {
+      ...warning, status: recoveryStatus, error_class: 'none',
+      attempted_at: '2026-07-21T07:20:00Z',
+      succeeded_at: recoveryStatus === 'refreshed' ? '2026-07-21T07:20:01Z' : null,
+    };
+    let resultIndex = 0;
+    let deliveries = 0;
+    let firstWarningKey;
+    const value = await active({
+      execFile(command, args, options, callback) {
+        const summary = [warning, recovery, warning][resultIndex++];
+        callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+      },
+      reportSender: async () => {
+        deliveries += 1;
+        if (deliveries === 1 && !deliverySuccess) throw new Error('delivery unavailable');
+        return { discord_sent: true };
+      },
+    });
+    const dueTimes = [
+      '2026-07-21T07:20:00.000Z', '2026-07-22T07:20:00.000Z', '2026-07-23T07:20:00.000Z',
+    ];
+    let state;
+    for (const [index, due] of dueTimes.entries()) {
+      state = value.task.status();
+      state.tasks[mod.TASKS[2].id].next_run_at = due;
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+      value.setClock(due);
+      state = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+      if (index === 0) {
+        firstWarningKey = state.calendar_status.warning_key;
+        assert.ok(firstWarningKey);
+        assert.equal(state.calendar_status.warning_delivery_attempted, true);
+        assert.equal(state.calendar_status.warning_notified, deliverySuccess);
+      }
+      if (index === 1) {
+        for (const field of ['warning_key', 'warning_delivery_attempted', 'warning_notified']) {
+          assert.equal(state.calendar_status[field], undefined);
+        }
+      }
+    }
+
+    assert.equal(state.tasks[mod.TASKS[2].id].last_run.calendar_refresh_summary.status, 'warning');
+    assert.ok(state.calendar_status.warning_key);
+    assert.equal(state.calendar_status.warning_key, firstWarningKey);
+    assert.equal(state.calendar_status.warning_delivery_attempted, true);
+    assert.equal(deliveries, 2);
+    });
+  }
+}
+
+test('uninterrupted calendar warning episode remains deduplicated', async () => {
+  const summary = {
+    coverage_start: '2026-07-01', coverage_end: '2026-10-31', remaining_days: 12,
+    attempted_at: '2026-07-20T07:20:00Z', succeeded_at: null, source: 'KRX_KIND_OFFICIAL',
+    source_hash: CALENDAR_HASH, status: 'warning', error_class: 'kind_calendar_publication_unverified',
+  };
+  let deliveries = 0;
+  const value = await active({
+    execFile(command, args, options, callback) {
+      callback(null, good(mod.TASKS[2].id, 'success', { calendar_refresh_summary: summary }));
+    },
+    reportSender: async () => { deliveries += 1; return { discord_sent: true }; },
+  });
+  for (const due of ['2026-07-21T07:20:00.000Z', '2026-07-22T07:20:00.000Z']) {
+    const state = value.task.status();
+    state.tasks[mod.TASKS[2].id].next_run_at = due;
+    fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+    value.setClock(due);
+    await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  }
+
+  assert.equal(deliveries, 1);
+  assert.equal(value.task.status().calendar_status.warning_notified, true);
+});
+
 test('calendar warning sender pause prevents subsequent independent shadow execution', async () => {
   let value;
   let refreshCalls = 0;
@@ -3716,9 +3800,12 @@ test('calendar warning sender pause prevents subsequent independent shadow execu
   value.setClock(due);
 
   const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const persisted = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
 
   assert.equal(after.state, 'PAUSED');
   assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED');
+  assert.equal(persisted.state, after.state);
+  assert.deepEqual(persisted.tasks[mod.TASKS[2].id], after.tasks[mod.TASKS[2].id]);
   assert.equal(refreshCalls, 0);
 });
 
