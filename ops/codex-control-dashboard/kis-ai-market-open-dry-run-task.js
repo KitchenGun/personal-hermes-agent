@@ -328,6 +328,10 @@ const POST_CLOSE_OUTPUT_KEYS = new Set([
   ...OUTPUT_KEYS,
   'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
 ]);
+const CALENDAR_REFRESH_SUMMARY_KEYS = new Set([
+  'coverage_start', 'coverage_end', 'remaining_days', 'attempted_at', 'succeeded_at',
+  'source', 'source_hash', 'status', 'error_class',
+]);
 const POST_CLOSE_COUNT_KEYS = [
   'intraday_outcomes_inserted', 'intraday_labeled_rows', 'intraday_official_dates',
 ];
@@ -342,6 +346,11 @@ const BOOLEAN_KEYS = new Set([
 ]);
 const SECRET_LIKE_RE = /(Bearer\s+[A-Za-z0-9._-]+|app[_-]?secret|app[_-]?key|access[_-]?token|refresh[_-]?token|authorization|client_secret)/i;
 const OFFICIAL_SOURCE_HASH_RE = /^sha256:[a-f0-9]{64}$/;
+const OFFICIAL_KIND_CALENDAR_URLS = new Set([
+  'https://kind.krx.co.kr/common/stockschedule.do?method=StockScheduleMain&index=11',
+  'https://kind.krx.co.kr/common/stockschedule.do?index=11&method=StockScheduleMain',
+  'https://kind.krx.co.kr/common/stockschedule.do',
+]);
 const VPS_SYMBOL_LABEL = '(?:삼성전자\\(005930\\)|SK하이닉스\\(000660\\)|현대차\\(005380\\)|\\d{6})';
 const VPS_FILL_ITEM_RE = new RegExp(`^(?:매수|매도) ${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
 const VPS_HOLDING_ITEM_RE = new RegExp(`^${VPS_SYMBOL_LABEL} [1-9]\\d*주$`);
@@ -676,18 +685,29 @@ function loadOfficialCalendarProof(tradeDate, calendarSnapshotPath = DEFAULT_CAL
   if (!metadata || metadata.source_type !== 'official' || metadata.environment !== 'live_candidate'
     || metadata.is_official !== true || metadata.valid_for_live_manual_run !== true
     || metadata.timezone !== TIMEZONE || !OFFICIAL_SOURCE_HASH_RE.test(String(metadata.source_hash || ''))
+    || typeof metadata.source_name !== 'string' || !metadata.source_name.trim()
+    || !OFFICIAL_KIND_CALENDAR_URLS.has(metadata.source_url)
     || !Array.isArray(payload.sessions)) throw new Error('official_calendar_proof_invalid');
   const matches = payload.sessions.filter((item) => item?.trade_date === tradeDate);
   if (matches.length !== 1 || typeof matches[0].is_trading_day !== 'boolean'
-    || matches[0].source_hash !== metadata.source_hash) throw new Error('official_calendar_proof_invalid');
-  return Object.freeze({ isTradingDay: matches[0].is_trading_day, sourceHash: metadata.source_hash });
+    || !OFFICIAL_SOURCE_HASH_RE.test(String(matches[0].source_hash || ''))
+    || typeof matches[0].source_name !== 'string' || !matches[0].source_name.trim()
+    || !OFFICIAL_KIND_CALENDAR_URLS.has(matches[0].source_url)
+    || !['observed_at', 'available_at', 'ingested_at'].every((field) => {
+      const value = matches[0][field];
+      return typeof value === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+        && Number.isFinite(Date.parse(value)) && Date.parse(value) <= Date.now();
+    })) throw new Error('official_calendar_proof_invalid');
+  return Object.freeze({ isTradingDay: matches[0].is_trading_day, sourceHash: matches[0].source_hash });
 }
 
 function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolver = loadOfficialCalendarProof, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   const raw = String(stdout || '');
-  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_or_oversized_output');
+  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES) throw new Error('unsafe_or_oversized_output');
   let value;
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_sanitized_json'); }
+  const { calendar_refresh_summary: rawCalendarSummary, ...coreOutput } = value || {};
+  if (SECRET_LIKE_RE.test(JSON.stringify(coreOutput))) throw new Error('unsafe_or_oversized_output');
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('invalid_sanitized_json');
   const hasIntradayResult = value.task_id === TASKS[1].id
     && value.status === 'success' && value.action_type === 'intraday_shadow';
@@ -700,7 +720,9 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     : OUTPUT_KEYS;
   if (Object.keys(value).length < expectedOutputKeys.size
     || [...expectedOutputKeys].some((key) => !Object.prototype.hasOwnProperty.call(value, key))
-    || Object.keys(value).some((key) => !expectedOutputKeys.has(key) && key !== 'intraday_candidate_counts')) {
+    || Object.keys(value).some((key) => !expectedOutputKeys.has(key)
+      && key !== 'intraday_candidate_counts'
+      && !(hasPostCloseResult && key === 'calendar_refresh_summary'))) {
     throw new Error('invalid_output_fields');
   }
   if (value.task_id !== expectedTaskId || !TASK_BY_ID.has(value.task_id)) throw new Error('invalid_output_task_id');
@@ -793,6 +815,41 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     reportMessage = validateReportMessage(value.report_message, value.official_trade_date, value.decisions, runtimeContract);
   }
   else if (value.report_message !== null) throw new Error('unexpected_report_message');
+  let calendarRefreshSummary = null;
+  if (Object.prototype.hasOwnProperty.call(value, 'calendar_refresh_summary')) {
+    const summary = value.calendar_refresh_summary;
+    const validTimestamp = (item, nullable = false) => (nullable && item === null)
+      || (typeof item === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/.test(item)
+        && Number.isFinite(Date.parse(item)) && Date.parse(item) <= Date.now());
+    const datesValid = [summary?.coverage_start, summary?.coverage_end].every((date) => date === null
+      || (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
+        && !Number.isNaN(Date.parse(`${date}T00:00:00Z`))))
+      && (summary?.coverage_start === null || summary?.coverage_end === null
+        || summary.coverage_start <= summary.coverage_end);
+    const sourcePins = new Set(['KRX_KIND_OFFICIAL']);
+    const summaryStatuses = new Set(['not_due', 'refreshed', 'warning']);
+    const summaryErrors = new Set([
+      'none', 'calendar_refresh_failed', 'calendar_source_invalid', 'calendar_source_hash_invalid',
+      'kind_calendar_response_invalid', 'kind_calendar_day_invalid',
+      'kind_calendar_day_duplicate_or_out_of_range', 'kind_calendar_event_unrecognized',
+      'kind_calendar_month_incomplete', 'kind_calendar_class_invalid',
+      'kind_calendar_weekend_class_missing', 'kind_calendar_weekday_class_invalid',
+      'kind_calendar_month_overlap', 'kind_calendar_publication_unverified',
+      'kind_calendar_coverage_insufficient',
+    ]);
+    const validOptionalSummary = hasPostCloseResult && summary && !Array.isArray(summary) && typeof summary === 'object'
+      && Object.keys(summary).length === CALENDAR_REFRESH_SUMMARY_KEYS.size
+      && Object.keys(summary).every((key) => CALENDAR_REFRESH_SUMMARY_KEYS.has(key))
+      && datesValid
+      && (summary.remaining_days === null || Number.isSafeInteger(summary.remaining_days))
+      && validTimestamp(summary.attempted_at, true) && validTimestamp(summary.succeeded_at, true)
+      && (summary.source === null || sourcePins.has(summary.source))
+      && (summary.source_hash === null || OFFICIAL_SOURCE_HASH_RE.test(String(summary.source_hash)))
+      && summaryStatuses.has(summary.status) && summaryErrors.has(summary.error_class);
+    if (validOptionalSummary) {
+      calendarRefreshSummary = Object.freeze({ ...summary });
+    }
+  }
   return Object.freeze({
     status: value.status, failClosed: value.fail_closed, reportMessage,
     officialTradeDate: value.official_trade_date, actionType: safeText(value.action_type, 60),
@@ -800,7 +857,7 @@ function parseKisAiMarketOpenOutput(stdout, expectedTaskId, calendarProofResolve
     failurePhase: safeText(value.failure_phase, 40), failureSymbol: value.failure_symbol,
     failureExceptionType: safeText(value.failure_exception_type, 40),
     failureErrno: value.failure_errno, failureAttemptNumber: value.failure_attempt_number,
-    intradayCandidateCounts,
+    intradayCandidateCounts, calendarRefreshSummary,
   });
 }
 
@@ -1519,12 +1576,15 @@ function parseWeeklyUniverseOutput(stdout) {
 
 function parseSafetyMonitorOutput(stdout) {
   const raw = String(stdout || '');
-  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('unsafe_safety_output');
+  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES) throw new Error('unsafe_safety_output');
   let value;
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_safety_output'); }
+  const { broker_http_diagnostics: rawDiagnostics, ...safetyFields } = value || {};
+  if (SECRET_LIKE_RE.test(JSON.stringify(safetyFields))) throw new Error('unsafe_safety_output');
   const keys = ['task_id', 'status', 'action_type', 'execution_owner', 'process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status', 'order_api_calls', 'vps_live_orders', 'prod_orders', 'retry', 'catch_up', 'fail_closed', 'error_class'];
-  if (!value || Array.isArray(value) || typeof value !== 'object' || Object.keys(value).length !== keys.length
+  if (!value || Array.isArray(value) || typeof value !== 'object' || Object.keys(value).length !== keys.length + (Object.hasOwn(value, 'broker_http_diagnostics') ? 1 : 0)
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+    || Object.keys(value).some((key) => !keys.includes(key) && key !== 'broker_http_diagnostics')
     || value.task_id !== 'kis-vps-safety-monitor-v1' || !['success', 'blocked'].includes(value.status)
     || value.action_type !== 'safety_monitor' || !['clear', 'active', 'unknown'].includes(value.process_lock)
     || !['vps', 'prod', 'unknown'].includes(value.execution_owner)
@@ -1536,7 +1596,37 @@ function parseSafetyMonitorOutput(stdout) {
     || value.retry !== false || value.catch_up !== false || typeof value.fail_closed !== 'boolean'
     || typeof value.error_class !== 'string' || value.fail_closed !== (value.status === 'blocked')
     || (value.status === 'success' && [value.process_lock, value.kill_state, value.open_order_status, value.reconciliation_status, value.account_risk_status].some((status) => status !== 'clear'))) throw new Error('invalid_safety_output');
-  return Object.freeze(value);
+  const diagnostics = [];
+  if (Array.isArray(rawDiagnostics)) {
+    const allowedEndpoints = new Set(['auth', 'read', 'balance', 'open_orders', 'quote', 'unknown']);
+    const allowedFailures = new Set([null, 'dns', 'tls', 'connect', 'timeout', 'http', 'unknown']);
+    for (const item of rawDiagnostics.slice(-32)) {
+      if (!item || Array.isArray(item) || typeof item !== 'object') continue;
+      const itemKeys = ['endpoint_class', 'requested_at_utc', 'completed_at_utc', 'latency_ms', 'http_status', 'failure_class', 'success', 'diagnostic_code'];
+      if (Object.keys(item).length !== itemKeys.length + (Object.hasOwn(item, 'timeout_stage') ? 1 : 0)
+        || Object.keys(item).some((key) => !itemKeys.includes(key) && key !== 'timeout_stage')
+        || !allowedEndpoints.has(item.endpoint_class)
+        || ![null, 'unknown', 'read'].includes(item.timeout_stage ?? null)
+        || (item.timeout_stage !== undefined && item.failure_class !== 'timeout')
+        || !allowedFailures.has(item.failure_class)
+        || typeof item.success !== 'boolean'
+        || typeof item.diagnostic_code !== 'string'
+        || !(new Set(['success', 'dns', 'tls', 'connect', 'timeout', 'unknown', 'http']).has(item.diagnostic_code)
+          || /^http_(?:429|500|502|503|504)$/.test(item.diagnostic_code))
+        || (item.success !== (item.diagnostic_code === 'success' && item.failure_class === null))
+        || !(item.http_status === null || (Number.isSafeInteger(item.http_status) && item.http_status >= 100 && item.http_status <= 599))
+        || (item.diagnostic_code.startsWith('http_') && Number(item.diagnostic_code.slice(5)) !== item.http_status)
+        || !(item.latency_ms === null || (typeof item.latency_ms === 'number' && Number.isFinite(item.latency_ms) && item.latency_ms >= 0))) continue;
+      const validTime = (timestamp) => typeof timestamp === 'string'
+        && /(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp) && !Number.isNaN(Date.parse(timestamp));
+      if (!validTime(item.requested_at_utc) || !validTime(item.completed_at_utc)) continue;
+      diagnostics.push(Object.freeze({
+        ...Object.fromEntries(itemKeys.map((key) => [key, item[key]])),
+        ...(item.timeout_stage !== undefined ? { timeout_stage: item.timeout_stage } : {}),
+      }));
+    }
+  }
+  return Object.freeze({ ...value, broker_http_diagnostics: Object.freeze(diagnostics) });
 }
 
 function buildCommand(taskId, { activationPreflight = false, schedulerToken = '', dueKey: invocationDueKey = '', verdictPath = '', promptHash = '' } = {}) {
@@ -3766,6 +3856,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         status: parsed.status, fail_closed: parsed.failClosed, official_trade_date: parsed.officialTradeDate,
         action_type: parsed.actionType, error_class: parsed.errorClass,
         ...(parsed.intradayCandidateCounts ? { intraday_candidate_counts: parsed.intradayCandidateCounts } : {}),
+        ...(parsed.calendarRefreshSummary ? { calendar_refresh_summary: parsed.calendarRefreshSummary } : {}),
       };
       if (task.kind === 'order' && !ownsCurrentOrderInvocation(latest, pendingInvocation)) {
         return pauseForTask(latest, 'scheduler_attestation_state_changed', {
@@ -3998,7 +4089,56 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           ...lastRun, error_class: 'scheduler_attestation_state_changed', fail_closed: true,
         });
       }
-      return save({ ...finalState, tasks: { ...finalState.tasks, [taskId]: { ...finalState.tasks[taskId], state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } } });
+      const previousRun = finalState.tasks[taskId]?.last_run;
+      const summary = parsed.calendarRefreshSummary;
+      const warningKey = summary?.status === 'warning' && summary.coverage_start && summary.coverage_end
+        ? crypto.createHash('sha256').update(`${summary.coverage_start}:${summary.coverage_end}:${summary.error_class}`).digest('hex')
+        : null;
+      if (warningKey) Object.assign(lastRun, {
+        calendar_refresh_warning_key: warningKey,
+        calendar_refresh_warning_notified: previousRun?.calendar_refresh_warning_key === warningKey
+          && previousRun?.calendar_refresh_warning_notified === true,
+      });
+      const previousCalendarStatus = finalState.calendar_status || {};
+      const calendarStatus = summary ? { ...previousCalendarStatus } : previousCalendarStatus;
+      if (summary) {
+        for (const [key, value] of Object.entries({
+          coverage_start: summary.coverage_start,
+          coverage_end: summary.coverage_end,
+          remaining_days: summary.remaining_days,
+          status: summary.status,
+          source: summary.source,
+          source_hash: summary.source_hash,
+          last_refresh_attempted_at: summary.attempted_at,
+          last_refresh_succeeded_at: summary.succeeded_at,
+          error_class: summary.error_class,
+        })) {
+          if (value !== null && value !== undefined) calendarStatus[key] = value;
+        }
+      }
+      const completedState = save({ ...finalState,
+        ...(summary ? { calendar_status: calendarStatus } : {}),
+        tasks: { ...finalState.tasks, [taskId]: { ...finalState.tasks[taskId], state: 'ACTIVE', pause_reason: undefined, consecutive_transport_failures: 0, last_run: lastRun } },
+      });
+      if (warningKey && lastRun.calendar_refresh_warning_notified !== true && typeof reportSender === 'function') {
+        try {
+          const delivery = await reportSender({
+            targetChannelId: REPORT_TARGET_CHANNEL_ID,
+            content: `[KIS 시장 일정 갱신 경고]\n범위: ${summary.coverage_start} ~ ${summary.coverage_end}\n남은 일수: ${summary.remaining_days}\n상태: ${summary.status}\n오류: ${summary.error_class}`,
+            deliveryLayer: 'hermes_calendar_refresh_warning',
+          });
+          if (delivery?.discord_sent === true) {
+            const current = loadStrict();
+            if (current.tasks[taskId]?.last_run?.calendar_refresh_warning_key === warningKey) {
+              return save({ ...current, tasks: { ...current.tasks, [taskId]: {
+                ...current.tasks[taskId],
+                last_run: { ...current.tasks[taskId].last_run, calendar_refresh_warning_notified: true },
+              } } });
+            }
+          }
+        } catch { /* warning delivery must not change calendar or trading state */ }
+      }
+      return completedState;
     } finally {
       if (collectionSlotEntry) {
         const terminalStatus = collectionFinalStatus || 'FAILED';
@@ -4061,6 +4201,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         reconciliation_status: value.reconciliation_status,
         account_risk_status: value.account_risk_status,
         error_class: safeText(value.error_class, 80),
+        broker_http_diagnostics: value.broker_http_diagnostics,
       });
       capture(result);
       if (result.status === 'blocked') {
