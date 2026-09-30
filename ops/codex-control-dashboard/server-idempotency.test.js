@@ -195,7 +195,7 @@ function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
   const processBody = processArgs[processArgs.indexOf('--body') + 1];
   assert.equal(
     processArgs[processArgs.indexOf('--workspace') + 1],
-    'worktree:/home/ubuntu/.hermes/jobs/repos/kis-trading-lab',
+    `worktree:${process.env.KIS_TRADING_LAB_REPO_DIR || '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab'}`,
   );
   assert.match(processBody, /Repair owner: kis-trading-lab/);
   assert.match(processBody, /Failure exception: RuntimeError/);
@@ -242,7 +242,7 @@ function testKisSelfHealTaskIsIsolatedAndStopsAtPrReview() {
     return '';
   });
   assert.deepEqual(gitCalls.at(-1), {
-    root: '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab',
+    root: process.env.KIS_TRADING_LAB_REPO_DIR || '/home/ubuntu/.hermes/jobs/repos/kis-trading-lab',
     gitArgs: ['branch', 'codex/kis-self-heal-test', 'origin/master'],
   });
 }
