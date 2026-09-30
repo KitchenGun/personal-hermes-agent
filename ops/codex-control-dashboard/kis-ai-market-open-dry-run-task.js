@@ -418,14 +418,16 @@ function isDue(task, date) {
 
 function isDelayedNonOrderStart(task, scheduledAt, invokedAt, calendarProofResolver) {
   const supervisorStart = task.id === TASKS[0].id;
-  if ((!supervisorStart && ![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id)) || !isDue(task, scheduledAt)
+  const dailyReportStart = task.id === TASKS[3].id;
+  if ((!supervisorStart && !dailyReportStart && ![POST_CLOSE_TASK.id, ORDER_TASK.id].includes(task.id)) || !isDue(task, scheduledAt)
     || (task.id === ORDER_TASK.id && !isPostCloseRefreshSlot(task, scheduledAt))) return false;
   const scheduled = seoulParts(scheduledAt);
   const invoked = seoulParts(invokedAt);
   const invokedMinute = (Number(invoked.hour) * 60) + Number(invoked.minute);
+  const startMinute = supervisorStart ? 540 : dailyReportStart ? 990 : 980;
   if (scheduled.year !== invoked.year || scheduled.month !== invoked.month || scheduled.day !== invoked.day
-    || invokedMinute < (supervisorStart ? 540 : 980)
-    || invokedMinute >= (supervisorStart ? 550 : 1070)) return false;
+    || invokedMinute < startMinute
+    || invokedMinute >= (supervisorStart ? 550 : dailyReportStart ? 1050 : 1070)) return false;
   try {
     return calendarProofResolver(`${scheduled.year}-${scheduled.month}-${scheduled.day}`)?.isTradingDay === true;
   } catch {
