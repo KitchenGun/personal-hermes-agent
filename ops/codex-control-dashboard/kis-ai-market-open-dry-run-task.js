@@ -3562,6 +3562,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         } : {}),
       };
       const calendarStatus = { ...previousCalendarStatus };
+      if (!warningKey) for (const field of ['warning_key', 'warning_delivery_attempted', 'warning_notified']) {
+        delete calendarStatus[field];
+      }
       for (const [field, value] of Object.entries({
         coverage_start: summary.coverage_start, coverage_end: summary.coverage_end,
         remaining_days: summary.remaining_days, status: summary.status, source: summary.source,
