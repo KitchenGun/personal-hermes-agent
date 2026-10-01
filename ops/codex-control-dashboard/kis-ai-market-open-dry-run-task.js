@@ -1385,6 +1385,67 @@ function sanitizeContextLatency(value) {
   });
 }
 
+function sanitizeResearchLinkage(value, expectedSlotId) {
+  const fail = (reason) => ({ status: 'NOT_LINKABLE', reason });
+  const hash = (v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
+  const time = (v) => typeof v === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$/.test(v) && Number.isFinite(Date.parse(v));
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== 5 || Object.keys(value).some((key) => !['schema_version', 'batch_id', 'collection_slot_time', 'decision_time', 'candidates'].includes(key))
+    || value.schema_version !== 'intraday_research_linkage_v1' || !hash(value.batch_id)
+    || !time(value.collection_slot_time) || !time(value.decision_time) || !Array.isArray(value.candidates)) return fail('malformed_metadata');
+  const expectedCollectionSlotTime = collectionSlotTimeFromDueKey(expectedSlotId);
+  if (!expectedCollectionSlotTime
+    || Date.parse(value.collection_slot_time) !== Date.parse(expectedCollectionSlotTime)) return fail('slot_mismatch');
+  const keys = ['symbol', 'correlation_id', 'prediction_id', 'experience_id', 'session_run_id', 'batch_id',
+    'candidate_hash', 'feature_input_hash', 'shortlist_hash', 'feature_hash', 'policy_hash', 'artifact_hash',
+    'prediction_anchor_at', 'decision_time', 'data_cutoff_at', 'model_version', 'feature_version', 'policy_version',
+    'reference_price', 'prob_up', 'prob_flat', 'prob_down', 'ml_enter_candidate', 'ml_entry_policy_result',
+    'hermes_candidate', 'hermes_candidate_reason', 'ml_completed_at'];
+  const seen = new Set();
+  const candidates = [];
+  for (const item of value.candidates) {
+    if (!item || Array.isArray(item) || typeof item !== 'object' || Object.keys(item).length !== keys.length
+      || keys.some((key) => !Object.hasOwn(item, key)) || !KRX_SYMBOL_RE.test(item.symbol) || seen.has(item.symbol)
+      || !['correlation_id', 'experience_id', 'session_run_id', 'batch_id', 'candidate_hash', 'feature_input_hash', 'shortlist_hash', 'feature_hash', 'policy_hash', 'artifact_hash'].every((key) => hash(item[key]))
+      || (item.prediction_id !== null && !hash(item.prediction_id))
+      || item.correlation_id !== (item.prediction_id || item.experience_id) || item.batch_id !== value.batch_id
+      || !['prediction_anchor_at', 'decision_time', 'data_cutoff_at'].every((key) => time(item[key]))
+      || item.decision_time !== value.decision_time || Date.parse(item.data_cutoff_at) > Date.parse(item.decision_time)
+      || Date.parse(item.prediction_anchor_at) > Date.parse(item.data_cutoff_at)
+      || (item.ml_completed_at !== null && !time(item.ml_completed_at))
+      || typeof item.model_version !== 'string'
+      || !/^(?:intraday_ml_(?:logistic|hist_gradient)_[a-f0-9]{12}|intraday_hybrid_v[0-9]+|intraday_model_unavailable_v[0-9]+)$/.test(item.model_version)
+      || SECRET_LIKE_RE.test(item.model_version)
+      || item.feature_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
+      || item.policy_version !== INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
+      || SECRET_LIKE_RE.test(item.feature_version) || SECRET_LIKE_RE.test(item.policy_version)
+      || !Number.isFinite(item.reference_price) || item.reference_price <= 0
+      || ['prob_up', 'prob_flat', 'prob_down'].some((key) => item[key] !== null && (!Number.isFinite(item[key]) || item[key] < 0 || item[key] > 1))
+      || typeof item.ml_enter_candidate !== 'boolean' || !['BUY', 'NO_BUY'].includes(item.ml_entry_policy_result)
+      || item.ml_entry_policy_result !== (item.ml_enter_candidate ? 'BUY' : 'NO_BUY') || item.hermes_candidate !== true
+      || !['ML_ENTRY_CANDIDATE', 'HELD_POSITION', 'EXIT_ONLY', 'OTHER_EXISTING_REASON'].includes(item.hermes_candidate_reason)) return fail('malformed_candidate');
+    seen.add(item.symbol);
+    candidates.push(Object.freeze({ ...item }));
+  }
+  return Object.freeze({ status: 'LINKABLE', value: Object.freeze({
+    schema_version: value.schema_version, batch_id: value.batch_id, collection_slot_time: value.collection_slot_time,
+    decision_time: value.decision_time, candidates: Object.freeze(candidates),
+  }) });
+}
+
+function researchCandidateMatches(item, candidate) {
+  if (!candidate) return false;
+  if (candidate.role === 'held_position') {
+    return item.hermes_candidate_reason === 'HELD_POSITION' && item.ml_enter_candidate === false;
+  }
+  const eligible = candidate.role === 'eligible_entry'
+    && candidate.risk_overlay === 'ALLOW' && candidate.data_quality === 'PASS';
+  if (item.ml_enter_candidate) {
+    return eligible && item.hermes_candidate_reason === 'ML_ENTRY_CANDIDATE';
+  }
+  return item.hermes_candidate_reason === 'OTHER_EXISTING_REASON';
+}
+
 function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   const raw = String(stdout || '');
   if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES) throw new Error('invalid_decision_context');
@@ -1393,8 +1454,10 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_decision_context'); }
   const contextLatency = Object.hasOwn(value || {}, 'context_latency')
     ? sanitizeContextLatency(value.context_latency) : null;
+  const researchLinkage = Object.hasOwn(value || {}, 'research_linkage')
+    ? sanitizeResearchLinkage(value.research_linkage, expectedSlotId) : null;
   const coreValue = value && typeof value === 'object' && !Array.isArray(value)
-    ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'context_latency')) : value;
+    ? Object.fromEntries(Object.entries(value).filter(([key]) => !['context_latency', 'research_linkage'].includes(key))) : value;
   if (SECRET_LIKE_RE.test(JSON.stringify(coreValue))) throw new Error('invalid_decision_context');
   const keys = [
     'task_id', 'status', 'slot_id', 'model_id', 'official_trade_date', 'candidates',
@@ -1405,7 +1468,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
   if (!value || Array.isArray(value) || typeof value !== 'object'
     || Object.keys(value).length < keys.length
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
-    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase', 'failure_diagnostic', 'context_latency'].includes(key))
+    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase', 'failure_diagnostic', 'context_latency', 'research_linkage'].includes(key))
     || (Object.prototype.hasOwnProperty.call(value, 'failure_phase')
       && (!decisionContextFailurePhases.includes(value.failure_phase)
         || (value.status === 'success' && value.failure_phase !== 'none')
@@ -1434,10 +1497,29 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
       failurePhase: value.failure_phase,
       ...(failureDiagnostic !== undefined ? { failure_diagnostic: failureDiagnostic } : {}),
       ...(contextLatency ? { context_latency: contextLatency } : {}),
+      ...(researchLinkage ? { research_linkage: researchLinkage } : {}),
     });
   }
   if (value.fail_closed !== false || value.error_class !== 'none') throw new Error('invalid_decision_context');
   const candidates = normalizedAiCandidates(value.candidates, runtimeContract);
+  let validatedResearchLinkage = researchLinkage;
+  if (researchLinkage?.status === 'LINKABLE') {
+    const linked = researchLinkage.value.candidates;
+    const exactSet = linked.length === candidates.length
+      && linked.every((item) => candidates.some((candidate) => candidate.symbol === item.symbol));
+    const sourceMatches = exactSet && linked.every((item) => {
+      const candidate = candidates.find((entry) => entry.symbol === item.symbol);
+      const probabilityMatches = ['prob_up', 'prob_flat', 'prob_down'].every((key) => item[key] === candidate[key]
+        || (Number.isFinite(item[key]) && Number.isFinite(candidate[key]) && Math.abs(item[key] - candidate[key]) <= 1e-8));
+      return researchCandidateMatches(item, candidate)
+        && probabilityMatches
+        && item.feature_version === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version
+        && item.policy_version === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version
+        && item.feature_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash
+        && item.policy_hash === INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash;
+    });
+    if (!sourceMatches) validatedResearchLinkage = Object.freeze({ status: 'NOT_LINKABLE', reason: 'candidate_mismatch' });
+  }
   if (!Array.isArray(value.holdings) || value.holdings.length > runtimeContract.max_open_positions
     || value.holdings.some((item) => !item || Array.isArray(item) || typeof item !== 'object'
       || Object.keys(item).length !== 2 || !KRX_SYMBOL_RE.test(String(item.symbol || ''))
@@ -1472,6 +1554,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     event_metadata: value.event_metadata.map((item) => Object.freeze({ ...item })),
     intraday_candidate_counts: intradayCandidateCounts,
     ...(contextLatency ? { context_latency: contextLatency } : {}),
+    ...(validatedResearchLinkage ? { research_linkage: validatedResearchLinkage } : {}),
   });
 }
 
@@ -1931,6 +2014,7 @@ function defaultRuntimeHealthCheck() {
 
 function createKisAiMarketOpenDryRunTask(options = {}) {
   const statePath = options.statePath || DEFAULT_STATE_PATH;
+  const researchLinkageDir = options.researchLinkageDir || `${statePath}.research-linkage`;
   const errorNotificationStatePath = options.errorNotificationStatePath || `${statePath}.error-notification.json`;
   const legacyV1StatePath = options.legacyV1StatePath || LEGACY_V1_STATE_PATH;
   const legacyV2StatePath = options.legacyV2StatePath || LEGACY_V2_STATE_PATH;
@@ -1953,6 +2037,28 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const llmExecutor = options.llmExecutor || null;
   const emergencyStopExecutor = options.emergencyStopExecutor || null;
   const verdictDir = options.verdictDir || null;
+
+  function persistResearchLinkage(linkage, slotId, stage, extra = {}) {
+    if (linkage?.status !== 'LINKABLE') return;
+    try {
+      const dueHash = crypto.createHash('sha256').update(slotId).digest('hex');
+      const batchHash = crypto.createHash('sha256').update(linkage.value.batch_id).digest('hex');
+      const file = path.join(researchLinkageDir, `${batchHash}-${dueHash}.json`);
+      let prior = null;
+      try { prior = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (prior && (prior.batch_id !== linkage.value.batch_id || prior.due_key !== slotId
+        || JSON.stringify(prior.identities) !== JSON.stringify(linkage.value.candidates.map((item) => [item.symbol, item.candidate_hash]))
+        || JSON.stringify(prior.research_linkage) !== JSON.stringify(linkage.value))) return;
+      const rank = { request: 1, terminal: 2, order_terminal: 3 };
+      if (!rank[stage] || (prior && rank[prior.stage] >= rank[stage])) return;
+      atomicWrite(file, {
+        ...(prior || {}),
+        schema_version: 'intraday_research_record_v1', batch_id: linkage.value.batch_id, due_key: slotId,
+        identities: linkage.value.candidates.map((item) => [item.symbol, item.candidate_hash]),
+        research_linkage: linkage.value, stage, updated_at: now().toISOString(), ...extra,
+      });
+    } catch { /* Research persistence cannot alter a trading result. */ }
+  }
   const schedulerRegistered = options.schedulerRegistered === true;
   const serverRegistered = options.serverRegistered === true;
   const safetyMonitorEnabled = options.safetyMonitorEnabled === true || schedulerRegistered;
@@ -2046,6 +2152,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       throw error;
     }
     if (context.context_latency) sample.context_latency = context.context_latency;
+    if (context.research_linkage) {
+      sample.research_linkage_status = context.research_linkage.status;
+      if (context.research_linkage.status === 'NOT_LINKABLE') sample.research_linkage_reason = context.research_linkage.reason;
+    }
     if (context.blocked) {
       const error = new Error(context.errorClass);
       error.failurePhase = context.failurePhase;
@@ -2066,6 +2176,47 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     }
     const packet = buildSanitizedAiPacket({ slotId, context, runtimeContract });
+    const linkage = context.research_linkage;
+    let verifiedLinkage = linkage?.status === 'LINKABLE' ? linkage : null;
+    const linkageLatency = () => ({
+      decision_context_started_at: sample.decision_context_started_at,
+      decision_context_completed_at: sample.decision_context_completed_at,
+      llm_started_at: sample.llm_started_at,
+      llm_completed_at: sample.llm_completed_at,
+      llm_duration_ms: sample.llm_duration_ms,
+    });
+    const persistLinkageTerminal = (extra) => persistResearchLinkage(verifiedLinkage, slotId, 'terminal', {
+      ...linkageLatency(), ...extra,
+    });
+    if (verifiedLinkage) {
+      const symbols = context.candidates.map((item) => item.symbol).sort();
+      const linkedSymbols = linkage.value.candidates.map((item) => item.symbol).sort();
+      let artifactMatches = true;
+      try {
+        const activeArtifact = loadStrict().tasks[ORDER_TASK.id].activation_artifact_hash;
+        if (activeArtifact) artifactMatches = linkage.value.candidates.every((item) => item.artifact_hash === activeArtifact);
+      } catch { artifactMatches = false; }
+      const reasonsMatch = linkage.value.candidates.every((item) => {
+        const candidate = context.candidates.find((entry) => entry.symbol === item.symbol);
+        return researchCandidateMatches(item, candidate);
+      });
+      if (JSON.stringify(symbols) !== JSON.stringify(linkedSymbols) || !reasonsMatch || !artifactMatches) {
+        sample.research_linkage_status = 'NOT_LINKABLE';
+        sample.research_linkage_reason = artifactMatches ? 'candidate_mismatch' : 'artifact_mismatch';
+        verifiedLinkage = null;
+      } else persistResearchLinkage(verifiedLinkage, slotId, 'request', {
+        ...linkageLatency(), request_recorded_at: now().toISOString(), llm_model: LLM_MODEL_ID,
+        prompt_hash: packet.prompt_hash, candidates: context.candidates.map((candidate) => ({
+          symbol: candidate.symbol, ml_action: candidate.ml_action, prob_up: candidate.prob_up,
+          prob_flat: candidate.prob_flat, prob_down: candidate.prob_down,
+          hermes_requested: true, completed_at: null, verdict: null,
+          verdict_price: null, verdict_price_status: 'unavailable',
+        })),
+      });
+      if (verifiedLinkage) {
+        Object.defineProperty(sample, 'researchLinkagePrivate', { value: verifiedLinkage, configurable: true });
+      }
+    }
     sample.candidates = packet.candidates.map(({ symbol }) => ({
       collection_slot_time: sample.collection_slot_time,
       symbol,
@@ -2087,6 +2238,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       sample.candidates = sample.candidates.map((candidate) => ({
         ...candidate, outcome: sample.llm_outcome, llm_duration_ms: sample.llm_duration_ms,
       }));
+      persistLinkageTerminal({ completed_at: sample.llm_completed_at, llm_outcome: sample.llm_outcome,
+        verdicts: context.candidates.map(({ symbol }) => ({ symbol, hermes_requested: true, completed_at: sample.llm_completed_at, verdict: 'NOT_EVALUABLE', verdict_price: null, verdict_price_status: 'unavailable' })) });
       const failure = attachAiVerdictFailure(error, context.candidates.length, undefined, 'failed');
       failure.llmLatencySample = sample;
       throw failure;
@@ -2100,6 +2253,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       sample.candidates = sample.candidates.map((candidate) => ({
         ...candidate, outcome: 'invalid_verdict', llm_duration_ms: sample.llm_duration_ms,
       }));
+      persistLinkageTerminal({ completed_at: sample.llm_completed_at, llm_outcome: 'invalid_verdict',
+        verdicts: context.candidates.map(({ symbol }) => ({ symbol, hermes_requested: true, completed_at: sample.llm_completed_at, verdict: 'NOT_EVALUABLE', verdict_price: null, verdict_price_status: 'unavailable' })) });
       const failure = attachAiVerdictFailure(new Error('invalid_ai_verdict'), context.candidates.length, undefined, 'incomplete');
       failure.llmLatencySample = sample;
       throw failure;
@@ -2108,6 +2263,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       sample.candidates = sample.candidates.map((candidate) => ({
         ...candidate, outcome: 'late', llm_duration_ms: sample.llm_duration_ms,
       }));
+      persistLinkageTerminal({ completed_at: sample.llm_completed_at, llm_outcome: 'late',
+        verdicts: context.candidates.map(({ symbol }) => ({ symbol, hermes_requested: true, completed_at: sample.llm_completed_at, verdict: 'NOT_EVALUABLE', verdict_price: null, verdict_price_status: 'unavailable' })) });
       const failure = attachAiVerdictFailure(new Error('late_ai_verdict'), context.candidates.length, responseValue, 'late');
       failure.llmLatencySample = sample;
       throw failure;
@@ -2119,6 +2276,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       sample.candidates = sample.candidates.map((candidate) => ({
         ...candidate, outcome: 'invalid_verdict', llm_duration_ms: sample.llm_duration_ms,
       }));
+      persistLinkageTerminal({ completed_at: sample.llm_completed_at, llm_outcome: 'invalid_verdict',
+        verdicts: context.candidates.map(({ symbol }) => ({ symbol, hermes_requested: true, completed_at: sample.llm_completed_at, verdict: 'NOT_EVALUABLE', verdict_price: null, verdict_price_status: 'unavailable' })) });
       const failure = attachAiVerdictFailure(error, context.candidates.length, responseValue, 'incomplete');
       failure.llmLatencySample = sample;
       throw failure;
@@ -2132,6 +2291,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     }));
     sample.llm_outcome = sample.candidates.some(({ outcome }) => outcome === 'HOLD' || outcome === 'HOLD_OVERNIGHT')
       ? 'validated_hold' : 'validated';
+    persistLinkageTerminal({
+      completed_at: sample.llm_completed_at, llm_outcome: sample.llm_outcome,
+      verdicts: sample.candidates.map(({ symbol, outcome }) => ({ symbol, hermes_requested: true, completed_at: sample.llm_completed_at, verdict: outcome, verdict_price: null, verdict_price_status: 'unavailable' })),
+    });
     fs.mkdirSync(verdictDir, { recursive: true, mode: 0o700 });
     const file = path.join(verdictDir, `${crypto.randomBytes(16).toString('hex')}.json`);
     const fd = fs.openSync(file, 'wx', 0o600);
@@ -2412,6 +2575,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         ...taskState,
         llm_latency_daily_summary: accumulateAiLatency(prior, slotId, updated),
       } } });
+      if (sample.researchLinkagePrivate && orderOutcome !== undefined) {
+        persistResearchLinkage(sample.researchLinkagePrivate, slotId, 'order_terminal', {
+          decision_context_started_at: sample.decision_context_started_at,
+          decision_context_completed_at: sample.decision_context_completed_at,
+          llm_started_at: sample.llm_started_at,
+          llm_completed_at: sample.llm_completed_at,
+          llm_duration_ms: sample.llm_duration_ms,
+          order_outcome: safeText(orderOutcome, 80), order_completed_at: sample.order_child_completed_at || now().toISOString(),
+          order_candidate_outcomes: sample.researchLinkagePrivate.value.candidates.map(({ symbol }) => ({
+            symbol, risk_result: null, risk_status: 'NOT_EVALUABLE', order_result: null, order_status: 'NOT_EVALUABLE',
+          })),
+        });
+      }
     } catch { /* Telemetry must never affect the trading result. */ }
   }
   function incidentStateHash(current, taskId, errorClass) {
