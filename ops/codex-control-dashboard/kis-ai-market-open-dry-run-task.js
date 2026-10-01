@@ -1325,12 +1325,77 @@ function buildDecisionContextCommand(schedulerToken, invocationDueKey) {
   };
 }
 
+const CONTEXT_LATENCY_STAGES = new Set([
+  'control_state_load', 'scheduler_attestation', 'settings_load', 'artifact_validation',
+  'calendar_validation', 'reporting_route_check', 'pending_reconciliation_read', 'auth_client_setup',
+  'balance_read', 'position_decode', 'open_orders_read', 'intraday_decision_lookup',
+  'candidate_selection', 'entry_count_read', 'account_decode', 'candidate_transform',
+]);
+
+function sanitizeContextLatency(value) {
+  const keys = ['version', 'measurement_scope', 'clock_source', 'started_at', 'completed_at', 'latency_ms', 'stages', 'broker_http_diagnostics'];
+  const validTime = (timestamp) => typeof timestamp === 'string'
+    && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|\+00:00)$/.test(timestamp)
+    && !Number.isNaN(Date.parse(timestamp));
+  const validLatency = (latency) => typeof latency === 'number' && Number.isFinite(latency) && latency >= 0;
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))
+    || value.version !== 'context_latency_v1' || value.measurement_scope !== 'process_local'
+    || value.clock_source !== 'monotonic' || !validTime(value.started_at) || !validTime(value.completed_at)
+    || !validLatency(value.latency_ms) || !Array.isArray(value.stages) || value.stages.length > 20
+    || !Array.isArray(value.broker_http_diagnostics) || value.broker_http_diagnostics.length > 32) return null;
+  const stages = [];
+  for (const item of value.stages) {
+    if (!item || Array.isArray(item) || typeof item !== 'object'
+      || Object.keys(item).length !== 5 || Object.keys(item).some((key) => !['stage', 'started_at', 'completed_at', 'latency_ms', 'result'].includes(key))
+      || !CONTEXT_LATENCY_STAGES.has(item.stage) || !validTime(item.started_at) || !validTime(item.completed_at)
+      || !validLatency(item.latency_ms) || !['success', 'error'].includes(item.result)) return null;
+    stages.push(Object.freeze({ ...item }));
+  }
+  const diagnostics = [];
+  const validDiagnosticTime = (timestamp) => typeof timestamp === 'string'
+    && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)
+    && !Number.isNaN(Date.parse(timestamp));
+  const allowedEndpoints = new Set(['auth', 'read', 'balance', 'open_orders', 'quote', 'unknown']);
+  const allowedFailures = new Set([null, 'dns', 'tls', 'connect', 'timeout', 'http', 'unknown']);
+  for (const item of value.broker_http_diagnostics) {
+    if (!item || Array.isArray(item) || typeof item !== 'object') continue;
+    const itemKeys = ['endpoint_class', 'requested_at_utc', 'completed_at_utc', 'latency_ms', 'http_status', 'failure_class', 'success', 'diagnostic_code'];
+    if (Object.keys(item).length !== itemKeys.length + (Object.hasOwn(item, 'timeout_stage') ? 1 : 0)
+      || Object.keys(item).some((key) => !itemKeys.includes(key) && key !== 'timeout_stage')
+      || !allowedEndpoints.has(item.endpoint_class) || ![null, 'unknown', 'read'].includes(item.timeout_stage ?? null)
+      || (item.timeout_stage !== undefined && item.failure_class !== 'timeout') || !allowedFailures.has(item.failure_class)
+      || typeof item.success !== 'boolean' || typeof item.diagnostic_code !== 'string'
+      || !(new Set(['success', 'dns', 'tls', 'connect', 'timeout', 'unknown', 'http']).has(item.diagnostic_code)
+        || /^http_(?:429|500|502|503|504)$/.test(item.diagnostic_code))
+      || item.success !== (item.diagnostic_code === 'success' && item.failure_class === null)
+      || !(item.http_status === null || (Number.isSafeInteger(item.http_status) && item.http_status >= 100 && item.http_status <= 599))
+      || (item.diagnostic_code.startsWith('http_') && Number(item.diagnostic_code.slice(5)) !== item.http_status)
+      || !(item.latency_ms === null || validLatency(item.latency_ms))
+      || !validDiagnosticTime(item.requested_at_utc) || !validDiagnosticTime(item.completed_at_utc)) continue;
+    diagnostics.push(Object.freeze({
+      ...Object.fromEntries(itemKeys.map((key) => [key, item[key]])),
+      ...(item.timeout_stage !== undefined ? { timeout_stage: item.timeout_stage } : {}),
+    }));
+  }
+  return Object.freeze({
+    version: value.version, measurement_scope: value.measurement_scope, clock_source: value.clock_source,
+    started_at: value.started_at, completed_at: value.completed_at, latency_ms: value.latency_ms,
+    stages: Object.freeze(stages), broker_http_diagnostics: Object.freeze(diagnostics),
+  });
+}
+
 function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = REQUIRED_RUNTIME_CONTRACT) {
   const raw = String(stdout || '');
-  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES || SECRET_LIKE_RE.test(raw)) throw new Error('invalid_decision_context');
+  if (Buffer.byteLength(raw, 'utf8') > MAX_BUFFER_BYTES) throw new Error('invalid_decision_context');
   let value;
   const expectedTradeDate = typeof expectedSlotId === 'string' ? expectedSlotId.split(':')[1] : '';
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_decision_context'); }
+  const contextLatency = Object.hasOwn(value || {}, 'context_latency')
+    ? sanitizeContextLatency(value.context_latency) : null;
+  const coreValue = value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'context_latency')) : value;
+  if (SECRET_LIKE_RE.test(JSON.stringify(coreValue))) throw new Error('invalid_decision_context');
   const keys = [
     'task_id', 'status', 'slot_id', 'model_id', 'official_trade_date', 'candidates',
     'holdings', 'account_aggregate', 'risk_aggregate', 'event_metadata', 'fail_closed',
@@ -1340,7 +1405,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
   if (!value || Array.isArray(value) || typeof value !== 'object'
     || Object.keys(value).length < keys.length
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
-    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase', 'failure_diagnostic'].includes(key))
+    || Object.keys(value).some((key) => !keys.includes(key) && !['intraday_candidate_counts', 'failure_phase', 'failure_diagnostic', 'context_latency'].includes(key))
     || (Object.prototype.hasOwnProperty.call(value, 'failure_phase')
       && (!decisionContextFailurePhases.includes(value.failure_phase)
         || (value.status === 'success' && value.failure_phase !== 'none')
@@ -1368,6 +1433,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
       errorClass: safeText(value.error_class, 80),
       failurePhase: value.failure_phase,
       ...(failureDiagnostic !== undefined ? { failure_diagnostic: failureDiagnostic } : {}),
+      ...(contextLatency ? { context_latency: contextLatency } : {}),
     });
   }
   if (value.fail_closed !== false || value.error_class !== 'none') throw new Error('invalid_decision_context');
@@ -1405,6 +1471,7 @@ function parseDecisionContextOutput(stdout, expectedSlotId, runtimeContract = RE
     risk_aggregate: Object.freeze({ ...value.risk_aggregate }),
     event_metadata: value.event_metadata.map((item) => Object.freeze({ ...item })),
     intraday_candidate_counts: intradayCandidateCounts,
+    ...(contextLatency ? { context_latency: contextLatency } : {}),
   });
 }
 
@@ -1978,6 +2045,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       error.llmLatencySample = sample;
       throw error;
     }
+    if (context.context_latency) sample.context_latency = context.context_latency;
     if (context.blocked) {
       const error = new Error(context.errorClass);
       error.failurePhase = context.failurePhase;
