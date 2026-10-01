@@ -219,6 +219,264 @@ function contextLatency() {
   };
 }
 
+function researchLinkage(slotId, symbols = ['005930']) {
+  const [, day, hour, minute] = slotId.split(':');
+  const collection = new Date(Date.parse(`${day}T${hour}:${minute}:00+09:00`) - 5 * 60_000).toISOString();
+  return {
+    schema_version: 'intraday_research_linkage_v1', batch_id: 'a'.repeat(64),
+    collection_slot_time: collection, decision_time: collection,
+    candidates: symbols.map((symbol) => ({
+      symbol, correlation_id: 'c'.repeat(64), prediction_id: null, experience_id: 'c'.repeat(64),
+      session_run_id: 'd'.repeat(64), batch_id: 'a'.repeat(64), candidate_hash: 'e'.repeat(64),
+      feature_input_hash: 'f'.repeat(64), shortlist_hash: '1'.repeat(64),
+      feature_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_hash,
+      policy_hash: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_hash, artifact_hash: 'a'.repeat(64), prediction_anchor_at: collection,
+      decision_time: collection, data_cutoff_at: collection, model_version: 'intraday_ml_logistic_aaaaaaaaaaaa',
+      feature_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_feature_version,
+      policy_version: mod.INTRADAY_PROVIDER_ATTESTATION.intraday_policy_version,
+      reference_price: 100, prob_up: .7, prob_flat: .2, prob_down: .1,
+      ml_enter_candidate: true, ml_entry_policy_result: 'BUY', hermes_candidate: true,
+      hermes_candidate_reason: 'ML_ENTRY_CANDIDATE', ml_completed_at: collection,
+    })),
+  };
+}
+
+test('research linkage is optional telemetry and never changes the AI packet', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const input = JSON.parse(decisionContext(slotId));
+  input.research_linkage = researchLinkage(slotId);
+  const parsed = mod.parseDecisionContextOutput(JSON.stringify(input), slotId);
+  assert.equal(parsed.research_linkage.status, 'LINKABLE', JSON.stringify(parsed.research_linkage));
+  assert.equal(parsed.research_linkage.value.collection_slot_time, '2026-07-21T00:10:00.000Z');
+  const qualifyingHold = JSON.parse(decisionContext(slotId));
+  Object.assign(qualifyingHold.candidates[0], {
+    ml_action: 'HOLD', review_tier: 'watch', prob_up: .58, prob_flat: .3, prob_down: .12,
+  });
+  qualifyingHold.research_linkage = researchLinkage(slotId);
+  Object.assign(qualifyingHold.research_linkage.candidates[0], {
+    prob_up: .58, prob_flat: .3, prob_down: .12,
+  });
+  const holdParsed = mod.parseDecisionContextOutput(JSON.stringify(qualifyingHold), slotId);
+  assert.equal(holdParsed.research_linkage.status, 'LINKABLE');
+  assert.equal(holdParsed.research_linkage.value.candidates[0].hermes_candidate_reason, 'ML_ENTRY_CANDIDATE');
+  const nonqualifyingExit = JSON.parse(JSON.stringify(qualifyingHold));
+  nonqualifyingExit.candidates[0].ml_action = 'EXIT';
+  nonqualifyingExit.research_linkage.candidates[0].ml_enter_candidate = false;
+  nonqualifyingExit.research_linkage.candidates[0].ml_entry_policy_result = 'NO_BUY';
+  nonqualifyingExit.research_linkage.candidates[0].hermes_candidate_reason = 'OTHER_EXISTING_REASON';
+  assert.equal(mod.parseDecisionContextOutput(JSON.stringify(nonqualifyingExit), slotId).research_linkage.status, 'LINKABLE');
+  const without = { ...input };
+  delete without.research_linkage;
+  assert.deepEqual(mod.buildSanitizedAiPacket({ slotId, context: parsed }),
+    mod.buildSanitizedAiPacket({ slotId, context: mod.parseDecisionContextOutput(JSON.stringify(without), slotId) }));
+  for (const mutate of [
+    (v) => { v.batch_id = '5'.repeat(64); },
+    (v) => { v.collection_slot_time = '2026-07-21T00:16:00Z'; },
+    (v) => { v.candidates[0].candidate_hash = 'bad'; },
+    (v) => { v.candidates[0].hermes_candidate_reason = 'HELD_POSITION'; },
+    (v) => { v.candidates[0].feature_hash = '5'.repeat(64); },
+    (v) => { v.candidates[0].correlation_id = '6'.repeat(64); },
+    (v) => { v.candidates[0].prediction_anchor_at = '2026-07-21T00:11:00Z'; },
+    (v) => { v.candidates[0].model_version = 'Bearer do-not-persist'; },
+  ]) {
+    const malformed = JSON.parse(JSON.stringify(researchLinkage(slotId)));
+    mutate(malformed);
+    input.research_linkage = malformed;
+    const result = mod.parseDecisionContextOutput(JSON.stringify(input), slotId);
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.research_linkage.status, 'NOT_LINKABLE');
+  }
+  const rounded = JSON.parse(JSON.stringify(researchLinkage(slotId)));
+  rounded.candidates[0].prob_up = .700000005;
+  input.research_linkage = rounded;
+  assert.equal(mod.parseDecisionContextOutput(JSON.stringify(input), slotId).research_linkage.status, 'LINKABLE');
+  input.research_linkage = { unexpected: 'Bearer must-not-leak' };
+  const dropped = mod.parseDecisionContextOutput(JSON.stringify(input), slotId);
+  assert.equal(dropped.research_linkage.status, 'NOT_LINKABLE');
+  assert.doesNotMatch(JSON.stringify(dropped), /Bearer|must-not-leak/);
+});
+
+test('research linkage has per-batch durable request and terminal history', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const context = JSON.parse(decisionContext(slotId));
+  context.research_linkage = researchLinkage(slotId);
+  let requestRecord;
+  const value = await active({
+    decisionContextOutput: JSON.stringify(context),
+    llmExecutor: async ({ packet }) => {
+      const directory = `${value.paths.statePath}.research-linkage`;
+      const file = fs.readdirSync(directory)[0];
+      requestRecord = JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'));
+      return aiVerdict(packet);
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  const directory = `${value.paths.statePath}.research-linkage`;
+  const files = fs.readdirSync(directory);
+  assert.equal(files.length, 1);
+  const record = JSON.parse(fs.readFileSync(path.join(directory, files[0]), 'utf8'));
+  assert.equal(record.stage, 'order_terminal');
+  assert.equal(record.research_linkage.batch_id, 'a'.repeat(64));
+  assert.equal(requestRecord.stage, 'request');
+  assert.equal(requestRecord.request_recorded_at !== undefined, true);
+  assert.equal(requestRecord.llm_started_at, null);
+  assert.equal(record.request_recorded_at, requestRecord.request_recorded_at);
+  assert.equal(record.completed_at !== undefined, true);
+  assert.equal(record.verdicts[0].verdict, 'HOLD');
+  assert.equal(record.decision_context_started_at, '2026-07-21T00:15:10.000Z');
+  assert.equal(record.decision_context_completed_at, '2026-07-21T00:15:10.000Z');
+  assert.equal(record.llm_started_at, '2026-07-21T00:15:10.000Z');
+  assert.equal(record.llm_completed_at, record.completed_at);
+  assert.equal(Number.isFinite(record.llm_duration_ms), true);
+  assert.equal(record.verdicts[0].verdict_price, null);
+  assert.equal(record.verdicts[0].verdict_price_status, 'unavailable');
+  assert.deepEqual(record.order_candidate_outcomes[0], {
+    symbol: '005930', risk_result: null, risk_status: 'NOT_EVALUABLE',
+    order_result: null, order_status: 'NOT_EVALUABLE',
+  });
+  assert.equal(record.research_linkage.candidates[0].ml_enter_candidate, true);
+  assert.equal(record.research_linkage.candidates[0].hermes_candidate_reason, 'ML_ENTRY_CANDIDATE');
+});
+
+test('research linkage filesystem failure does not interrupt verdict execution', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const context = JSON.parse(decisionContext(slotId));
+  context.research_linkage = researchLinkage(slotId);
+  let llmCalls = 0;
+  const value = await active({
+    decisionContextOutput: JSON.stringify(context),
+    llmExecutor: async ({ packet }) => { llmCalls += 1; return aiVerdict(packet); },
+  });
+  fs.writeFileSync(`${value.paths.statePath}.research-linkage`, 'unavailable');
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:10Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  assert.equal(llmCalls, 1);
+});
+
+test('actual KIS context_metadata passes Hermes validation without changing the prompt packet', {
+  skip: !process.env.KIS_REPORT_PRODUCER_SOURCE && 'KIS_REPORT_PRODUCER_SOURCE not configured',
+}, async (t) => {
+  const producerSource = process.env.KIS_REPORT_PRODUCER_SOURCE;
+  const producer = fs.statSync(producerSource).isDirectory()
+    ? producerSource : path.resolve(path.dirname(producerSource), '..');
+  const python = process.env.KIS_REPORT_TEST_PYTHON || 'python';
+  assert.ok(fs.existsSync(path.join(producer, 'tests', 'test_intraday_research.py')));
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-kis-export-roundtrip-'));
+  fs.chmodSync(scratch, 0o700);
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const databasePath = path.join(scratch, 'evidence.sqlite');
+  const script = `import hashlib, json, os, runpy, sqlite3, sys
+from datetime import datetime
+from types import SimpleNamespace as NS
+h=runpy.run_path('tests/test_intraday_research.py')
+from kis_trading_lab.intraday_research import context_metadata, register_batch
+db=h['_db'](); sid=h['_owned_session'](db); qid=h['_quote'](db, minute='13'); h['_put_decision'](db, sid, qid)
+db.execute("UPDATE ai_experiences SET experience_id=? WHERE event_type='intraday_feature_decision_v1'",('e'*64,))
+row=db.execute("SELECT payload_json FROM ai_experiences WHERE event_type='intraday_feature_decision_v1'").fetchone()
+payload=json.loads(row[0]); feature='intraday-quote-10m-v3-independent'; policy='intraday-fast-track-v4-independent'
+payload.update(action='HOLD', model_version='intraday_ml_logistic_aaaaaaaaaaaa', feature_version=feature, policy_version=policy,
+ feature_hash=hashlib.sha256(feature.encode('ascii')).hexdigest(), policy_hash=hashlib.sha256(policy.encode('ascii')).hexdigest(),
+ intraday_artifact_hash='a'*64, prob_up=.58, prob_flat=.3, prob_down=.12)
+body=json.dumps(payload,sort_keys=True,separators=(',',':'))
+db.execute("UPDATE ai_experiences SET payload_json=?,payload_hash=? WHERE event_type='intraday_feature_decision_v1'",(body,hashlib.sha256(body.encode()).hexdigest()))
+item=NS(symbol='005930',action='HOLD',decision_time=datetime.fromisoformat('2026-10-01T00:14:00+00:00'),
+ data_cutoff_at=datetime.fromisoformat('2026-10-01T00:13:21+00:00'),feature_hash=payload['feature_hash'],policy_hash=payload['policy_hash'],
+ shortlist_hash=payload['shortlist_hash'],model_version=payload['model_version'],prob_up=.58,prob_flat=.3,prob_down=.12,
+ source_quote_ids=(qid,),features=payload['features'],risk_overlay='ALLOW',data_quality='PASS')
+batch=NS(decisions=(item,),decision_time=item.decision_time)
+selected=[dict(symbol='005930',role='eligible_entry',review_tier='watch',ml_action='HOLD',prob_up=.58,prob_flat=.3,prob_down=.12,
+ risk_overlay='ALLOW',data_quality='PASS',
+ market_evidence=dict(decision_time='2026-10-01T00:14:00Z',data_cutoff_at='2026-10-01T00:13:21Z'))]
+when=datetime.fromisoformat('2026-10-01T09:14:00+09:00')
+register_batch(db,session_run_id=sid,trade_date='2026-10-01',slot_id='2026-10-01T09:10',collection_time=when,decisions=[item],now=datetime.fromisoformat('2026-10-01T00:14:00+00:00'))
+value=context_metadata(db,trade_date='2026-10-01',collection_time=when,batch=batch,selected=selected,held_symbols=set())
+assert value is not None
+db.commit()
+target=sqlite3.connect(sys.argv[1]); db.backup(target); target.close(); os.chmod(sys.argv[1],0o600)
+print(json.dumps(value,separators=(',',':')))
+`;
+  const linkageJson = await new Promise((resolve, reject) => execFile(
+    python, ['-c', script, databasePath], {
+      cwd: producer, timeout: 15000, maxBuffer: 65536, windowsHide: true,
+      env: { ...process.env, PYTHONPATH: producer },
+    }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()),
+  ));
+  const slotId = `${mod.TASKS[4].id}:2026-10-01:09:15`;
+  const rawContext = JSON.parse(decisionContext(slotId));
+  rawContext.candidates[0].ml_action = 'HOLD';
+  rawContext.candidates[0].review_tier = 'watch';
+  rawContext.candidates[0].prob_up = .58;
+  rawContext.candidates[0].prob_flat = .3;
+  rawContext.candidates[0].prob_down = .12;
+  rawContext.candidates[0].market_evidence = {
+    ...marketEvidence(), decision_time: '2026-10-01T00:14:00Z', data_cutoff_at: '2026-10-01T00:13:21Z',
+  };
+  rawContext.research_linkage = JSON.parse(linkageJson);
+  const parsed = mod.parseDecisionContextOutput(JSON.stringify(rawContext), slotId);
+  assert.equal(parsed.research_linkage.status, 'LINKABLE', JSON.stringify(rawContext.research_linkage.candidates[0]));
+  assert.equal(parsed.candidates[0].ml_action, 'HOLD');
+  assert.equal(parsed.research_linkage.value.candidates[0].ml_enter_candidate, true);
+  assert.equal(parsed.research_linkage.value.candidates[0].hermes_candidate_reason, 'ML_ENTRY_CANDIDATE');
+  const withoutLinkage = { ...rawContext };
+  delete withoutLinkage.research_linkage;
+  const baselinePacket = mod.buildSanitizedAiPacket({
+    slotId, context: mod.parseDecisionContextOutput(JSON.stringify(withoutLinkage), slotId),
+  });
+  const linkedPacket = mod.buildSanitizedAiPacket({ slotId, context: parsed });
+  assert.deepEqual(linkedPacket, baselinePacket);
+
+  let receivedPacket;
+  const value = await active({
+    decisionContextOutput: JSON.stringify(rawContext),
+    calendarProofResolver: () => calendarProof(),
+    llmExecutor: async ({ packet }) => { receivedPacket = packet; return aiVerdict(packet); },
+  });
+  value.setClock('2026-10-01T00:14:50Z');
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-10-01T00:15:10Z');
+  const runResult = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-10-01T00:15:00Z') });
+  assert.ok(receivedPacket, JSON.stringify(runResult.tasks[mod.TASKS[4].id]));
+  assert.deepEqual(receivedPacket, baselinePacket);
+  const directory = `${value.paths.statePath}.research-linkage`;
+  const record = JSON.parse(fs.readFileSync(path.join(directory, fs.readdirSync(directory)[0]), 'utf8'));
+  assert.equal(record.research_linkage.candidates[0].candidate_hash, rawContext.research_linkage.candidates[0].candidate_hash);
+
+  const exportScript = `import json, sqlite3, sys
+from pathlib import Path
+from kis_trading_lab.intraday_research_export import export_research
+uri=Path(sys.argv[1]).resolve(strict=True).as_uri()+'?mode=ro'
+with sqlite3.connect(uri,uri=True) as db:
+ db.execute('PRAGMA query_only=ON')
+ tables=('ai_experiences','ai_session_runs','ai_shadow_predictions','kis_quote_snapshots_v1')
+ before={table:db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0] for table in tables}
+ exported=export_research(sys.argv[1],'2026-10-01',sys.argv[2])
+ after={table:db.execute('SELECT COUNT(*) FROM '+table).fetchone()[0] for table in tables}
+assert before==after
+print(json.dumps({'counts_before':before,'counts_after':after,'export':exported},separators=(',',':')))
+`;
+  const roundtripJson = await new Promise((resolve, reject) => execFile(
+    python, ['-c', exportScript, databasePath, directory], {
+      cwd: producer, timeout: 15000, maxBuffer: 262144, windowsHide: true,
+      env: { ...process.env, PYTHONPATH: producer },
+    }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()),
+  ));
+  const roundtrip = JSON.parse(roundtripJson);
+  assert.deepEqual(roundtrip.counts_after, roundtrip.counts_before);
+  assert.deepEqual(roundtrip.export.candidate_linkage_counts, { LINKABLE: 1, NOT_LINKABLE: 0 });
+  assert.equal(roundtrip.export.candidate_groups.length, 1);
+  const group = roundtrip.export.candidate_groups[0];
+  assert.equal(group.linkage_status, 'LINKABLE');
+  assert.equal(group.ml_action, 'HOLD');
+  assert.equal(group.verdict, 'HOLD');
+  assert.equal(group.hermes_candidate_reason, 'ML_ENTRY_CANDIDATE');
+  assert.equal(roundtrip.export.horizon_count, 3);
+  assert.deepEqual(roundtrip.export.horizon_status_counts, { PENDING: 3 });
+  assert.deepEqual(group.horizons.map(({ payload }) => payload.status), ['PENDING', 'PENDING', 'PENDING']);
+});
+
 test('optional context latency is sanitized, ignored for the AI packet, and dropped when malformed', () => {
   const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const withTelemetry = JSON.parse(decisionContext(slotId));
