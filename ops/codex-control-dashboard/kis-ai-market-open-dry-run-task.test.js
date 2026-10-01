@@ -210,6 +210,95 @@ function marketEvidence() {
   };
 }
 
+function contextLatency() {
+  return {
+    version: 'context_latency_v1', measurement_scope: 'process_local', clock_source: 'monotonic',
+    started_at: '2026-07-21T00:15:00.000123+00:00', completed_at: '2026-07-21T00:15:00.025456+00:00', latency_ms: 25,
+    stages: [{ stage: 'settings_load', started_at: '2026-07-21T00:15:00.001234+00:00', completed_at: '2026-07-21T00:15:00.003456+00:00', latency_ms: 2, result: 'success' }],
+    broker_http_diagnostics: [],
+  };
+}
+
+test('optional context latency is sanitized, ignored for the AI packet, and dropped when malformed', () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const withTelemetry = JSON.parse(decisionContext(slotId));
+  withTelemetry.context_latency = contextLatency();
+  const parsed = mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId);
+  assert.deepEqual(parsed.context_latency, contextLatency());
+  const withoutTelemetry = { ...withTelemetry };
+  delete withoutTelemetry.context_latency;
+  assert.deepEqual(
+    mod.buildSanitizedAiPacket({ slotId, context: parsed }),
+    mod.buildSanitizedAiPacket({ slotId, context: mod.parseDecisionContextOutput(JSON.stringify(withoutTelemetry), slotId) }),
+  );
+
+  withTelemetry.context_latency.stages[0].secret = 'Bearer do-not-leak';
+  assert.equal(mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId).context_latency, undefined);
+  assert.doesNotMatch(JSON.stringify(parsed), /secret|Bearer|do-not-leak/);
+  for (const malformed of [null, [], 'invalid', 42, { ...contextLatency(), started_at: '2026-07-21T00:15:00.000123+09:00' },
+    { ...contextLatency(), completed_at: '2026-07-21T00:15:00.000123456+00:00' },
+    { ...contextLatency(), stages: [null] }, { ...contextLatency(), broker_http_diagnostics: {} }]) {
+    withTelemetry.context_latency = malformed;
+    assert.doesNotThrow(() => mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId));
+    assert.equal(mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId).context_latency, undefined);
+  }
+  withTelemetry.context_latency = {
+    ...contextLatency(),
+    broker_http_diagnostics: [{
+      endpoint_class: 'balance', requested_at_utc: 'Tue, 21 Jul 2026 00:15:00 (Bearer private-token) +00:00',
+      completed_at_utc: '2026-07-21T00:15:01.000000+00:00', latency_ms: 1000, http_status: 200,
+      failure_class: null, success: true, diagnostic_code: 'success',
+    }],
+  };
+  const droppedDiagnostic = mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId);
+  assert.deepEqual(droppedDiagnostic.context_latency.broker_http_diagnostics, []);
+  assert.doesNotMatch(JSON.stringify(droppedDiagnostic), /private-token|Bearer|Tue, 21 Jul/);
+  const coreSecret = JSON.parse(decisionContext(slotId));
+  coreSecret.candidates[0].raw_response = 'Bearer do-not-leak';
+  assert.throws(() => mod.parseDecisionContextOutput(JSON.stringify(coreSecret), slotId), /invalid_decision_context/);
+});
+
+test('context latency persists for no-candidate and blocked decision contexts', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  for (const blocked of [false, true]) {
+    const context = JSON.parse(decisionContext(slotId, []));
+    context.context_latency = contextLatency();
+    if (blocked) Object.assign(context, {
+      status: 'blocked', fail_closed: true, error_class: 'intraday_decision_stale_or_missing',
+      failure_phase: 'intraday_decision_lookup', candidates: [], holdings: [], account_aggregate: {}, risk_aggregate: {}, event_metadata: [],
+    });
+    const value = await active({ decisionContextOutput: JSON.stringify(context) });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    value.setClock('2026-07-21T00:15:10Z');
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+    const sample = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary.samples[0];
+    assert.deepEqual(sample.context_latency, contextLatency());
+    assert.equal(sample.decision_context_duration_ms >= 0, true);
+    assert.equal(sample.llm_outcome, blocked ? 'error' : 'no_candidates');
+  }
+});
+
+test('context latency survives validated HOLD and invalid verdict schema outcomes', async () => {
+  const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  for (const outcome of ['validated_hold', 'invalid_verdict', 'timeout']) {
+    const context = JSON.parse(decisionContext(slotId));
+    context.context_latency = contextLatency();
+    const value = await active({
+      decisionContextOutput: JSON.stringify(context),
+      llmExecutor: async ({ packet }) => {
+        if (outcome === 'timeout') throw new Error('llm_response_timeout');
+        return outcome === 'invalid_verdict' ? {} : aiVerdict(packet);
+      },
+    });
+    await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+    value.setClock('2026-07-21T00:15:10Z');
+    const result = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+    const sample = result.tasks[mod.TASKS[4].id].llm_latency_daily_summary.samples[0];
+    assert.deepEqual(sample.context_latency, contextLatency());
+    assert.equal(sample.llm_outcome, outcome === 'invalid_verdict' ? 'error' : outcome);
+  }
+});
+
 test('market evidence is bounded, point-in-time and included in the prompt hash', () => {
   const slotId = `${mod.TASKS[4].id}:2026-07-21:09:15`;
   const input = JSON.parse(decisionContext(slotId, Array.from({ length: 20 }, (_, i) => String(i).padStart(6, '0'))));
