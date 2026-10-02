@@ -483,6 +483,28 @@ test('optional context latency is sanitized, ignored for the AI packet, and drop
   withTelemetry.context_latency = contextLatency();
   const parsed = mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId);
   assert.deepEqual(parsed.context_latency, contextLatency());
+  const nested = contextLatency();
+  nested.stages = [
+    'control_state_load', 'scheduler_attestation', 'settings_load', 'artifact_validation',
+    'calendar_validation', 'reporting_route_check', 'pending_reconciliation_read', 'auth_client_setup',
+    'balance_read', 'position_decode', 'open_orders_read', 'intraday_decision_lookup',
+    'candidate_selection', 'entry_count_read', 'account_decode', 'candidate_transform',
+    'artifact_db_open', 'artifact_db_integrity_check', 'lookup_db_open', 'lookup_db_integrity_check',
+    'active_ml_bundle_artifact_check', 'artifact_promotion_query', 'artifact_promotion_parse',
+    'artifact_promotion_contract', 'artifact_registry_query', 'artifact_file_hash', 'artifact_joblib_load',
+    'artifact_metadata_check', 'intraday_batch_rows_query', 'intraday_batch_payload_hash_parse',
+    'active_ml_bundle_batch_check', 'batch_promotion_query', 'batch_promotion_parse',
+    'batch_promotion_contract', 'batch_registry_query', 'batch_file_hash', 'batch_joblib_load',
+    'batch_metadata_check', 'intraday_batch_contract_check',
+    'intraday_batch_final_artifact_contract', 'intraday_batch_construct',
+  ].map((stage) => ({ ...contextLatency().stages[0], stage }));
+  withTelemetry.context_latency = nested;
+  assert.equal(nested.stages.length, 41);
+  assert.deepEqual(
+    mod.parseDecisionContextOutput(JSON.stringify(withTelemetry), slotId).context_latency,
+    nested,
+  );
+  withTelemetry.context_latency = contextLatency();
   const withoutTelemetry = { ...withTelemetry };
   delete withoutTelemetry.context_latency;
   assert.deepEqual(
@@ -1414,6 +1436,70 @@ test('safety completion after an order slot does not enable delayed order dispat
   assert.equal(orderRuns, 0);
   assert.equal(after.tasks[mod.TASKS[4].id].last_run.action_type, 'missed_window_no_op');
   assert.equal(after.tasks[mod.TASKS[4].id].last_due_at, null);
+});
+
+test('missed order window keeps no-dispatch decision and persists sanitized evidence', async () => {
+  let orderRuns = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    onExec: ({ args }) => {
+      if (args.includes('vps-autonomous-order') && args.includes('run-once')) orderRuns += 1;
+    },
+  });
+  markOrderActive(value);
+  const state = value.task.status();
+  const order = state.tasks[mod.TASKS[4].id];
+  order.next_run_at = '2026-07-21T00:05:00.000Z';
+  order.last_run = { status: 'success', action_type: 'previous_safe_run' };
+  order.pending_invocation = { token: 'must-not-persist' };
+  state.last_safety_monitor = {
+    monitor_started_at: '2026-07-21T00:04:00.000Z',
+    monitor_completed_at: '2026-07-21T00:04:30.000Z', monitor_duration_ms: 30000,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:15:00Z');
+
+  const after = await value.task.tick();
+  const lastRun = after.tasks[mod.TASKS[4].id].last_run;
+  assert.equal(orderRuns, 0);
+  assert.equal(lastRun.action_type, 'missed_window_no_op');
+  assert.equal(lastRun.due_key, `${mod.TASKS[4].id}:2026-07-21:09:05`);
+  assert.equal(lastRun.scheduled_due_at, '2026-07-21T00:05:00.000Z');
+  assert.equal(lastRun.monitor_started_at, after.last_safety_monitor.monitor_started_at);
+  assert.equal(lastRun.monitor_completed_at, after.last_safety_monitor.monitor_completed_at);
+  assert.equal(lastRun.monitor_duration_ms, after.last_safety_monitor.monitor_duration_ms);
+  assert.equal(lastRun.dispatch_attempt_at, null);
+  assert.equal(lastRun.dispatch_at, null);
+  assert.equal(lastRun.lock_state, 'clear');
+  assert.equal(lastRun.previous_run_state, 'success');
+  assert.equal(lastRun.pending, true);
+  assert.equal(lastRun.skip_reason, 'missed_window');
+  assert.equal(JSON.stringify(lastRun).includes('must-not-persist'), false);
+  assert.equal(after.tasks[mod.TASKS[4].id].next_run_at, '2026-07-21T00:25:00.000Z');
+});
+
+test('missed order diagnostic drops parseable monitor timestamps with trailing sensitive text', async () => {
+  const value = await active({ schedulerRegistered: true });
+  markOrderActive(value);
+  const state = value.task.status();
+  state.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:05:00.000Z';
+  state.last_safety_monitor = {
+    checked_at: '2026-07-21T00:15:00.000Z',
+    monitor_started_at: '2026-07-21T00:04:00.000Z secret=should-not-persist',
+    monitor_completed_at: 'July 21, 2026 00:04:30 UTC password=should-not-persist',
+    monitor_duration_ms: 30000,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock('2026-07-21T00:15:00Z');
+
+  const after = await value.task.runOnce({
+    taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00.000Z'),
+  });
+  const lastRun = after.tasks[mod.TASKS[4].id].last_run;
+  assert.equal(lastRun.action_type, 'missed_window_no_op');
+  assert.equal(lastRun.monitor_started_at, null);
+  assert.equal(lastRun.monitor_completed_at, null);
+  assert.equal(JSON.stringify(lastRun).includes('should-not-persist'), false);
 });
 
 for (const scenario of [
