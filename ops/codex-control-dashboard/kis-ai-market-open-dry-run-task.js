@@ -1326,6 +1326,14 @@ function buildDecisionContextCommand(schedulerToken, invocationDueKey) {
 }
 
 const CONTEXT_LATENCY_STAGES = new Set([
+  'artifact_db_open', 'artifact_db_integrity_check', 'lookup_db_open', 'lookup_db_integrity_check',
+  'active_ml_bundle_artifact_check', 'active_ml_bundle_batch_check',
+  'artifact_promotion_query', 'artifact_promotion_parse', 'artifact_promotion_contract', 'artifact_registry_query',
+  'artifact_file_hash', 'artifact_joblib_load', 'artifact_metadata_check',
+  'batch_promotion_query', 'batch_promotion_parse', 'batch_promotion_contract', 'batch_registry_query',
+  'batch_file_hash', 'batch_joblib_load', 'batch_metadata_check',
+  'intraday_batch_rows_query', 'intraday_batch_payload_hash_parse', 'intraday_batch_contract_check',
+  'intraday_batch_final_artifact_contract', 'intraday_batch_construct',
   'control_state_load', 'scheduler_attestation', 'settings_load', 'artifact_validation',
   'calendar_validation', 'reporting_route_check', 'pending_reconciliation_read', 'auth_client_setup',
   'balance_read', 'position_decode', 'open_orders_read', 'intraday_decision_lookup',
@@ -1342,7 +1350,7 @@ function sanitizeContextLatency(value) {
     || Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))
     || value.version !== 'context_latency_v1' || value.measurement_scope !== 'process_local'
     || value.clock_source !== 'monotonic' || !validTime(value.started_at) || !validTime(value.completed_at)
-    || !validLatency(value.latency_ms) || !Array.isArray(value.stages) || value.stages.length > 20
+    || !validLatency(value.latency_ms) || !Array.isArray(value.stages) || value.stages.length > 80
     || !Array.isArray(value.broker_http_diagnostics) || value.broker_http_diagnostics.length > 32) return null;
   const stages = [];
   for (const item of value.stages) {
@@ -3656,7 +3664,34 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         const scheduleTask = task.kind === 'order' && taskState.refresh_only_pending
           && !hasIntradayProviderAttestation(taskState)
           ? REFRESH_ONLY_ORDER_TASK : task;
-        return save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, next_run_at: nextRunAt(scheduleTask, dueTime), last_run: { status: taskState.refresh_only_pending ? 'waiting' : 'no_op', action_type: taskState.refresh_only_pending ? 'missed_refresh_window_no_op' : 'missed_window_no_op', error_class: taskState.refresh_only_pending ? 'model_v3_prediction_batch_incomplete' : 'none', fail_closed: taskState.refresh_only_pending === true, catch_up: false, invoked_by: safeText(invokedBy), completed_at: now().toISOString() } } } });
+        const completedAt = now().toISOString();
+        const lastRun = {
+          status: taskState.refresh_only_pending ? 'waiting' : 'no_op',
+          action_type: taskState.refresh_only_pending ? 'missed_refresh_window_no_op' : 'missed_window_no_op',
+          error_class: taskState.refresh_only_pending ? 'model_v3_prediction_batch_incomplete' : 'none',
+          fail_closed: taskState.refresh_only_pending === true, catch_up: false,
+          invoked_by: safeText(invokedBy), completed_at: completedAt,
+        };
+        if (task.kind === 'order') {
+          const monitor = current.last_safety_monitor || {};
+          const previousStatus = taskState.last_run?.status;
+          const validMonitorTime = (timestamp) => typeof timestamp === 'string'
+            && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|\+00:00)$/.test(timestamp)
+            && Number.isFinite(Date.parse(timestamp));
+          let lockState = 'unknown';
+          try { lockState = fs.existsSync(runLockPath) ? 'present' : 'clear'; } catch { /* diagnostic only */ }
+          Object.assign(lastRun, {
+            due_key: dueKey(task, scheduled), scheduled_due_at: scheduled.toISOString(),
+            monitor_started_at: validMonitorTime(monitor.monitor_started_at) ? monitor.monitor_started_at : null,
+            monitor_completed_at: validMonitorTime(monitor.monitor_completed_at) ? monitor.monitor_completed_at : null,
+            monitor_duration_ms: Number.isSafeInteger(monitor.monitor_duration_ms) && monitor.monitor_duration_ms >= 0 ? monitor.monitor_duration_ms : null,
+            dispatch_attempt_at: null, dispatch_at: null, lock_state: lockState,
+            previous_run_state: ['success', 'no_op', 'blocked', 'waiting', 'running'].includes(previousStatus) ? previousStatus : 'unknown',
+            pending: taskState.pending_invocation !== null && taskState.pending_invocation !== undefined,
+            skip_reason: 'missed_window',
+          });
+        }
+        return save({ ...current, tasks: { ...current.tasks, [taskId]: { ...taskState, next_run_at: nextRunAt(scheduleTask, dueTime), last_run: lastRun } } });
       }
       return current;
     }
