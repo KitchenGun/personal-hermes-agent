@@ -31,3 +31,9 @@ set -a
 set +a
 PATH="$HOME/.local/bin:$PATH" bash ~/.hermes/codex-control-dashboard/dashboard-smoke.sh
 ```
+
+## 클라우드 개발 → VM 배포 인계
+
+클라우드에서 준비한 변경을 GitHub 전체 SHA와 승인된 VM 고정 프로필로 인계할 때는
+[클라우드 개발과 VM 배포 인계](../docs/cloud-vm-deployment-handoff.md)를 따릅니다.
+문서 전용 변경은 런타임 파일 복사나 서비스 재시작 없이 소스 반영만 확인합니다.

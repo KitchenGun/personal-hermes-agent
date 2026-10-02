@@ -87,19 +87,19 @@
 
       <section class="queue">
         <div class="sectionHead">
-          <h2>Task queue</h2>
+          <h2 id="taskQueueHeading">Task queue</h2>
           <span id="queueHint"></span>
         </div>
         <div class="tableWrap">
-          <table>
+          <table aria-labelledby="taskQueueHeading">
             <thead>
               <tr>
-                <th>ID</th>
-                <th>Task</th>
-                <th>Status</th>
-                <th>Assignee</th>
-                <th>Retries</th>
-                <th>Age</th>
+                <th scope="col">ID</th>
+                <th scope="col">Task</th>
+                <th scope="col">Status</th>
+                <th scope="col">Assignee</th>
+                <th scope="col">Retries</th>
+                <th scope="col">Age</th>
               </tr>
             </thead>
             <tbody id="taskRows"></tbody>
