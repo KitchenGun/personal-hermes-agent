@@ -9,7 +9,7 @@ import guard
 from github_transport import GitHub,RemoteError
 from store import Store,Conflict,TERMINAL
 
-WORKER_VERSION = 1
+WORKER_VERSION = 2
 FAIL_STARTUP_HEALTH = False  # A reviewed isolated bad-health release may exercise rollback.
 RESULT_PREFIX = 'DEPLOY_CONTROL_RESULT_V1 '
 
