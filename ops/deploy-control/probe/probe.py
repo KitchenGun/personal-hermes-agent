@@ -1,5 +1,5 @@
 """Nonfinancial deployment receipt probe. No network, trading, or application state."""
-PROBE_VERSION = 1
+PROBE_VERSION = 2
 
 def main():
     import _deploy_context as context
