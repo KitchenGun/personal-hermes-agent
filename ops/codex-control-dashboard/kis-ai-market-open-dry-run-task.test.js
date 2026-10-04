@@ -2276,10 +2276,14 @@ now = datetime(2026, 10, 5, 0, 16, tzinfo=timezone.utc)
 created = now.isoformat()
 expires = (now + timedelta(minutes=3)).isoformat()
 root = Path(tempfile.mkdtemp(prefix='kis-hermes-proof-'))
+root.chmod(0o700)
 attroot = root / 'attestations'
 orderroot = attroot / 'order-prechecks'
 analysisroot = orderroot / 'exit-analyses'
-analysisroot.mkdir(parents=True)
+analysisroot.mkdir(parents=True, mode=0o700)
+attroot.chmod(0o700)
+orderroot.chmod(0o700)
+analysisroot.chmod(0o700)
 r.HELD_EXIT_ANALYSIS_DIR = str(analysisroot)
 duehash = hashlib.sha256(due.encode()).hexdigest()
 position = {'symbol':'005930','quantity':1,'average_price':70000.0}
@@ -2318,6 +2322,7 @@ proof = {'schema':r.HELD_EXIT_ANALYSIS_SCHEMA,'analysis_only':True,'due_key':due
  'attestation':att,'position_lifecycle_hash':lifehash,'positions':[position],'context':context}
 proofpath = analysisroot / (duehash + '.json')
 proofhash = r._write_held_exit_analysis(proofpath,proof)
+proofpath.chmod(0o600)
 analysis_pending['context_hash'] = proofhash
 analysis_record = {'status':'RUNNING','due_key':due,'context_path':str(proofpath),
  'context_hash':proofhash,'position_identity':positionid,'created_at':created,'expires_at':expires,
@@ -2330,14 +2335,19 @@ state = {'state':'ACTIVE','scheduler_registered':True,'server_registered':True,'
  'intraday_policy_version':r.INTRADAY_POLICY_VERSION,'intraday_feature_hash':r.INTRADAY_FEATURE_HASH,
  'intraday_policy_hash':r.INTRADAY_POLICY_HASH}}}
 statepath.write_text(json.dumps(state,separators=(',',':')),encoding='utf8')
+statepath.chmod(0o600)
 readback = r._read_held_exit_analysis(proofpath,expected_hash=proofhash,due_key=due,now=now,require_canonical=False)
 wrong_hash = wrong_slot = False
 try: r._read_held_exit_analysis(proofpath,expected_hash='0'*64,due_key=due,now=now,require_canonical=False)
 except r.AutonomousRuntimeError: wrong_hash = True
 try: r._read_held_exit_analysis(proofpath,expected_hash=proofhash,due_key=due+':wrong',now=now,require_canonical=False)
 except r.AutonomousRuntimeError: wrong_slot = True
-(attroot / (duehash+'.json')).write_text(json.dumps(pending,separators=(',',':')),encoding='utf8')
-(attroot / (duehash+'.analysis.json')).write_text(json.dumps(analysis_pending,separators=(',',':')),encoding='utf8')
+normal_token = attroot / (duehash+'.json')
+analysis_token = attroot / (duehash+'.analysis.json')
+normal_token.write_text(json.dumps(pending,separators=(',',':')),encoding='utf8')
+analysis_token.write_text(json.dumps(analysis_pending,separators=(',',':')),encoding='utf8')
+normal_token.chmod(0o600)
+analysis_token.chmod(0o600)
 produced = r.run_llm_decision_context(scheduler_token=token,due_key=due,
  held_exit_analysis_path=proofpath,held_exit_analysis_hash=proofhash,state_path=statepath,
  attestation_dir=attroot,require_canonical=False,now=now)
@@ -2345,6 +2355,7 @@ normal = r.verify_scheduler_attestation(scheduler_token=token,due_key=due,state_
  attestation_dir=attroot,require_canonical=False,now=now)
 precheck = orderroot / 'precheck.json'
 precheck.write_text('{}',encoding='utf8')
+precheck.chmod(0o600)
 envelope = {'schema':'kis-vps-order-precheck-v2','result':'LLM_EXIT_REQUIRED','fail_closed':False,
  'error_class':'none','precheck_path':str(precheck),'attestation':att,'entry_ready':False,
  'exit_analysis_required':True,'exit_analysis_path':str(proofpath),'exit_analysis_hash':proofhash}
