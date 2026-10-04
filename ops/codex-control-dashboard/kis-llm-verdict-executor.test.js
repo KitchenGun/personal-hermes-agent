@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const test = require('node:test');
 
 const {
@@ -68,4 +69,69 @@ test('maps a killed Hermes process to the bounded timeout class', async () => {
     executor({ model: FIXED_MODEL_ID, timeoutMs: 1000, packet: packet() }),
     /llm_response_timeout/,
   );
+});
+
+test('aborting Hermes waits for ChildProcess close after an early exec callback', async () => {
+  const controller = new AbortController();
+  let callback;
+  const child = new EventEmitter();
+  child.closed = false;
+  let receivedSignal;
+  let settled = false;
+  const executor = createHermesLlmVerdictExecutor({
+    execFile(file, args, options, done) { receivedSignal = options.signal; callback = done; return child; },
+  });
+  const pending = executor({ model: FIXED_MODEL_ID, timeoutMs: 1000, packet: packet(), signal: controller.signal });
+  pending.finally(() => { settled = true; }).catch(() => {});
+  assert.equal(receivedSignal, controller.signal);
+  controller.abort();
+  callback(Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }), '', '');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  child.closed = true;
+  child.emit('close', null, 'SIGTERM');
+  await assert.rejects(pending, /llm_cancelled/);
+  assert.equal(settled, true);
+});
+
+test('generic child errors wait for close and never become successful verdict text', async () => {
+  const child = new EventEmitter();
+  let callback;
+  let settled = false;
+  const executor = createHermesLlmVerdictExecutor({
+    execFile(file, args, options, done) { callback = done; return child; },
+  });
+  const pending = executor({ model: FIXED_MODEL_ID, timeoutMs: 1000, packet: packet() });
+  pending.finally(() => { settled = true; }).catch(() => {});
+  callback(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }), 'valid-looking-json', '');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  child.emit('close', -2, null);
+  await assert.rejects(pending, /llm_verdict_contract_unavailable/);
+  assert.equal(settled, true);
+});
+
+test('a close event before the callback still settles only from the callback outcome', async () => {
+  const child = new EventEmitter();
+  let callback;
+  const expected = '{"bounded":"result"}';
+  const executor = createHermesLlmVerdictExecutor({
+    execFile(file, args, options, done) { callback = done; return child; },
+  });
+  const pending = executor({ model: FIXED_MODEL_ID, timeoutMs: 1000, packet: packet() });
+  child.emit('close', 0, null);
+  callback(null, expected, '');
+  assert.equal(await pending, expected);
+});
+
+test('an already-aborted request is rejected without spawning Hermes', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let calls = 0;
+  const executor = createHermesLlmVerdictExecutor({
+    execFile() { calls += 1; throw new Error('must not spawn'); },
+  });
+  await assert.rejects(executor({ model: FIXED_MODEL_ID, timeoutMs: 1000, packet: packet(),
+    signal: controller.signal }), /llm_cancelled/);
+  assert.equal(calls, 0);
 });

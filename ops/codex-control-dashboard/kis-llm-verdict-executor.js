@@ -33,12 +33,16 @@ function createHermesLlmVerdictExecutor(options = {}) {
   const execFile = options.execFile || defaultExecFile;
   const hermesBin = options.hermesBin || process.env.HERMES_BIN || '/home/ubuntu/.local/bin/hermes';
   const execMode = options.execMode || process.env.HERMES_EXEC_MODE || 'direct';
-  return ({ model, timeoutMs, packet }) => new Promise((resolve, reject) => {
+  return ({ model, timeoutMs, packet, signal }) => new Promise((resolve, reject) => {
     if (model !== FIXED_MODEL_ID || !packet || typeof packet !== 'object' || Array.isArray(packet)) {
       reject(new Error('llm_verdict_contract_unavailable'));
       return;
     }
     const timeout = Math.min(Math.max(1, Number(timeoutMs) || MAX_TIMEOUT_MS), MAX_TIMEOUT_MS);
+    if (signal?.aborted) {
+      reject(new Error('llm_cancelled'));
+      return;
+    }
     const args = [
       '--safe-mode',
       '--ignore-rules',
@@ -47,13 +51,38 @@ function createHermesLlmVerdictExecutor(options = {}) {
       '--oneshot', buildPrompt(packet),
     ];
     const command = commandFor(execMode, hermesBin, args);
-    execFile(command.file, command.args, { timeout, maxBuffer: MAX_BUFFER_BYTES }, (error, stdout) => {
-      if (error) {
-        reject(new Error(error.killed ? 'llm_response_timeout' : 'llm_verdict_contract_unavailable'));
-        return;
+    let settled = false;
+    let child = null;
+    let closeSeen = false;
+    let callbackResult = null;
+    let callbackSeen = false;
+    let spawnReturned = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(value);
+    };
+    const settleCallback = () => {
+      if (!callbackSeen || !spawnReturned || (child && !closeSeen)) return;
+      if (signal?.aborted) finish(new Error('llm_cancelled'));
+      else if (callbackResult) {
+        const [error, stdout] = callbackResult;
+        finish(error ? new Error(error.killed ? 'llm_response_timeout' : 'llm_verdict_contract_unavailable')
+          : null, error ? undefined : String(stdout || '').trim());
       }
-      resolve(String(stdout || '').trim());
+    };
+    const onClose = () => { closeSeen = true; settleCallback(); };
+    child = execFile(command.file, command.args, {
+      timeout, maxBuffer: MAX_BUFFER_BYTES, ...(signal ? { signal } : {}),
+    }, (error, stdout) => {
+      callbackSeen = true;
+      callbackResult = [error, stdout];
+      settleCallback();
     });
+    child?.once?.('close', onClose);
+    spawnReturned = true;
+    if (!child) closeSeen = true;
+    settleCallback();
   });
 }
 
