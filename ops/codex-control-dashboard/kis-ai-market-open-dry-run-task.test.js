@@ -2018,6 +2018,7 @@ test('restart terminalizes orphaned RUNNING and READY analyses without replay or
   const { EventEmitter } = require('node:events');
   const restarted = mod.createKisAiMarketOpenDryRunTask({
     ...value.paths, now: () => new Date('2026-07-21T00:16:00Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
     runtimeHealthCheck: async () => true, sourceParityCheck: () => true,
     calendarProofResolver: () => calendarProof(true), execFile() { childCalls += 1; },
     processObject: new EventEmitter(), setTimer: () => ({ unref() {} }), clearTimer() {},
@@ -2030,6 +2031,8 @@ test('restart terminalizes orphaned RUNNING and READY analyses without replay or
     assert.equal(recovered.exit_analyses[dueKey].error_class, 'exit_analysis_interrupted');
   }
   assert.equal(recovered.exit_analyses[dueKeys[0]].token_cleanup_status, 'deleted');
+  assert.match(recovered.exit_analyses[dueKeys[0]].analysis_token_hash, /^[a-f0-9]{64}$/);
+  assert.match(recovered.exit_analyses[dueKeys[0]].analysis_token_proof_hash, /^[a-f0-9]{64}$/);
   assert.equal(fs.existsSync(analysisTokenPaths[0]), false);
   assert.equal(recovered.exit_analyses[dueKeys[1]].token_cleanup_status, 'preserved_foreign');
   assert.equal(recovered.exit_analyses[dueKeys[1]].verdict_cleanup_status, 'preserved_unbound');
@@ -2116,6 +2119,7 @@ test('restart deletes only producer-bound READY verdicts and records foreign sym
   const { EventEmitter } = require('node:events');
   const restarted = mod.createKisAiMarketOpenDryRunTask({
     ...value.paths, now: () => new Date('2026-07-21T00:55:00Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
     runtimeHealthCheck: async () => true, sourceParityCheck: () => true,
     calendarProofResolver: () => calendarProof(true), execFile() { orderChildCalls += 1; },
     processObject: new EventEmitter(), setTimer: () => ({ unref() {} }), clearTimer() {},
@@ -2145,6 +2149,214 @@ test('restart deletes only producer-bound READY verdicts and records foreign sym
   assert.equal(recoveredOrder.pending_invocation.due_key, dueKeys[3]);
   assert.equal(orderChildCalls, 0);
   await restarted.stop();
+});
+
+test('shutdown cancellation after verdict production drops summary fields and exact owned file', async () => {
+  let resolveExecutor;
+  let executorStarted = false;
+  let executorPacket;
+  let job;
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED', awaitManagedAnalysis: false,
+    analysisStateLockTimeoutMs: 1000, shutdownDrainTimeoutMs: 1000,
+    llmExecutor({ packet }) {
+      executorStarted = true;
+      executorPacket = packet;
+      return new Promise((resolve) => { resolveExecutor = resolve; });
+    },
+    onExitAnalysisJob(created) { job = created; },
+    decisionContextOutput(slotId) {
+      const context = JSON.parse(heldDecisionContext(slotId));
+      context.analysis_only = true; context.position_lifecycle_hash = 'f'.repeat(64);
+      context.intraday_candidate_counts = { analyzed: 0, observation_ready: 0, data_excluded: 0,
+        model_unavailable: 0, risk_excluded: 0, llm_eligible: 0 };
+      return JSON.stringify(context);
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:00Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  for (let i = 0; i < 100 && !executorStarted; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(executorStarted, true);
+  const withStaleVerdict = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  Object.assign(withStaleVerdict.tasks[mod.TASKS[4].id].exit_analyses[job.dueKey], {
+    verdict_path: path.join(value.paths.verdictDir, `${'b'.repeat(32)}.json`),
+    verdict_hash: 'c'.repeat(64), verdict_due_key: job.dueKey,
+    verdict_generation: job.generation, verdict_context_hash: job.contextHash,
+    verdict_binding_hash: 'd'.repeat(64), prompt_hash: 'e'.repeat(64),
+    candidate_count: 1, verdict_summary: { entered: 1 },
+  });
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(withStaleVerdict));
+  const releaseState = mod.acquireExclusiveLock(value.paths.runLockPath);
+  try {
+    resolveExecutor(aiVerdict(executorPacket));
+    for (let i = 0; i < 100 && !job.result?.verdict; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+    assert.ok(job.result?.verdict);
+    const verdictPath = job.result.verdict.path;
+    const stopping = value.task.stop();
+    for (let i = 0; i < 100 && value.task.status().scheduler_registered; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+    releaseState();
+    await Promise.all([job.promise, stopping]);
+    const analysis = value.task.status().tasks[mod.TASKS[4].id].exit_analyses[job.dueKey];
+    assert.equal(analysis.status, 'CANCELLED');
+    assert.equal(Object.hasOwn(analysis, 'verdict_path'), false);
+    assert.equal(Object.hasOwn(analysis, 'verdict_hash'), false);
+    assert.equal(Object.hasOwn(analysis, 'prompt_hash'), false);
+    assert.equal(Object.hasOwn(analysis, 'candidate_count'), false);
+    assert.equal(Object.hasOwn(analysis, 'verdict_summary'), false);
+    assert.equal(fs.existsSync(verdictPath), false);
+  } catch (error) {
+    try { releaseState(); } catch {}
+    throw error;
+  }
+});
+
+test('restart retries exact owned cleanup left pending on an interrupted FAILED record', async () => {
+  const jobs = new Map();
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED', awaitManagedAnalysis: false,
+    decisionContextOutput(slotId) {
+      const context = JSON.parse(heldDecisionContext(slotId));
+      context.analysis_only = true; context.position_lifecycle_hash = 'f'.repeat(64);
+      context.intraday_candidate_counts = { analyzed: 0, observation_ready: 0, data_excluded: 0,
+        model_unavailable: 0, risk_excluded: 0, llm_eligible: 0 };
+      return JSON.stringify(context);
+    },
+    onExitAnalysisJob(job) { jobs.set(job.dueKey, job); },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.setClock('2026-07-21T00:15:00Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  const dueKey = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+  const job = jobs.get(dueKey);
+  await job.promise;
+  const tokenPath = path.join(value.paths.orderAttestationDir,
+    `${crypto.createHash('sha256').update(dueKey).digest('hex')}.analysis.json`);
+  fs.writeFileSync(tokenPath, JSON.stringify(job.pendingToken));
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  const analysis = state.tasks[mod.TASKS[4].id].exit_analyses[dueKey];
+  analysis.status = 'FAILED'; analysis.pending_invocation = null;
+  analysis.token_cleanup_status = 'pending_cleanup';
+  analysis.verdict_cleanup_status = 'pending_cleanup';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  const { EventEmitter } = require('node:events');
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths, now: () => new Date('2026-07-21T00:16:00Z'),
+    runtimeContract: mod.REQUIRED_RUNTIME_CONTRACT,
+    runtimeHealthCheck: async () => true, sourceParityCheck: () => true,
+    calendarProofResolver: () => calendarProof(true), processObject: new EventEmitter(),
+    setTimer: () => ({ unref() {} }), clearTimer() {}, schedulerRegistered: true,
+    serverRegistered: true, enforceSchedulerOwnership: false,
+  });
+  restarted.start();
+  const recovered = restarted.status().tasks[mod.TASKS[4].id].exit_analyses[dueKey];
+  assert.equal(recovered.token_cleanup_status, 'deleted');
+  assert.equal(recovered.verdict_cleanup_status, 'deleted');
+  assert.equal(fs.existsSync(tokenPath), false);
+  assert.equal(fs.existsSync(analysis.verdict_path), false);
+  await restarted.stop();
+});
+
+test('start holds admission ownership through interrupted-analysis cleanup and registration', async () => {
+  const value = await active({ schedulerRegistered: true, serverRegistered: true });
+  const lockPath = `${value.paths.statePath}.admission.lock`;
+  const readFile = fs.readFileSync;
+  let stateReads = 0;
+  let competingStopAcknowledged = false;
+  fs.readFileSync = function readWithCompetingStop(file, ...args) {
+    if (file === value.paths.statePath && ++stateReads === 2) {
+      try {
+        const release = mod.acquireAdmissionLock(lockPath);
+        competingStopAcknowledged = true;
+        const state = JSON.parse(readFile.call(this, file, 'utf8'));
+        state.scheduler_registered = false; state.server_registered = false;
+        fs.writeFileSync(file, JSON.stringify(state));
+        release();
+      } catch (error) {
+        if (!/admission_lock_contended/.test(error.message)) throw error;
+      }
+    }
+    return readFile.call(this, file, ...args);
+  };
+  try { value.task.start(); } finally { fs.readFileSync = readFile; }
+  assert.equal(competingStopAcknowledged, false);
+  assert.equal(value.task.status().scheduler_registered, true);
+  await value.task.stop();
+});
+
+test('admission acquisition removes only its own partially initialized inode', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-admission-partial-'));
+  const lockPath = path.join(root, 'state.json.admission.lock');
+  const originalFsync = fs.fsyncSync;
+  fs.fsyncSync = (fd) => {
+    const stat = fs.fstatSync(fd);
+    if (stat.isFile() && !fs.existsSync(path.join(root, 'injected'))) {
+      fs.writeFileSync(path.join(root, 'injected'), 'once');
+      throw Object.assign(new Error('injected_fsync_failure'), { code: 'EIO' });
+    }
+    return originalFsync(fd);
+  };
+  try { assert.throws(() => mod.acquireAdmissionLock(lockPath), /admission_lock_acquire_failed/); }
+  finally { fs.fsyncSync = originalFsync; }
+  assert.equal(fs.existsSync(lockPath), false);
+
+  fs.unlinkSync(path.join(root, 'injected'));
+  let replaced = false;
+  fs.fsyncSync = (fd) => {
+    if (!replaced && fs.fstatSync(fd).isFile()) {
+      replaced = true;
+      fs.renameSync(lockPath, `${lockPath}.owned`);
+      fs.writeFileSync(lockPath, 'foreign', { flag: 'wx', mode: 0o600 });
+      throw Object.assign(new Error('injected_replacement'), { code: 'EIO' });
+    }
+    return originalFsync(fd);
+  };
+  try { assert.throws(() => mod.acquireAdmissionLock(lockPath), /admission_lock_acquire_failed/); }
+  finally { fs.fsyncSync = originalFsync; }
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'foreign');
+  assert.equal(fs.existsSync(`${lockPath}.owned`), true);
+});
+
+test('resume state rejection is classified after run-lock ownership', async () => {
+  const value = await active();
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /task_not_resumable/);
+  assert.equal(value.task.status().last_resume_attempt.failure_phase, 'resume_state_validation');
+});
+
+test('settled detached executor consumes scheduler-owner release failure', async () => {
+  let executorStarted = false;
+  let resolveExecutor;
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED', awaitManagedAnalysis: false,
+    shutdownDrainTimeoutMs: 100, llmResponseTimeoutMs: 10, analysisDrainTimeoutMs: 10,
+    llmExecutor() {
+      executorStarted = true;
+      return new Promise((resolve) => { resolveExecutor = resolve; });
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.task.start(); value.setClock('2026-07-21T00:15:00Z');
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt: new Date('2026-07-21T00:15:00Z') });
+  for (let i = 0; i < 100 && !executorStarted; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(executorStarted, true);
+  await value.task.stop();
+  const displaced = `${value.paths.schedulerOwnerLockPath}.owned`;
+  fs.renameSync(value.paths.schedulerOwnerLockPath, displaced);
+  fs.writeFileSync(value.paths.schedulerOwnerLockPath, JSON.stringify({ pid: process.pid + 1, token: 'foreign' }),
+    { flag: 'wx', mode: 0o600 });
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    resolveExecutor('{}');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } finally { process.removeListener('unhandledRejection', onUnhandled); }
+  assert.deepEqual(unhandled, []);
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), true);
+  assert.equal(fs.existsSync(displaced), true);
+  const failures = JSON.parse(fs.readFileSync(`${value.paths.statePath}.exit-analysis-failures.json`, 'utf8'));
+  assert.ok(failures.some((entry) => entry.phase === 'scheduler_owner_release'));
 });
 
 test('service stop during delayed order precheck never dispatches the pending normal order', async () => {
