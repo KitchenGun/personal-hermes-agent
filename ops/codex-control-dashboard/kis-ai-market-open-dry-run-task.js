@@ -2244,6 +2244,62 @@ function acquireExclusiveLock(lockPath) {
   };
 }
 
+function acquireAdmissionLock(lockPath) {
+  const resolved = path.resolve(lockPath);
+  const parent = path.dirname(resolved);
+  let parentStat;
+  try { parentStat = fs.lstatSync(parent); } catch { throw new Error('admission_lock_parent_unavailable'); }
+  let realParent;
+  try { realParent = path.resolve(fs.realpathSync(parent)); } catch { throw new Error('admission_lock_parent_invalid'); }
+  const sameParent = process.platform === 'win32'
+    ? realParent.toLowerCase() === parent.toLowerCase() : realParent === parent;
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || !sameParent
+    || (process.platform !== 'win32' && ((parentStat.mode & 0o077) !== 0
+      || (typeof process.getuid === 'function' && parentStat.uid !== process.getuid())))) {
+    throw new Error('admission_lock_parent_invalid');
+  }
+  let fd;
+  const ownerNonce = crypto.randomBytes(16).toString('hex');
+  const payload = { schema_version: 'kis_order_admission_lock_v1', pid: process.pid,
+    owner_nonce: ownerNonce, created_at: new Date().toISOString() };
+  const contents = `${JSON.stringify(payload)}\n`;
+  try {
+    fd = fs.openSync(resolved, 'wx', 0o600);
+    fs.writeFileSync(fd, contents, 'utf8');
+    fs.fsyncSync(fd);
+    const heldStat = fs.fstatSync(fd);
+    const pathStat = fs.lstatSync(resolved);
+    if (!heldStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink()
+      || heldStat.dev !== pathStat.dev || heldStat.ino !== pathStat.ino
+      || (process.platform !== 'win32' && (pathStat.mode & 0o077) !== 0)
+      || fs.readFileSync(resolved, 'utf8') !== contents) throw new Error('admission_lock_ownership_unverified');
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (error.code === 'EEXIST') throw new Error('admission_lock_contended');
+    throw error.message === 'admission_lock_ownership_unverified' ? error : new Error('admission_lock_acquire_failed');
+  }
+  const inode = fs.fstatSync(fd);
+  let released = false;
+  return () => {
+    if (released) return;
+    let current;
+    try {
+      const pathStat = fs.lstatSync(resolved);
+      if (!pathStat.isFile() || pathStat.isSymbolicLink()
+        || pathStat.dev !== inode.dev || pathStat.ino !== inode.ino
+        || fs.readFileSync(resolved, 'utf8') !== contents) throw new Error('admission_lock_release_unverified');
+      current = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+    } catch { throw new Error('admission_lock_release_unverified'); }
+    if (current.schema_version !== payload.schema_version || current.pid !== payload.pid
+      || current.owner_nonce !== ownerNonce || current.created_at !== payload.created_at) {
+      throw new Error('admission_lock_release_unverified');
+    }
+    fs.closeSync(fd);
+    fs.unlinkSync(resolved);
+    released = true;
+  };
+}
+
 function acquireSchedulerOwnershipLock(lockPath) {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   const token = crypto.randomBytes(16).toString('hex');
@@ -2309,10 +2365,15 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const legacyV1RunLockPath = options.legacyV1RunLockPath || LEGACY_V1_RUN_LOCK_PATH;
   const legacyV2RunLockPath = options.legacyV2RunLockPath || LEGACY_V2_RUN_LOCK_PATH;
   const runLockPath = options.runLockPath || DEFAULT_RUN_LOCK_PATH;
+  const admissionLockPath = path.resolve(`${statePath}.admission.lock`);
   const schedulerOwnerLockPath = options.schedulerOwnerLockPath || DEFAULT_SCHEDULER_OWNER_LOCK_PATH;
   const exitAnalysisFailurePath = options.exitAnalysisFailurePath || `${statePath}.exit-analysis-failures.json`;
   const analysisStateLockTimeoutMs = Number.isSafeInteger(options.analysisStateLockTimeoutMs)
     ? Math.max(1, options.analysisStateLockTimeoutMs) : 10_000;
+  const analysisDrainTimeoutMs = Number.isSafeInteger(options.analysisDrainTimeoutMs)
+    ? Math.max(1, options.analysisDrainTimeoutMs) : 1_000;
+  const admissionLockTimeoutMs = Number.isSafeInteger(options.admissionLockTimeoutMs)
+    ? Math.max(1, Math.min(options.admissionLockTimeoutMs, EXEC_TIMEOUT_MS + 60_000)) : EXEC_TIMEOUT_MS + 60_000;
   const llmResponseTimeoutMs = Number.isSafeInteger(options.llmResponseTimeoutMs)
     ? Math.max(1, options.llmResponseTimeoutMs) : LLM_RESPONSE_TIMEOUT_MS;
   const orderAttestationDir = options.orderAttestationDir || ORDER_ATTESTATION_DIR;
@@ -2333,6 +2394,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const verdictDir = options.verdictDir || null;
   const exitAnalysisJobs = new Map();
   const exitAnalysisContinuations = new Map();
+  const unsettledAnalysisExecutors = new Set();
   let exitAnalysisGeneration = 0;
   let shutdownEpoch = 0;
   let shutdownPromise = null;
@@ -2365,12 +2427,27 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const safetyMonitorEnabled = options.safetyMonitorEnabled === true || schedulerRegistered;
   const enforceSchedulerOwnership = options.enforceSchedulerOwnership !== false;
   const execTimeoutMs = Math.min(Number(options.execTimeoutMs || EXEC_TIMEOUT_MS), EXEC_TIMEOUT_MS);
+  const shutdownDrainTimeoutMs = Number.isSafeInteger(options.shutdownDrainTimeoutMs)
+    ? Math.max(1, Math.min(options.shutdownDrainTimeoutMs, EXEC_TIMEOUT_MS + 60_000))
+    : Math.min(execTimeoutMs + 60_000, EXEC_TIMEOUT_MS + 60_000);
   const maxBuffer = Math.min(Number(options.maxBuffer || MAX_BUFFER_BYTES), MAX_BUFFER_BYTES);
   let timer = null;
   let ticking = false;
   let schedulerStopping = false;
+  let admissionRevoked = false;
+  let admissionRevocationComplete = false;
+  let retainedUnconfirmedAdmissionRelease = null;
   const activeRuns = new Set();
   const activeTicks = new Set();
+  function releaseSchedulerOwnershipIfIdle() {
+    if (!schedulerStopping || !admissionRevocationComplete || retainedUnconfirmedAdmissionRelease
+      || activeRuns.size || activeTicks.size
+      || exitAnalysisJobs.size || unsettledAnalysisExecutors.size) return;
+    if (releaseSchedulerOwnership) {
+      releaseSchedulerOwnership();
+      releaseSchedulerOwnership = null;
+    }
+  }
   let recoveringIncident = false;
   let schedulerFaulted = false;
   let releaseSchedulerOwnership = null;
@@ -2421,6 +2498,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       order_child_completed_at: null,
       order_outcome: null,
       order_error_class: null,
+      executor_exit_status: null,
     };
     if (typeof llmExecutor !== 'function' || typeof verdictDir !== 'string' || verdictDir.length === 0) {
       const error = new Error('llm_verdict_contract_unavailable');
@@ -2563,12 +2641,25 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (timeoutSignal.aborted) timeoutAbortListener();
         else timeoutSignal.addEventListener('abort', timeoutAbortListener, { once: true });
       });
+      let executorSettled = false;
       const executorPromise = Promise.resolve(llmExecutor({
         model: LLM_MODEL_ID, timeoutMs: llmResponseTimeoutMs, packet, signal: timeoutSignal,
       }));
+      unsettledAnalysisExecutors.add(executorPromise);
+      executorPromise.then(() => {
+        executorSettled = true;
+        unsettledAnalysisExecutors.delete(executorPromise);
+        releaseSchedulerOwnershipIfIdle();
+      }, () => {
+        executorSettled = true;
+        unsettledAnalysisExecutors.delete(executorPromise);
+        releaseSchedulerOwnershipIfIdle();
+      });
       try { response = await Promise.race([executorPromise, aborted]); }
       catch (error) {
-        if (signal?.aborted || timeoutReason.value) await executorPromise.catch(() => {});
+        if (signal?.aborted || timeoutReason.value) {
+          sample.executor_exit_status = executorSettled ? 'confirmed' : 'unconfirmed';
+        }
         throw error;
       }
     } catch (error) {
@@ -2649,6 +2740,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     fs.chmodSync(file, 0o600);
     return Object.freeze({
       path: file,
+      sha256: crypto.createHash('sha256').update(serialized, 'utf8').digest('hex'),
       promptHash: packet.prompt_hash,
       candidateCount: context.candidates.length,
       llmInvoked: true,
@@ -2769,13 +2861,26 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   function save(value) {
     if (value.tasks?.[ORDER_TASK.id]?.state === 'ACTIVE') delete value.order_pause_reason;
     if (value.incidents === undefined) value.incidents = {};
+    if (admissionRevoked) value = { ...value, scheduler_registered: false, server_registered: false };
     atomicWrite(statePath, value);
     return value;
+  }
+  async function acquireAdmissionLockBounded() {
+    const deadline = performance.now() + admissionLockTimeoutMs;
+    while (true) {
+      try { return acquireAdmissionLock(admissionLockPath); }
+      catch (error) {
+        if (error.message !== 'admission_lock_contended' || performance.now() >= deadline) {
+          throw new Error('stop_unconfirmed');
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
+      }
+    }
   }
   function recordExitAnalysisPersistenceFailure(dueKey, error, phase) {
     const entry = {
       at: now().toISOString(), due_key: String(dueKey || '').slice(0, 128),
-      phase: ['running_snapshot', 'terminal_snapshot', 'shutdown_terminal', 'token_write'].includes(phase) ? phase : 'snapshot',
+      phase: ['running_snapshot', 'terminal_snapshot', 'shutdown_terminal', 'token_write', 'token_cleanup'].includes(phase) ? phase : 'snapshot',
       error_class: ['EACCES', 'EPERM', 'ENOSPC', 'EROFS'].includes(error?.code) ? error.code : 'state_persistence_failed',
     };
     try {
@@ -3585,7 +3690,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const prior = orderTask.exit_analyses?.[job.dueKey];
       if (!prior || prior.generation !== job.generation || prior.context_hash !== job.contextHash) return false;
       if (job.epoch !== shutdownEpoch || job.controller.signal.aborted) {
-        result = { errorClass: 'analysis_cancelled', cancelled: true };
+        result = { ...result, errorClass: 'analysis_cancelled', cancelled: true };
       }
       const wasConsumed = prior.status === 'CONSUMED' || prior.entry_dispatch_attempted === true;
       const expired = Date.parse(prior.expires_at) <= now().getTime();
@@ -3608,10 +3713,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         } : {}),
         ...(result.verdict ? {
           verdict_path: result.verdict.path,
+          verdict_hash: result.verdict.sha256,
+          verdict_due_key: job.dueKey,
+          verdict_generation: job.generation,
+          verdict_context_hash: job.contextHash,
+          verdict_binding_hash: crypto.createHash('sha256').update(canonicalJson({
+            due_key: job.dueKey, generation: job.generation, context_hash: job.contextHash,
+            path: result.verdict.path, verdict_hash: result.verdict.sha256,
+            prompt_hash: result.verdict.promptHash,
+          })).digest('hex'),
           prompt_hash: result.verdict.promptHash,
           candidate_count: result.verdict.candidateCount,
           verdict_summary: result.verdict.summary,
         } : result.verdictSummary ? { verdict_summary: result.verdictSummary } : {}),
+        ...(job.pendingToken ? {
+          analysis_token_hash: job.pendingToken.token_hash,
+          analysis_token_proof_hash: crypto.createHash('sha256')
+            .update(canonicalJson(job.pendingToken)).digest('hex'),
+        } : {}),
       };
       const latencySample = result.llmLatencySample || result.verdict?.llmLatencySample;
       try {
@@ -3678,7 +3797,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const job = {
       dueKey: key, dueTime: new Date(dueTime), contextPath: precheck.exitAnalysisPath,
       contextHash: precheck.exitAnalysisHash, positionIdentity: precheck.attestation.position_identity,
-      token, tokenPath, generation, epoch: shutdownEpoch, controller: new AbortController(),
+      token, tokenPath, pendingToken: pending, generation, epoch: shutdownEpoch, controller: new AbortController(),
       entryReady: precheck.entryReady,
       activationArtifactHash: precheck.attestation.artifact_hash,
       executorAlreadyReady: precheck.entryReady || precheck.result === 'DIRECT_EXIT_READY',
@@ -3765,12 +3884,21 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         };
         await persistExitAnalysisTerminal(job, job.result);
       } finally {
-        try { fs.unlinkSync(tokenPath); } catch {}
+        try {
+          const stat = fs.lstatSync(tokenPath);
+          if (stat.isSymbolicLink() || !stat.isFile()
+            || JSON.stringify(JSON.parse(fs.readFileSync(tokenPath, 'utf8'))) !== JSON.stringify(job.pendingToken)) {
+            recordExitAnalysisPersistenceFailure(key, { code: stat.isSymbolicLink() ? 'token_symlink_preserved' : 'foreign_token_preserved' }, 'token_cleanup');
+          } else fs.unlinkSync(tokenPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') recordExitAnalysisPersistenceFailure(key, error, 'token_cleanup');
+        }
         if (exitAnalysisJobs.get(key) === job && job.terminal?.status !== 'READY') {
           exitAnalysisJobs.delete(key);
           if (job.continuationNonce) exitAnalysisContinuations.delete(job.continuationNonce);
           job.retired = true;
         }
+        releaseSchedulerOwnershipIfIdle();
       }
     })();
     job.promise.catch(() => {});
@@ -3806,6 +3934,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== RESUME_AFTER_IO_FIX_APPROVAL) throw new Error('exact_resume_approval_required');
     let release;
+    const resumeStartedAt = now();
+    const resumeStartedMonotonic = performance.now();
+    const resumeAttemptId = crypto.randomBytes(16).toString('hex');
+    let resumePhase = 'lock_acquisition';
+    let resumeExitCode = null;
+    let resumeTransportClass = 'UNKNOWN';
+    let resumeEndpointDiagnostics = [];
+    const formatResumeEndpointDiagnostics = () => resumeEndpointDiagnostics.slice(-32).map((item) => ({
+      endpoint_class: item.endpoint_class,
+      requested_at_utc: item.requested_at_utc,
+      completed_at_utc: item.completed_at_utc,
+      endpoint_duration_ms: item.latency_ms,
+      http_status: item.http_status,
+      failure_class: item.failure_class,
+      diagnostic_code: item.diagnostic_code,
+      success: item.success,
+      ...(item.timeout_stage ? { timeout_stage: item.timeout_stage } : {}),
+    }));
     try {
       release = acquireExclusiveLock(runLockPath);
       const current = loadStrict();
@@ -3873,10 +4019,14 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
       assertLegacyPaused();
       assertNoResumeBlockingLocks();
+      resumePhase = 'runtime_health';
       if (await runtimeHealthCheck() !== true) throw new Error('runtime_health_unavailable');
+      resumePhase = 'source_parity';
       if (sourceParityCheck() !== true) throw new Error('runtime_source_parity_failed');
       if (preflightReason) {
+        resumePhase = 'activation_preflight';
         const preflightRun = await execute(buildCommand(TASKS[0].id, { activationPreflight: true }));
+        resumeExitCode = Number.isSafeInteger(preflightRun.error?.code) ? preflightRun.error.code : 0;
         if (preflightRun.error?.killed) throw new Error('timeout');
         if (preflightRun.error && Number(preflightRun.error.code) !== 2) {
           throw new Error('database_recovery_preflight_process_error');
@@ -3903,14 +4053,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             : fallback);
         }
       }
+      resumePhase = 'quote_transport_diagnosis';
       const { error, stdout } = await execute(buildDiagnosticCommand());
+      resumeExitCode = Number.isSafeInteger(error?.code) ? error.code : 0;
       if (error) throw new Error('quote_transport_diagnosis_process_error');
       const diagnostic = parseQuoteTransportDiagnosticOutput(stdout);
+      resumeTransportClass = diagnostic.errorClass;
       if (!diagnostic.passed || diagnostic.symbolsSucceeded !== 3) throw new Error('quote_transport_diagnosis_failed');
+      resumePhase = 'safety_monitor';
       const safetyRun = await execute(buildSafetyMonitorCommand());
+      resumeExitCode = Number.isSafeInteger(safetyRun.error?.code) ? safetyRun.error.code : 0;
       if (safetyRun.error?.killed) throw new Error('timeout');
       if (safetyRun.error && Number(safetyRun.error.code) !== 2) throw new Error('safety_monitor_process_error');
       const safety = parseSafetyMonitorOutput(safetyRun.stdout);
+      resumeEndpointDiagnostics = safety.broker_http_diagnostics;
       const manualHoldSafetyClear = safety.status === 'success'
         && safety.execution_owner === 'vps'
         && safety.process_lock === 'clear'
@@ -3931,6 +4087,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       }
       if (!manualHold && safety.status !== 'success' && !vpsDailyLossEntryBlock) throw new Error(safety.error_class || 'safe_block');
       const resumedAt = now();
+      resumePhase = 'state_revalidation';
       const latest = loadStrict();
       const latestSnapshot = JSON.stringify({
         state: latest.state,
@@ -3945,6 +4102,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
       if (latestSnapshot !== recoverySnapshot) throw new Error('resume_state_changed');
       if (manualHold && !manualHoldIncidentsClear(latest)) throw new Error('incident_approval_required');
+      const resumeCompletedAt = now();
       const postClosePauseReason = current.state === 'PAUSED'
         ? current.pause_reason
         : current.tasks[POST_CLOSE_TASK.id]?.pause_reason;
@@ -3968,8 +4126,29 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           consecutive_transport_failures: 0,
         }];
       }));
+      const endpointDiagnostics = formatResumeEndpointDiagnostics();
       return save({
         ...latest,
+        last_resume_attempt: {
+          resume_attempt_id: resumeAttemptId,
+          resume_started_at_utc: resumeStartedAt.toISOString(),
+          resume_completed_at_utc: resumeCompletedAt.toISOString(),
+          status: 'success',
+          failure_phase: null,
+          duration_ms: Math.max(0, Math.round(performance.now() - resumeStartedMonotonic)),
+          exit_code: resumeExitCode ?? 0,
+          fresh_safety: {
+            status: safety.status,
+            execution_owner: safety.execution_owner,
+            process_lock: safety.process_lock,
+            kill_state: safety.kill_state,
+            open_order_status: safety.open_order_status,
+            reconciliation_status: safety.reconciliation_status,
+            account_risk_status: safety.account_risk_status,
+            error_class: safety.error_class,
+          },
+          endpoint_diagnostics: endpointDiagnostics,
+        },
         state: 'ACTIVE',
         pause_reason: undefined,
         resumed_at: resumedAt.toISOString(),
@@ -3982,6 +4161,32 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         server_registered: false,
         tasks,
       });
+    } catch (error) {
+      const failedAt = now();
+      const endpointDiagnostics = formatResumeEndpointDiagnostics();
+      const primaryEndpoint = endpointDiagnostics.find((item) => !item.success) || endpointDiagnostics[0] || null;
+      const resumeFailure = {
+        resume_attempt_id: resumeAttemptId,
+        resume_started_at_utc: resumeStartedAt.toISOString(),
+        resume_completed_at_utc: failedAt.toISOString(),
+        status: 'failed', failure_phase: resumePhase,
+        endpoint_class: primaryEndpoint?.endpoint_class || 'UNKNOWN',
+        transport_class: sanitizeErrorClass(primaryEndpoint?.failure_class
+          || (primaryEndpoint?.success ? 'none' : primaryEndpoint?.diagnostic_code)
+          || resumeTransportClass),
+        http_status: primaryEndpoint?.http_status ?? null,
+        requested_at_utc: primaryEndpoint?.requested_at_utc || resumeStartedAt.toISOString(),
+        completed_at_utc: primaryEndpoint?.completed_at_utc || failedAt.toISOString(),
+        endpoint_duration_ms: primaryEndpoint?.endpoint_duration_ms ?? null,
+        duration_ms: Math.max(0, Math.round(performance.now() - resumeStartedMonotonic)),
+        endpoint_diagnostics: endpointDiagnostics,
+        error_class: sanitizeErrorClass(error?.message || 'resume_failed'),
+        error_code: typeof error?.code === 'string' ? sanitizeErrorClass(error.code) : null,
+        exit_code: resumeExitCode ?? (Number.isSafeInteger(error?.code) ? error.code : null),
+        retry: false,
+      };
+      try { save({ ...loadStrict(), last_resume_attempt: resumeFailure }); } catch {}
+      throw error;
     } finally { if (release) release(); }
   }
   async function enableOrderTask({
@@ -4223,24 +4428,141 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (!interrupted.length) return;
       const completedAt = now().toISOString();
       const exitAnalyses = { ...order.exit_analyses };
+      const ownership = new Map();
+      const inspectToken = (dueKey, analysis) => {
+        const pending = analysis.pending_invocation;
+        const terminalReadyToken = analysis.status === 'READY' && pending == null
+          && analysis.due_key === dueKey && analysis.analysis_token_hash
+          && analysis.analysis_token_proof_hash && analysis.context_hash && analysis.position_identity;
+        if (!terminalReadyToken && (!pending || analysis.due_key !== dueKey
+          || pending.due_key !== dueKey || pending.purpose !== 'held_exit_analysis'
+          || pending.context_hash !== analysis.context_hash
+          || pending.position_identity !== analysis.position_identity
+          || !/^[a-f0-9]{64}$/.test(pending.token_hash || ''))) return { status: 'not_owned' };
+        const expectedHash = pending?.token_hash || analysis.analysis_token_hash;
+        const expectedProof = pending
+          ? crypto.createHash('sha256').update(canonicalJson(pending)).digest('hex')
+          : analysis.analysis_token_proof_hash;
+        if (!/^[a-f0-9]{64}$/.test(expectedHash || '') || !/^[a-f0-9]{64}$/.test(expectedProof || '')) {
+          return { status: 'preserved_unbound' };
+        }
+        const tokenPath = exitAnalysisTokenPath(dueKey);
+        try {
+          const stat = fs.lstatSync(tokenPath);
+          if (stat.isSymbolicLink()) return { status: 'preserved_symlink' };
+          if (!stat.isFile()) return { status: 'preserved_non_file' };
+          const token = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
+          const proofHash = crypto.createHash('sha256').update(canonicalJson(token)).digest('hex');
+          if (proofHash !== expectedProof || token.due_key !== dueKey
+            || token.purpose !== 'held_exit_analysis' || token.context_hash !== analysis.context_hash
+            || token.position_identity !== analysis.position_identity || token.token_hash !== expectedHash
+            || (pending && canonicalJson(token) !== canonicalJson(pending))) return { status: 'preserved_foreign' };
+          return { status: 'pending_cleanup', path: tokenPath, stat, proofHash };
+        } catch (error) {
+          return { status: error.code === 'ENOENT' ? 'already_absent' : 'preserved_unreadable' };
+        }
+      };
+      const inspectVerdict = (dueKey, analysis) => {
+        const inUse = order.pending_invocation?.due_key === dueKey || analysis.entry_dispatch_attempted === true
+          || (exitAnalysisJobs.get(dueKey)?.continuationStarted
+            && !exitAnalysisJobs.get(dueKey)?.continuationCompleted);
+        if (inUse) return { status: 'preserved_in_use' };
+        if (analysis.status !== 'READY') return { status: 'not_applicable' };
+        const verdictPath = analysis.verdict_path;
+        const binding = {
+          due_key: analysis.verdict_due_key, generation: analysis.verdict_generation,
+          context_hash: analysis.verdict_context_hash, path: verdictPath,
+          verdict_hash: analysis.verdict_hash, prompt_hash: analysis.prompt_hash,
+        };
+        const bound = analysis.due_key === dueKey && analysis.verdict_due_key === dueKey
+          && analysis.verdict_generation === analysis.generation
+          && analysis.verdict_context_hash === analysis.context_hash
+          && /^[a-f0-9]{64}$/.test(analysis.context_hash || '')
+          && /^[a-f0-9]{64}$/.test(analysis.verdict_hash || '')
+          && /^[a-f0-9]{64}$/.test(analysis.prompt_hash || '')
+          && analysis.verdict_binding_hash === crypto.createHash('sha256').update(canonicalJson(binding)).digest('hex')
+          && typeof verdictDir === 'string' && verdictDir.length > 0
+          && typeof verdictPath === 'string';
+        if (!bound) return { status: 'preserved_unbound' };
+        const resolvedDir = path.resolve(verdictDir);
+        const resolvedPath = path.resolve(verdictPath);
+        if (path.dirname(resolvedPath) !== resolvedDir
+          || !/^[a-f0-9]{32}\.json$/.test(path.basename(resolvedPath))) return { status: 'preserved_unbound' };
+        try {
+          const stat = fs.lstatSync(resolvedPath);
+          if (stat.isSymbolicLink()) return { status: 'preserved_symlink' };
+          if (!stat.isFile()) return { status: 'preserved_non_file' };
+          const bytes = fs.readFileSync(resolvedPath);
+          if (crypto.createHash('sha256').update(bytes).digest('hex') !== analysis.verdict_hash) {
+            return { status: 'preserved_foreign' };
+          }
+          const verdict = JSON.parse(bytes.toString('utf8'));
+          if (verdict.slot_id !== dueKey || verdict.prompt_hash !== analysis.prompt_hash
+            || verdict.model_id !== LLM_MODEL_ID || !Array.isArray(verdict.decisions)) {
+            return { status: 'preserved_foreign' };
+          }
+          return { status: 'pending_cleanup', path: resolvedPath, stat, hash: analysis.verdict_hash };
+        } catch (error) {
+          return { status: error.code === 'ENOENT' ? 'already_absent' : 'preserved_unreadable' };
+        }
+      };
       for (const [dueKey, analysis] of interrupted) {
+        const token = inspectToken(dueKey, analysis);
+        const verdict = inspectVerdict(dueKey, analysis);
+        ownership.set(dueKey, { token, verdict, analysis });
         exitAnalyses[dueKey] = { ...analysis, status: 'FAILED', pending_invocation: null,
-          completed_at: completedAt, error_class: 'exit_analysis_interrupted' };
+          completed_at: completedAt, error_class: 'exit_analysis_interrupted',
+          token_cleanup_status: token.status,
+          verdict_cleanup_status: verdict.status,
+          ...(token.status.startsWith('preserved_') ? { token_cleanup_error_class: token.status } : {}),
+          ...(verdict.status.startsWith('preserved_') ? { verdict_cleanup_error_class: verdict.status } : {}),
+        };
       }
       save({ ...current, tasks: { ...current.tasks, [ORDER_TASK.id]: { ...order, exit_analyses: exitAnalyses } } });
       for (const [dueKey] of interrupted) {
-        try { fs.unlinkSync(exitAnalysisTokenPath(dueKey)); } catch { /* Best-effort private-token cleanup. */ }
+        const terminal = exitAnalyses[dueKey];
+        const original = ownership.get(dueKey).analysis;
+        for (const kind of ['token', 'verdict']) {
+          const initial = ownership.get(dueKey)[kind];
+          const statusKey = `${kind}_cleanup_status`;
+          const errorKey = `${kind}_cleanup_error_class`;
+          if (initial.status !== 'pending_cleanup') continue;
+          const latest = kind === 'token' ? inspectToken(dueKey, original) : inspectVerdict(dueKey, original);
+          if (latest.status !== 'pending_cleanup' || latest.stat.dev !== initial.stat.dev
+            || latest.stat.ino !== initial.stat.ino || (kind === 'token'
+              ? latest.proofHash !== initial.proofHash : latest.hash !== initial.hash)) {
+            exitAnalyses[dueKey] = { ...exitAnalyses[dueKey], [statusKey]: 'preserved_changed', [errorKey]: 'preserved_changed' };
+            continue;
+          }
+          try {
+            fs.unlinkSync(latest.path);
+            exitAnalyses[dueKey] = { ...exitAnalyses[dueKey], [statusKey]: 'deleted' };
+          } catch (error) {
+            const status = error.code === 'ENOENT' ? 'already_absent' : 'preserved_cleanup_failed';
+            exitAnalyses[dueKey] = { ...exitAnalyses[dueKey], [statusKey]: status,
+              ...(error.code !== 'ENOENT' ? { [errorKey]: safeText(error.code || 'cleanup_failed', 40) } : {}),
+            };
+          }
+        }
       }
+      const latest = loadStrict();
+      const latestOrder = latest.tasks[ORDER_TASK.id];
+      save({ ...latest, tasks: { ...latest.tasks, [ORDER_TASK.id]: { ...latestOrder, exit_analyses: exitAnalyses } } });
     } finally { if (release) release(); }
   }
   function runOnce(args = {}) {
     if (schedulerStopping) return Promise.resolve(stateUnavailableStatus());
     const promise = runOnceInternal(args);
     activeRuns.add(promise);
-    return promise.finally(() => activeRuns.delete(promise));
+    return promise.finally(() => {
+      activeRuns.delete(promise);
+      releaseSchedulerOwnershipIfIdle();
+    });
   }
   async function runOnceInternal({ taskId, invokedBy = 'hermes_scheduler', dueAt = now(), collectionDispatch = false,
     _exitAnalysisContinuation = null } = {}) {
+    const invocationEpoch = shutdownEpoch;
+    const serviceStopping = () => schedulerStopping || shutdownEpoch !== invocationEpoch;
     const continuationJob = _exitAnalysisContinuation ? exitAnalysisContinuations.get(_exitAnalysisContinuation) : null;
     if (_exitAnalysisContinuation && (!continuationJob || continuationJob.continuationUsed)) {
       throw new Error('exit_analysis_continuation_invalid');
@@ -4513,6 +4835,31 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             .every((keyName) => currentTask[keyName] === taskState[keyName])
         );
     };
+    const stopBeforeOrderDispatch = () => {
+      const latest = loadStrict();
+      const currentTask = latest.tasks[taskId];
+      if (currentTask?.last_due_at !== key
+        || JSON.stringify(currentTask.pending_invocation) !== JSON.stringify(pendingInvocation)) return latest;
+      const stopped = save({ ...latest, tasks: { ...latest.tasks, [taskId]: {
+        ...currentTask,
+        pending_invocation: null,
+        last_run: {
+          invoked_by: safeText(invokedBy), started_at: startedAt, completed_at: now().toISOString(),
+          status: 'no_op', action_type: 'service_stopping_no_dispatch', error_class: 'none',
+          fail_closed: false, retry: false, no_same_slot_retry: true,
+        },
+      } } });
+      if (attestationPath) {
+        try {
+          const stat = fs.lstatSync(attestationPath);
+          if (stat.isFile() && !stat.isSymbolicLink()
+            && JSON.stringify(JSON.parse(fs.readFileSync(attestationPath, 'utf8'))) === JSON.stringify(pendingInvocation)) {
+            fs.unlinkSync(attestationPath);
+          }
+        } catch (error) { if (error.code !== 'ENOENT') schedulerFaulted = true; }
+      }
+      return stopped;
+    };
     let schedulerToken = task.kind === 'order' ? crypto.randomBytes(16).toString('hex') : '';
     let pendingInvocation = task.kind === 'order' ? {
       due_key: key,
@@ -4663,6 +5010,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             });
           }
         }
+        if (serviceStopping()) return stopBeforeOrderDispatch();
         if (precheck.exitAnalysisRequired && !continuationJob) {
           try {
             exitAnalysisJob = launchHeldExitAnalysis({ dueKey: key, dueTime: scheduledDueTime,
@@ -4760,6 +5108,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           llmLatencySample = continuationJob.result.verdict.llmLatencySample;
         }
         const precheckLatest = loadStrict();
+      if (serviceStopping()) return stopBeforeOrderDispatch();
       const ownsAnalysisOrderSlot = exitAnalysisJob && precheckLatest.state === 'ACTIVE'
         && precheckLatest.tasks[taskId]?.state === 'ACTIVE'
         && precheckLatest.tasks[taskId]?.last_due_at === key
@@ -4780,6 +5129,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           ...precheckLatest.tasks[taskId], pending_invocation: pendingInvocation,
         } } });
         atomicWrite(attestationPath, pendingInvocation);
+      if (serviceStopping()) return stopBeforeOrderDispatch();
         if (continuationJob) {
           const consumed = loadStrict();
           const order = consumed.tasks[taskId];
@@ -4849,6 +5199,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       const command = buildCommand(taskId, {
         schedulerToken, dueKey: key, verdictPath, promptHash, precheckPath: orderPrecheckPath,
       });
+      if (task.kind === 'order') {
+        const beforeDispatch = loadStrict();
+        if (serviceStopping() || !ownsCurrentOrderInvocation(beforeDispatch, pendingInvocation)) {
+          return serviceStopping() ? stopBeforeOrderDispatch() : beforeDispatch;
+        }
+      }
       if (llmLatencySample) {
         llmLatencySample.order_child_started_at = now().toISOString();
         persistAiLatency(key, llmLatencySample);
@@ -5519,7 +5875,10 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (schedulerStopping) return Promise.resolve(stateUnavailableStatus());
     const promise = tickInternal();
     activeTicks.add(promise);
-    return promise.finally(() => activeTicks.delete(promise));
+    return promise.finally(() => {
+      activeTicks.delete(promise);
+      releaseSchedulerOwnershipIfIdle();
+    });
   }
   async function tickInternal() {
     if (schedulerStopping) return stateUnavailableStatus();
@@ -5684,10 +6043,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   }
   function start() {
     if (!timer && !schedulerFaulted) {
-      schedulerStopping = false;
-      releaseSchedulerOwnership = acquireSchedulerOwnershipLock(schedulerOwnerLockPath);
-      timer = {};
+      if (schedulerStopping && releaseSchedulerOwnership) throw new Error('stop_unconfirmed');
+      let releaseAdmission = acquireAdmissionLock(admissionLockPath);
+      let holdAdmissionOnFailure = false;
       try {
+        releaseSchedulerOwnership = acquireSchedulerOwnershipLock(schedulerOwnerLockPath);
+        schedulerStopping = true;
+        admissionRevocationComplete = false;
+        timer = {};
+        try { save({ ...loadStrict(), scheduler_registered: false, server_registered: false }); }
+        catch (error) { holdAdmissionOnFailure = true; throw error; }
+        admissionRevoked = true;
+        releaseAdmission();
+        releaseAdmission = null;
         terminalizeInterruptedExitAnalyses();
         for (const signalName of ['SIGTERM', 'SIGINT']) {
           const handler = () => {
@@ -5704,14 +6072,38 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           signalHandlers.set(signalName, handler);
           processObject.on(signalName, handler);
         }
-        save(withRegistration(loadStrict()));
+        releaseAdmission = acquireAdmissionLock(admissionLockPath);
+        admissionRevoked = false;
+        try { save(withRegistration(loadStrict())); }
+        catch (error) {
+          admissionRevoked = true;
+          holdAdmissionOnFailure = true;
+          throw error;
+        }
+        try { releaseAdmission(); }
+        catch (error) {
+          admissionRevoked = true;
+          holdAdmissionOnFailure = true;
+          throw error;
+        }
+        releaseAdmission = null;
+        schedulerStopping = false;
+        admissionRevocationComplete = true;
         schedule();
       } catch (error) {
+        if (releaseAdmission && holdAdmissionOnFailure) {
+          retainedUnconfirmedAdmissionRelease = releaseAdmission;
+          releaseAdmission = null;
+        }
+        if (releaseAdmission) { try { releaseAdmission(); } catch {} }
         if (timer) clearTimer(timer); timer = null;
         for (const [name, handler] of signalHandlers) processObject.removeListener(name, handler);
         signalHandlers.clear();
-        if (releaseSchedulerOwnership) releaseSchedulerOwnership();
-        releaseSchedulerOwnership = null;
+        if (!holdAdmissionOnFailure && releaseSchedulerOwnership) {
+          releaseSchedulerOwnership();
+          releaseSchedulerOwnership = null;
+          schedulerStopping = false;
+        }
         throw error;
       }
     }
@@ -5720,29 +6112,55 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function stop() {
     if (shutdownPromise) return shutdownPromise;
     schedulerStopping = true;
+    admissionRevocationComplete = false;
     shutdownEpoch += 1;
     if (timer) clearTimer(timer); timer = null;
     shutdownPromise = (async () => {
+      let releaseAdmission;
       try {
+        releaseAdmission = await acquireAdmissionLockBounded();
+        const current = loadStrict();
+        save({ ...current, scheduler_registered: false, server_registered: false });
+        admissionRevoked = true;
+        releaseAdmission();
+        releaseAdmission = null;
+        admissionRevocationComplete = true;
         for (const job of exitAnalysisJobs.values()) job.controller.abort();
-        await Promise.allSettled([...activeTicks, ...activeRuns]);
-        await Promise.allSettled([...exitAnalysisJobs.values()].map((job) => job.promise));
+        let drainTimer;
+        const drained = await Promise.race([
+          Promise.allSettled([
+            ...activeTicks, ...activeRuns,
+            ...[...exitAnalysisJobs.values()].map((job) => job.promise),
+          ]).then(() => true),
+          new Promise((resolve) => { drainTimer = setTimeout(() => resolve(false), shutdownDrainTimeoutMs); }),
+        ]);
+        clearTimeout(drainTimer);
+        if (!drained) throw new Error('stop_unconfirmed');
         for (const job of exitAnalysisJobs.values()) job.retired = true;
         exitAnalysisJobs.clear();
         exitAnalysisContinuations.clear();
-        const current = loadStrict();
-        try { return save({ ...current, scheduler_registered: false, server_registered: false }); }
-        catch (error) {
-          recordExitAnalysisPersistenceFailure('shutdown', error, 'shutdown_terminal');
-          throw error;
+        if (unsettledAnalysisExecutors.size > 0) {
+          let drainTimer;
+          await Promise.race([
+            Promise.allSettled([...unsettledAnalysisExecutors]),
+            new Promise((resolve) => { drainTimer = setTimeout(resolve, analysisDrainTimeoutMs); }),
+          ]);
+          clearTimeout(drainTimer);
         }
+        return loadStrict();
+      } catch (error) {
+        if (releaseAdmission && !admissionRevocationComplete) {
+          retainedUnconfirmedAdmissionRelease = releaseAdmission;
+          releaseAdmission = null;
+        }
+        recordExitAnalysisPersistenceFailure('shutdown', error, 'shutdown_terminal');
+        if (error.message === 'stop_unconfirmed') throw error;
+        throw new Error('stop_unconfirmed');
       } finally {
+        if (releaseAdmission) { try { releaseAdmission(); } catch {} }
         for (const [signalName, handler] of signalHandlers) processObject.removeListener(signalName, handler);
         signalHandlers.clear();
-        if (releaseSchedulerOwnership) {
-          releaseSchedulerOwnership();
-          releaseSchedulerOwnership = null;
-        }
+        releaseSchedulerOwnershipIfIdle();
       }
     })();
     try { return await shutdownPromise; } finally { shutdownPromise = null; terminationSignal = null; }
@@ -5809,6 +6227,6 @@ module.exports = {
   buildWeeklyUniverseCommand, buildIndependentShadowRefreshCommand,
   parseWeeklyUniverseOutput,
   parseEnableOrderArgs,
-  defaultSourceParityCheck, acquireExclusiveLock, acquireSchedulerOwnershipLock,
+  defaultSourceParityCheck, acquireExclusiveLock, acquireAdmissionLock, acquireSchedulerOwnershipLock,
   createKisAiMarketOpenDryRunTask,
 };

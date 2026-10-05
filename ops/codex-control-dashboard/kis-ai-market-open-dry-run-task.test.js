@@ -37,13 +37,18 @@ function runKisSchedulerVerifier({ statePath, attestationDir, dueKey, token, tas
       : path.resolve(__dirname, '../../../../kis-trading-lab'));
   const python = process.env.KIS_REPORT_TEST_PYTHON || process.env.PYTHON || 'python';
   const script = [
-    'import json, os, sys',
+    'import inspect, json, os, sys',
+    'from pathlib import Path',
     "sys.path.insert(0, os.environ['HERMES_KIS_ROOT'])",
     'from datetime import datetime',
     'from kis_trading_lab import vps_autonomous_runtime as r',
+    "runtime_source = Path(r.__file__).resolve()",
+    "runtime_root = Path(os.environ['HERMES_KIS_ROOT']).resolve()",
+    "assert runtime_source.is_relative_to(runtime_root), 'kis_runtime_import_path_mismatch'",
+    "assert {'purpose', 'context_path', 'context_hash'} <= set(inspect.signature(r.verify_scheduler_attestation).parameters), 'kis_verifier_signature_mismatch'",
     'try:',
     " a = r.verify_scheduler_attestation(scheduler_token=os.environ['HERMES_TOKEN'], due_key=os.environ['HERMES_DUE'], state_path=os.environ['HERMES_STATE'], attestation_dir=os.environ['HERMES_ATTESTATIONS'], require_canonical=False, now=datetime.fromisoformat(os.environ['HERMES_NOW']), purpose=os.environ['HERMES_PURPOSE'], context_path=os.environ['HERMES_CONTEXT_PATH'] or None, context_hash=os.environ['HERMES_CONTEXT_HASH'] or None)",
-    " print(json.dumps({'status':'success','artifact_hash':a.artifact_hash,'provider_id':a.provider_id}))",
+    " print(json.dumps({'status':'success','artifact_hash':a.artifact_hash,'provider_id':a.provider_id,'runtime_source':str(runtime_source)}))",
     'except Exception as e:',
     " s=json.loads(open(os.environ['HERMES_STATE'], encoding='utf-8').read()); t=s['tasks'].get(os.environ['HERMES_TASK_ID'], {}); p=t.get('pending_invocation') or {}; a=__import__('pathlib').Path(os.environ['HERMES_ATTESTATIONS'])/( __import__('hashlib').sha256(os.environ['HERMES_DUE'].encode()).hexdigest()+'.json'); proof=json.loads(a.read_text()) if a.exists() else None; print(json.dumps({'status':'blocked','error_class':str(e),'debug':{'state':s.get('state'),'scheduler_registered':s.get('scheduler_registered'),'server_registered':s.get('server_registered'),'task_state':t.get('state'),'last_due_at':t.get('last_due_at'),'pending_due':p.get('due_key'),'token_match':p.get('token_hash')==__import__('hashlib').sha256(os.environ['HERMES_TOKEN'].encode()).hexdigest(),'expires_at':p.get('expires_at'),'artifact_len':len(str(t.get('activation_artifact_hash') or '')),'daily_entry_cap':t.get('daily_entry_cap'),'approval_hash':t.get('daily_entry_cap_approval_hash'),'provider':{k:t.get(k) for k in ('decision_provider','intraday_feature_version','intraday_policy_version','intraday_feature_hash','intraday_policy_hash')},'pending_provider':{k:p.get(k) for k in ('decision_provider','intraday_feature_version','intraday_policy_version','intraday_feature_hash','intraday_policy_hash')},'proof_equal':proof==p,'runtime_provider':(r.INTRADAY_PROVIDER_ID,r.INTRADAY_FEATURE_VERSION,r.INTRADAY_POLICY_VERSION,r.INTRADAY_FEATURE_HASH,r.INTRADAY_POLICY_HASH)}}))",
   ].join('\n');
@@ -1269,12 +1274,14 @@ function fixture(options = {}) {
       return;
     }
     if (args.includes('order-precheck-v2')) {
-      if (typeof options.onOrderPrecheck === 'function') options.onOrderPrecheck({ command, args, execOptions });
       const precheckError = options.orderPrecheckError
         || (options.orderPrecheckResult === 'BLOCKED' ? Object.assign(new Error('blocked'), { code: 2 }) : null);
-      callback(precheckError, typeof options.orderPrecheckOutput === 'function'
+      const precheckOutput = typeof options.orderPrecheckOutput === 'function'
         ? options.orderPrecheckOutput(execOptions.env.KIS_HERMES_DUE_KEY, execOptions)
-        : options.orderPrecheckOutput || makePrecheck(execOptions.env.KIS_HERMES_DUE_KEY));
+        : options.orderPrecheckOutput || makePrecheck(execOptions.env.KIS_HERMES_DUE_KEY);
+      const deferred = typeof options.onOrderPrecheck === 'function'
+        && options.onOrderPrecheck({ command, args, execOptions, callback, precheckError, precheckOutput }) === true;
+      if (!deferred) callback(precheckError, precheckOutput);
       return;
     }
     if (args.includes('decision-context')) {
@@ -1376,6 +1383,9 @@ function fixture(options = {}) {
     clearTimer: options.clearTimer,
     processObject: options.processObject,
     analysisStateLockTimeoutMs: options.analysisStateLockTimeoutMs,
+    analysisDrainTimeoutMs: options.analysisDrainTimeoutMs,
+    shutdownDrainTimeoutMs: options.shutdownDrainTimeoutMs,
+    admissionLockTimeoutMs: options.admissionLockTimeoutMs,
     llmResponseTimeoutMs: options.llmResponseTimeoutMs,
     onExitAnalysisJob(job) {
       exitAnalysisJobs.set(job.dueKey, job);
@@ -1876,10 +1886,21 @@ test('real KIS scheduler verifier accepts only the separate normal BUY and SELL 
           attestationDir: value.paths.orderAttestationDir, dueKey, token: analysisToken });
         assert.equal(invalidAnalysisToken.status, 'blocked');
         assert.equal(invalidAnalysisToken.error_class, 'scheduler_attestation_invalid');
+        const invalidNormalToken = runKisSchedulerVerifier({ statePath: value.paths.statePath,
+          attestationDir: value.paths.orderAttestationDir, dueKey, token: '0'.repeat(32) });
+        assert.equal(invalidNormalToken.status, 'blocked');
+        assert.equal(invalidNormalToken.error_class, 'scheduler_attestation_invalid');
         verified = runKisSchedulerVerifier({ statePath: value.paths.statePath,
           attestationDir: value.paths.orderAttestationDir, dueKey, token: normalToken });
         assert.equal(verified.status, 'success', JSON.stringify(verified));
+        assert.equal(verified.runtime_source,
+          path.resolve(process.env.KIS_HERMES_RUNTIME_SOURCE, 'kis_trading_lab', 'vps_autonomous_runtime.py'));
         assert.equal(verified.provider_id, mod.INTRADAY_PROVIDER_ATTESTATION.decision_provider);
+        const replayedNormal = runKisSchedulerVerifier({ statePath: value.paths.statePath,
+          attestationDir: value.paths.orderAttestationDir, dueKey, token: normalToken });
+        assert.equal(replayedNormal.status, 'blocked');
+        assert.equal(['scheduler_attestation_invalid', 'hermes_scheduler_attestation_unavailable']
+          .includes(replayedNormal.error_class), true);
 
         const analysisRecord = order.exit_analyses[dueKey];
         const analysisAttestationDir = value.paths.orderAttestationDir;
@@ -1985,7 +2006,8 @@ test('restart terminalizes orphaned RUNNING and READY analyses without replay or
   fs.mkdirSync(value.paths.orderAttestationDir, { recursive: true });
   const analysisTokenPaths = dueKeys.map((dueKey) => path.join(value.paths.orderAttestationDir,
     `${crypto.createHash('sha256').update(dueKey).digest('hex')}.analysis.json`));
-  for (const file of analysisTokenPaths) fs.writeFileSync(file, '{}');
+  fs.writeFileSync(analysisTokenPaths[0], JSON.stringify(order.exit_analyses[dueKeys[0]].pending_invocation));
+  fs.writeFileSync(analysisTokenPaths[1], JSON.stringify({ foreign: true }));
   const { EventEmitter } = require('node:events');
   const restarted = mod.createKisAiMarketOpenDryRunTask({
     ...value.paths, now: () => new Date('2026-07-21T00:16:00Z'),
@@ -1999,11 +2021,292 @@ test('restart terminalizes orphaned RUNNING and READY analyses without replay or
   for (const dueKey of dueKeys) {
     assert.equal(recovered.exit_analyses[dueKey].status, 'FAILED');
     assert.equal(recovered.exit_analyses[dueKey].error_class, 'exit_analysis_interrupted');
-    assert.equal(fs.existsSync(analysisTokenPaths[dueKeys.indexOf(dueKey)]), false);
   }
+  assert.equal(recovered.exit_analyses[dueKeys[0]].token_cleanup_status, 'deleted');
+  assert.equal(fs.existsSync(analysisTokenPaths[0]), false);
+  assert.equal(recovered.exit_analyses[dueKeys[1]].token_cleanup_status, 'preserved_foreign');
+  assert.equal(recovered.exit_analyses[dueKeys[1]].verdict_cleanup_status, 'preserved_unbound');
+  assert.equal(fs.existsSync(analysisTokenPaths[1]), true);
   assert.equal(recovered.pending_invocation, null);
   assert.equal(childCalls, 0);
   await restarted.stop();
+});
+
+test('restart deletes only producer-bound READY verdicts and records foreign symlink and in-use preservation', async () => {
+  const jobs = new Map();
+  const normalProofs = new Map();
+  let orderChildCalls = 0;
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED', awaitManagedAnalysis: false,
+    onOrderPrecheck({ execOptions }) {
+      const dueKey = execOptions.env.KIS_HERMES_DUE_KEY;
+      normalProofs.set(dueKey, JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'))
+        .tasks[mod.TASKS[4].id].pending_invocation);
+    },
+    onExitAnalysisJob(job) { jobs.set(job.dueKey, job); },
+    decisionContextOutput(slotId) {
+      const context = JSON.parse(heldDecisionContext(slotId));
+      context.analysis_only = true;
+      context.position_lifecycle_hash = 'f'.repeat(64);
+      context.intraday_candidate_counts = { analyzed: 0, observation_ready: 0, data_excluded: 0,
+        model_unavailable: 0, risk_excluded: 0, llm_eligible: 0 };
+      return JSON.stringify(context);
+    },
+    execFile(command, args, options, callback) {
+      if (args.includes('run-once')) orderChildCalls += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const cases = ['owned', 'foreign', 'symlink', 'in_use'];
+  const dueKeys = cases.map((_, index) => `${mod.TASKS[4].id}:2026-07-21:09:${15 + index * 10}`);
+  const deferredContinuations = [];
+  const originalSetImmediate = global.setImmediate;
+  global.setImmediate = (callback, ...args) => {
+    deferredContinuations.push({ callback, args });
+    return { unref() {} };
+  };
+  try {
+    for (let index = 0; index < dueKeys.length; index += 1) {
+      const dueAt = new Date(`2026-07-21T00:${15 + index * 10}:00Z`);
+      value.setClock(dueAt);
+      const pending = await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+      assert.equal(pending.tasks[mod.TASKS[4].id].last_run.action_type, 'held_exit_analysis_pending');
+      const job = jobs.get(dueKeys[index]);
+      assert.ok(job, `missing actual analysis producer for ${dueKeys[index]}`);
+      await job.promise;
+      assert.equal(job.terminal.status, 'READY');
+      assert.equal(job.terminal.verdict_hash, crypto.createHash('sha256')
+        .update(fs.readFileSync(job.terminal.verdict_path)).digest('hex'));
+      const tokenPath = path.join(value.paths.orderAttestationDir,
+        `${crypto.createHash('sha256').update(dueKeys[index]).digest('hex')}.analysis.json`);
+      fs.writeFileSync(tokenPath, JSON.stringify(job.pendingToken));
+    }
+  } finally { global.setImmediate = originalSetImmediate; }
+  assert.equal(deferredContinuations.length, cases.length);
+
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  const order = state.tasks[mod.TASKS[4].id];
+  const records = new Map(dueKeys.map((dueKey) => [dueKey, order.exit_analyses[dueKey]]));
+  const ownedPath = records.get(dueKeys[0]).verdict_path;
+  const foreignPath = records.get(dueKeys[1]).verdict_path;
+  const symlinkPath = records.get(dueKeys[2]).verdict_path;
+  const inUsePath = records.get(dueKeys[3]).verdict_path;
+  fs.writeFileSync(foreignPath, JSON.stringify({ foreign: true }));
+  const symlinkTarget = path.join(value.root, 'foreign-verdict.json');
+  fs.writeFileSync(symlinkTarget, JSON.stringify({ foreign: true }));
+  fs.unlinkSync(symlinkPath);
+  let symlinkCreated = true;
+  try { fs.symlinkSync(symlinkTarget, symlinkPath, 'file'); }
+  catch (error) {
+    if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+    symlinkCreated = false;
+    fs.writeFileSync(symlinkPath, JSON.stringify({ foreign: true }));
+  }
+  order.pending_invocation = normalProofs.get(dueKeys[3]);
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  const { EventEmitter } = require('node:events');
+  const restarted = mod.createKisAiMarketOpenDryRunTask({
+    ...value.paths, now: () => new Date('2026-07-21T00:55:00Z'),
+    runtimeHealthCheck: async () => true, sourceParityCheck: () => true,
+    calendarProofResolver: () => calendarProof(true), execFile() { orderChildCalls += 1; },
+    processObject: new EventEmitter(), setTimer: () => ({ unref() {} }), clearTimer() {},
+    schedulerRegistered: true, serverRegistered: true, enforceSchedulerOwnership: false,
+  });
+  restarted.start();
+  const recoveredOrder = restarted.status().tasks[mod.TASKS[4].id];
+  assert.equal(recoveredOrder.exit_analyses[dueKeys[0]].verdict_cleanup_status, 'deleted');
+  assert.equal(fs.existsSync(ownedPath), false);
+  assert.equal(recoveredOrder.exit_analyses[dueKeys[1]].verdict_cleanup_status, 'preserved_foreign');
+  assert.equal(fs.existsSync(foreignPath), true);
+  if (symlinkCreated) {
+    assert.equal(recoveredOrder.exit_analyses[dueKeys[2]].verdict_cleanup_status, 'preserved_symlink');
+    assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true);
+  } else {
+    assert.equal(recoveredOrder.exit_analyses[dueKeys[2]].verdict_cleanup_status, 'preserved_foreign');
+    assert.equal(fs.existsSync(symlinkPath), true);
+  }
+  assert.equal(recoveredOrder.exit_analyses[dueKeys[3]].verdict_cleanup_status, 'preserved_in_use');
+  assert.equal(fs.existsSync(inUsePath), true);
+  for (const dueKey of dueKeys) {
+    assert.equal(recoveredOrder.exit_analyses[dueKey].status, 'FAILED');
+    assert.equal(recoveredOrder.exit_analyses[dueKey].token_cleanup_status, 'deleted');
+    assert.equal(fs.existsSync(path.join(value.paths.orderAttestationDir,
+      `${crypto.createHash('sha256').update(dueKey).digest('hex')}.analysis.json`)), false);
+  }
+  assert.equal(recoveredOrder.pending_invocation.due_key, dueKeys[3]);
+  assert.equal(orderChildCalls, 0);
+  await restarted.stop();
+});
+
+test('service stop during delayed order precheck never dispatches the pending normal order', async () => {
+  let finishPrecheck;
+  let orderChildCalls = 0;
+  const value = await active({
+    schedulerRegistered: true, serverRegistered: true,
+    onOrderPrecheck({ callback, precheckError, precheckOutput }) {
+      finishPrecheck = () => callback(precheckError, precheckOutput);
+      return true;
+    },
+    execFile(command, args, options, callback) {
+      if (args.includes('run-once')) orderChildCalls += 1;
+      callback(null, orderGood());
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+  const running = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  for (let i = 0; i < 50 && !finishPrecheck; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(typeof finishPrecheck, 'function');
+  const stopping = value.task.stop();
+  for (let i = 0; i < 100; i += 1) {
+    const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+    if (state.scheduler_registered === false && state.server_registered === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  const revoked = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(revoked.scheduler_registered, false);
+  assert.equal(revoked.server_registered, false);
+  finishPrecheck();
+  await Promise.all([running, stopping]);
+  assert.equal(orderChildCalls, 0);
+  const stopped = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(stopped.scheduler_registered, false);
+  assert.equal(stopped.server_registered, false);
+  value.task.start();
+  const restarted = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(restarted.scheduler_registered, true);
+  assert.equal(restarted.server_registered, true);
+  await value.task.stop();
+});
+
+test('submitted-side admission wins before stop revocation and its committed evidence is preserved', async () => {
+  const value = await active({ schedulerRegistered: true, serverRegistered: true, admissionLockTimeoutMs: 200 });
+  value.task.start();
+  const releaseAdmission = mod.acquireAdmissionLock(`${value.paths.statePath}.admission.lock`);
+  const commitEvidencePath = path.join(value.root, 'submitted-commit.json');
+  const stopping = value.task.stop();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const beforeRelease = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(beforeRelease.scheduler_registered, true);
+  fs.writeFileSync(commitEvidencePath, JSON.stringify({ submitted: true, order_api_calls: 1 }));
+  releaseAdmission();
+  await stopping;
+  assert.deepEqual(JSON.parse(fs.readFileSync(commitEvidencePath, 'utf8')),
+    { submitted: true, order_api_calls: 1 });
+  const afterRevoke = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(afterRevoke.scheduler_registered, false);
+  assert.equal(afterRevoke.server_registered, false);
+});
+
+test('stop admission-lock contention is unconfirmed, preserves owner, and never deletes foreign lock', async () => {
+  const value = await active({ schedulerRegistered: true, serverRegistered: true, admissionLockTimeoutMs: 30 });
+  value.task.start();
+  const admissionPath = `${value.paths.statePath}.admission.lock`;
+  const foreignPayload = { schema_version: 'kis_order_admission_lock_v1', pid: process.pid,
+    owner_nonce: 'a'.repeat(32), created_at: new Date().toISOString() };
+  fs.writeFileSync(admissionPath, JSON.stringify(foreignPayload), { flag: 'wx', mode: 0o600 });
+  await assert.rejects(value.task.stop(), /stop_unconfirmed/);
+  assert.equal(fs.existsSync(admissionPath), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(admissionPath, 'utf8')), foreignPayload);
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), true);
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(state.scheduler_registered, true);
+  assert.equal(state.server_registered, true);
+});
+
+test('failed stop revocation keeps admission lock and owner against a waiting pre-submit child', async () => {
+  let finishPrecheck;
+  let orderChildCalls = 0;
+  const value = await active({ schedulerRegistered: true, serverRegistered: true,
+    admissionLockTimeoutMs: 100, onOrderPrecheck({ callback, precheckError, precheckOutput }) {
+      finishPrecheck = () => callback(precheckError, precheckOutput);
+      return true;
+    }, execFile(command, args, options, callback) {
+      if (args.includes('run-once')) orderChildCalls += 1;
+      callback(null, orderGood());
+    } });
+  value.task.start();
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+  const running = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  for (let i = 0; i < 50 && !finishPrecheck; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(typeof finishPrecheck, 'function');
+
+  const renameSync = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (destination === value.paths.statePath) throw Object.assign(new Error('injected_state_write_failure'), { code: 'EIO' });
+    return renameSync(source, destination);
+  };
+  try { await assert.rejects(value.task.stop(), /stop_unconfirmed/); }
+  finally { fs.renameSync = renameSync; }
+
+  finishPrecheck();
+  await running;
+  assert.equal(orderChildCalls, 0);
+  assert.equal(fs.existsSync(`${value.paths.statePath}.admission.lock`), true);
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), true);
+  assert.throws(() => mod.acquireAdmissionLock(`${value.paths.statePath}.admission.lock`), /admission_lock_contended/);
+});
+
+test('admission lock release requires the exact inode and owner payload', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-admission-owner-'));
+  const lockPath = path.join(root, 'state.json.admission.lock');
+  const release = mod.acquireAdmissionLock(lockPath);
+  fs.unlinkSync(lockPath);
+  fs.writeFileSync(lockPath, JSON.stringify({ schema_version: 'kis_order_admission_lock_v1',
+    pid: process.pid, owner_nonce: 'b'.repeat(32), created_at: new Date().toISOString() }), { mode: 0o600 });
+  assert.throws(release, /admission_lock_release_unverified/);
+  assert.equal(fs.existsSync(lockPath), true);
+});
+
+test('stop bounds an abort-ignoring analysis drain and retains scheduler ownership until it settles', async () => {
+  let executorStarted = false;
+  let resolveExecutor;
+  let orderChildCalls = 0;
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED',
+    awaitManagedAnalysis: false,
+    shutdownDrainTimeoutMs: 100,
+    llmResponseTimeoutMs: 15,
+    analysisDrainTimeoutMs: 30,
+    onOrderChild() { orderChildCalls += 1; return { stdout: orderGood() }; },
+    llmExecutor() {
+      executorStarted = true;
+      return new Promise((resolve) => { resolveExecutor = resolve; });
+    },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.task.start();
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+  await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  for (let i = 0; i < 100 && !executorStarted; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(executorStarted, true);
+  const stopPromise = value.task.stop();
+  const stoppedBoundedly = await Promise.race([
+    stopPromise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+  ]);
+  try {
+    assert.equal(stoppedBoundedly, true);
+    assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), true);
+    const dueKey = `${mod.TASKS[4].id}:2026-07-21:09:15`;
+    const cancelled = value.task.status().tasks[mod.TASKS[4].id].exit_analyses[dueKey];
+    assert.equal(cancelled.status, 'CANCELLED');
+    assert.equal(cancelled.llm_latency_sample?.executor_exit_status, 'unconfirmed', JSON.stringify(cancelled));
+    assert.equal(orderChildCalls, 0);
+  } finally {
+    resolveExecutor('{}');
+    await stopPromise;
+  }
+  for (let i = 0; i < 50 && fs.existsSync(value.paths.schedulerOwnerLockPath); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), false);
 });
 
 test('STOP waits for the decision-context ChildProcess close after an early abort callback', async () => {
@@ -2026,6 +2329,7 @@ test('STOP waits for the decision-context ChildProcess close after an early abor
   await value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
   let stopped = false;
   const stopPromise = value.task.stop().then(() => { stopped = true; });
+  for (let i = 0; i < 100 && !signal.aborted; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
   assert.equal(signal.aborted, true);
   callback(Object.assign(new Error('aborted'), { name: 'AbortError', code: 'ABORT_ERR' }), '', '');
   await new Promise((resolve) => setImmediate(resolve));
@@ -2033,6 +2337,47 @@ test('STOP waits for the decision-context ChildProcess close after an early abor
   child.emit('close', null, 'SIGTERM');
   await stopPromise;
   assert.equal(stopped, true);
+});
+
+test('STOP timeout stays unconfirmed and retains scheduler owner until child close', async () => {
+  const { EventEmitter } = require('node:events');
+  const child = new EventEmitter();
+  let callback;
+  let signal;
+  let orderChildCalls = 0;
+  const value = await active({
+    orderPrecheckResult: 'LLM_EXIT_REQUIRED',
+    awaitManagedAnalysis: false,
+    shutdownDrainTimeoutMs: 25,
+    onDecisionContextChild({ execOptions, callback: childCallback }) {
+      signal = execOptions.signal;
+      callback = childCallback;
+      return child;
+    },
+    onOrderChild() { orderChildCalls += 1; return { stdout: orderGood() }; },
+  });
+  await value.task.enableOrderTask({ confirm: true, approval: mod.ORDER_ACTIVATION_APPROVAL });
+  value.task.start();
+  const dueAt = new Date('2026-07-21T00:15:00Z');
+  value.setClock(dueAt);
+  const running = value.task.runOnce({ taskId: mod.TASKS[4].id, dueAt });
+  for (let i = 0; i < 100 && !callback; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(typeof callback, 'function');
+  const stopped = value.task.stop();
+  for (let i = 0; i < 100 && !signal.aborted; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(signal.aborted, true);
+  callback(Object.assign(new Error('aborted'), { name: 'AbortError', code: 'ABORT_ERR' }), '', '');
+  await assert.rejects(stopped, /stop_unconfirmed/);
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), true);
+  assert.equal(value.task.status().scheduler_registered, false);
+  assert.equal(orderChildCalls, 0);
+  child.emit('close', null, 'SIGTERM');
+  await running;
+  for (let i = 0; i < 100 && fs.existsSync(value.paths.schedulerOwnerLockPath); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(fs.existsSync(value.paths.schedulerOwnerLockPath), false);
+  assert.equal(orderChildCalls, 0);
 });
 
 test('F/K STOP fences dispatch, aborts analysis, drains an in-flight order, and preserves foreign signal listeners', async () => {
@@ -2128,7 +2473,8 @@ test('shutdown re-emits only after listeners detach and consumes stop persistenc
   }
   assert.equal(failedKills, 0);
   assert.equal(unhandled, 0);
-  assert.equal(fs.existsSync(failing.paths.schedulerOwnerLockPath), false);
+  assert.equal(fs.existsSync(failing.paths.schedulerOwnerLockPath), true);
+  assert.equal(fs.existsSync(`${failing.paths.statePath}.admission.lock`), true);
 });
 
 test('exact activation approval enables four dry-run schedules and keeps order disabled', async () => {
@@ -5820,9 +6166,18 @@ test('one transient supervisor read failure stays active and preserves peer sche
 });
 
 test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', async () => {
-  const value = await active();
+  const value = await active({ safetyOutput: safetyOutput('success', { broker_http_diagnostics: [{
+    endpoint_class: 'open_orders', requested_at_utc: '2026-07-21T00:10:01.000Z',
+    completed_at_utc: '2026-07-21T00:10:01.250Z', latency_ms: 250, http_status: 200,
+    failure_class: null, success: true, diagnostic_code: 'success',
+  }] }) });
   const paused = value.task.status();
   paused.state = 'PAUSED'; paused.pause_reason = 'invalid_failure_evidence';
+  const previousResumeAttemptId = 'b'.repeat(32);
+  paused.last_resume_attempt = { resume_attempt_id: previousResumeAttemptId, status: 'failed' };
+  paused.last_safety_monitor = { status: 'blocked', execution_owner: 'unknown', process_lock: 'unknown',
+    kill_state: 'unknown', open_order_status: 'unknown', reconciliation_status: 'unknown',
+    account_risk_status: 'unknown', error_class: 'stale_prior_safety' };
   for (const item of Object.values(paused.tasks)) {
     item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
   }
@@ -5830,6 +6185,23 @@ test('exact IO resume runs 3-of-3 diagnosis and schedules only future slots', as
   await assert.rejects(value.task.resumeAfterIoFix({ approval: `${mod.RESUME_AFTER_IO_FIX_APPROVAL} ` }), /exact_resume/);
   value.setClock('2026-07-21T00:11:00Z');
   const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+  const attempt = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).last_resume_attempt;
+  assert.match(attempt.resume_attempt_id, /^[a-f0-9]{32}$/);
+  assert.notEqual(attempt.resume_attempt_id, previousResumeAttemptId);
+  assert.equal(attempt.status, 'success');
+  assert.equal(attempt.failure_phase, null);
+  assert.ok(Date.parse(attempt.resume_started_at_utc) <= Date.parse(attempt.resume_completed_at_utc));
+  assert.ok(Number.isFinite(attempt.duration_ms) && attempt.duration_ms >= 0);
+  assert.equal(attempt.exit_code, 0);
+  assert.deepEqual(attempt.fresh_safety, {
+    status: 'success', execution_owner: 'vps', process_lock: 'clear', kill_state: 'clear',
+    open_order_status: 'clear', reconciliation_status: 'clear', account_risk_status: 'clear', error_class: 'none',
+  });
+  assert.deepEqual(attempt.endpoint_diagnostics[0], {
+    endpoint_class: 'open_orders', requested_at_utc: '2026-07-21T00:10:01.000Z',
+    completed_at_utc: '2026-07-21T00:10:01.250Z', endpoint_duration_ms: 250, http_status: 200,
+    failure_class: null, success: true, diagnostic_code: 'success',
+  });
   assert.equal(state.state, 'ACTIVE');
   assert.equal(mod.TASKS.slice(0, 4).every((task) => state.tasks[task.id].state === 'ACTIVE'), true);
   assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
@@ -6662,10 +7034,75 @@ test('IO resume remains paused when health, writer lock, parity, or diagnosis fa
     try { await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }); }
     catch (error) { rejection = error; }
     assert.ok(rejection, `resume should reject on ${failure}`);
-    assert.equal(value.task.status().state, 'PAUSED');
+    const state = value.task.status();
+    assert.equal(state.state, 'PAUSED');
+    const attempt = state.last_resume_attempt;
+    assert.equal(attempt.status, 'failed');
+    assert.equal(attempt.failure_phase, ({ health: 'runtime_health', lock: 'lock_acquisition', parity: 'source_parity', diagnosis: 'quote_transport_diagnosis' })[failure]);
+    assert.equal(attempt.endpoint_class, 'UNKNOWN');
+    assert.equal(typeof attempt.transport_class, 'string');
+    assert.equal(attempt.http_status, null);
+    for (const key of ['requested_at_utc', 'completed_at_utc', 'duration_ms', 'exit_code']) {
+      assert.equal(Object.hasOwn(attempt, key), true, `missing durable resume field ${key}`);
+    }
+    assert.equal(attempt.retry, false);
+    assert.ok(Number.isFinite(attempt.duration_ms) && attempt.duration_ms >= 0);
+    assert.ok(Number.isFinite(Date.parse(attempt.requested_at_utc)));
+    assert.ok(Number.isFinite(Date.parse(attempt.completed_at_utc)));
+    assert.equal(JSON.stringify(attempt).includes('authorization'), false);
   }
   assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
   assert.equal(typeof mod.defaultSourceParityCheck(), 'boolean');
+});
+
+test('failed IO resume durably preserves validated endpoint diagnostics and separates durations', async () => {
+  const requested = '2026-07-21T00:02:02.000Z';
+  const completed = '2026-07-21T00:02:02.321Z';
+  const diagnostics = [
+    { endpoint_class: 'open_orders', requested_at_utc: requested, completed_at_utc: completed,
+      latency_ms: 321, http_status: 500, failure_class: 'http', success: false, diagnostic_code: 'http_500' },
+    { endpoint_class: 'balance', requested_at_utc: '2026-07-21T00:02:03.000Z',
+      completed_at_utc: '2026-07-21T00:02:03.120Z', latency_ms: 120, http_status: 200,
+      failure_class: null, success: true, diagnostic_code: 'success' },
+  ];
+  const value = await active({ safetyOutput: safetyOutput('blocked', {
+    error_class: 'open_order_status_unavailable', open_order_status: 'unknown',
+    broker_http_diagnostics: diagnostics,
+  }) });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  const previousResumeAttemptId = 'a'.repeat(32);
+  paused.last_resume_attempt = { resume_attempt_id: previousResumeAttemptId };
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  await assert.rejects(
+    value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }),
+    /open_order_status_unavailable/,
+  );
+  const attempt = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).last_resume_attempt;
+  assert.match(attempt.resume_attempt_id, /^[a-f0-9]{32}$/);
+  assert.notEqual(attempt.resume_attempt_id, previousResumeAttemptId);
+  const resumeStarted = Date.parse(attempt.resume_started_at_utc);
+  const resumeCompleted = Date.parse(attempt.resume_completed_at_utc);
+  assert.ok(Number.isFinite(resumeStarted) && Number.isFinite(resumeCompleted));
+  assert.ok(resumeCompleted >= resumeStarted);
+  assert.equal(attempt.failure_phase, 'safety_monitor');
+  assert.equal(attempt.endpoint_class, 'open_orders');
+  assert.equal(attempt.http_status, 500);
+  assert.equal(attempt.transport_class, 'http');
+  assert.equal(attempt.requested_at_utc, requested);
+  assert.equal(attempt.completed_at_utc, completed);
+  assert.notEqual(attempt.requested_at_utc, attempt.resume_started_at_utc);
+  assert.notEqual(attempt.completed_at_utc, attempt.resume_completed_at_utc);
+  assert.equal(attempt.endpoint_duration_ms, 321);
+  assert.ok(Number.isFinite(attempt.duration_ms) && attempt.duration_ms >= 0);
+  assert.notEqual(attempt.duration_ms, attempt.endpoint_duration_ms);
+  assert.equal(attempt.exit_code, 0);
+  assert.deepEqual(attempt.endpoint_diagnostics.map((item) => [item.endpoint_class, item.http_status]),
+    [['open_orders', 500], ['balance', 200]]);
+  assert.equal(JSON.stringify(attempt).includes('raw response'), false);
 });
 
 test('state corruption faults and pauses polling without executing child', async () => {
