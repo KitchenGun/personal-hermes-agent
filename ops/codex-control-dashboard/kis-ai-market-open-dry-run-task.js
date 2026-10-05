@@ -2222,9 +2222,10 @@ function processIsAlive(pid) {
 function acquireExclusiveLock(lockPath) {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   let fd;
+  const contents = `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() })}\n`;
   try {
     fd = fs.openSync(lockPath, 'wx', 0o600);
-    fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() })}\n`, 'utf8');
+    fs.writeFileSync(fd, contents, 'utf8');
     fs.fsyncSync(fd);
   } catch (error) {
     if (fd !== undefined) fs.closeSync(fd);
@@ -2237,10 +2238,28 @@ function acquireExclusiveLock(lockPath) {
       && processIsAlive(Number(existing.pid))) throw new Error('scheduler_lock_active');
     throw new Error('scheduler_lock_stale');
   }
+  const inode = fs.fstatSync(fd);
   let released = false;
   return () => {
     if (released) return;
-    released = true; fs.closeSync(fd); fs.unlinkSync(lockPath);
+    let releaseError = null;
+    try {
+      const pathStat = fs.lstatSync(lockPath);
+      const descriptorStat = fs.fstatSync(fd);
+      if (!pathStat.isFile() || pathStat.isSymbolicLink()
+        || descriptorStat.dev !== inode.dev || descriptorStat.ino !== inode.ino
+        || pathStat.dev !== inode.dev || pathStat.ino !== inode.ino
+        || fs.readFileSync(lockPath, 'utf8') !== contents) {
+        throw new Error('scheduler_lock_release_unverified');
+      }
+      fs.unlinkSync(lockPath);
+    } catch (error) { releaseError = error; }
+    released = true;
+    try { fs.closeSync(fd); } catch (error) { if (!releaseError) releaseError = error; }
+    if (releaseError) {
+      throw releaseError.message === 'scheduler_lock_release_unverified'
+        ? releaseError : new Error('scheduler_lock_release_unverified');
+    }
   };
 }
 
@@ -2430,6 +2449,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   const shutdownDrainTimeoutMs = Number.isSafeInteger(options.shutdownDrainTimeoutMs)
     ? Math.max(1, Math.min(options.shutdownDrainTimeoutMs, EXEC_TIMEOUT_MS + 60_000))
     : Math.min(execTimeoutMs + 60_000, EXEC_TIMEOUT_MS + 60_000);
+  const resumeFailurePhases = new Set(['lock_acquisition', 'runtime_health', 'source_parity',
+    'activation_preflight', 'quote_transport_diagnosis', 'safety_monitor', 'state_revalidation']);
   const maxBuffer = Math.min(Number(options.maxBuffer || MAX_BUFFER_BYTES), MAX_BUFFER_BYTES);
   let timer = null;
   let ticking = false;
@@ -2892,6 +2913,40 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       atomicWrite(exitAnalysisFailurePath, [...records.slice(-29), entry]);
       return true;
     } catch { return false; }
+  }
+  function persistResumeFailureEvidence(attempt) {
+    const evidencePath = `${statePath}.resume-attempt-${attempt.resume_attempt_id}.json`;
+    const parent = path.dirname(path.resolve(statePath));
+    let fd;
+    try {
+      for (let current = parent; ; current = path.dirname(current)) {
+        const stat = fs.lstatSync(current);
+        if (stat.isSymbolicLink()) return false;
+        if (current === path.dirname(current)) break;
+      }
+      const parentStat = fs.lstatSync(parent);
+      const realParent = path.resolve(fs.realpathSync(parent));
+      const sameParent = process.platform === 'win32'
+        ? realParent.toLowerCase() === parent.toLowerCase() : realParent === parent;
+      if (!parentStat.isDirectory() || !sameParent
+        || (process.platform !== 'win32' && ((parentStat.mode & 0o077) !== 0
+          || (typeof process.getuid === 'function' && parentStat.uid !== process.getuid())))) return false;
+      const contents = `${JSON.stringify(attempt)}\n`;
+      fd = fs.openSync(evidencePath, 'wx', 0o600);
+      fs.writeFileSync(fd, contents, 'utf8');
+      fs.fsyncSync(fd);
+      const owned = fs.fstatSync(fd);
+      fs.closeSync(fd); fd = undefined;
+      const stat = fs.lstatSync(evidencePath);
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.dev !== owned.dev || stat.ino !== owned.ino
+        || fs.readFileSync(evidencePath, 'utf8') !== contents
+        || (process.platform !== 'win32' && ((stat.mode & 0o077) !== 0
+          || (typeof process.getuid === 'function' && stat.uid !== process.getuid())))) return false;
+      const directoryFd = fs.openSync(parent, 'r');
+      try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+      return true;
+    } catch { return false; }
+    finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
   }
   function mergeCollectionLedger(taskState, entry) {
     const ledger = (taskState.collection_slot_ledger || [])
@@ -3934,6 +3989,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
   async function resumeAfterIoFix({ approval, invokedBy = 'hermes_cli' } = {}) {
     if (approval !== RESUME_AFTER_IO_FIX_APPROVAL) throw new Error('exact_resume_approval_required');
     let release;
+    let resumeRunLockIdentity;
     const resumeStartedAt = now();
     const resumeStartedMonotonic = performance.now();
     const resumeAttemptId = crypto.randomBytes(16).toString('hex');
@@ -3952,8 +4008,24 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       success: item.success,
       ...(item.timeout_stage ? { timeout_stage: item.timeout_stage } : {}),
     }));
+    const ownsResumeRunLock = () => {
+      if (!release || !resumeRunLockIdentity) return false;
+      try {
+        const stat = fs.lstatSync(runLockPath);
+        return stat.isFile() && !stat.isSymbolicLink()
+          && stat.dev === resumeRunLockIdentity.dev && stat.ino === resumeRunLockIdentity.ino
+          && fs.readFileSync(runLockPath, 'utf8') === resumeRunLockIdentity.contents;
+      } catch { return false; }
+    };
     try {
       release = acquireExclusiveLock(runLockPath);
+      const runLockStat = fs.lstatSync(runLockPath);
+      const runLockContents = fs.readFileSync(runLockPath, 'utf8');
+      const runLockPayload = JSON.parse(runLockContents);
+      if (runLockStat.isSymbolicLink() || !runLockStat.isFile() || runLockPayload.pid !== process.pid) {
+        throw new Error('scheduler_lock_ownership_unverified');
+      }
+      resumeRunLockIdentity = { dev: runLockStat.dev, ino: runLockStat.ino, contents: runLockContents };
       const current = loadStrict();
       const manualHold = current.state === 'PAUSED'
         && current.pause_reason === 'operator_prod_transition_preparation'
@@ -4185,7 +4257,19 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         exit_code: resumeExitCode ?? (Number.isSafeInteger(error?.code) ? error.code : null),
         retry: false,
       };
-      try { save({ ...loadStrict(), last_resume_attempt: resumeFailure }); } catch {}
+      let canonicalSaved = false;
+      let releaseAdmission;
+      try {
+        if (ownsResumeRunLock()) {
+          releaseAdmission = acquireAdmissionLock(admissionLockPath);
+          if (ownsResumeRunLock()) {
+            const latest = loadStrict();
+            save({ ...latest, last_resume_attempt: resumeFailure });
+            canonicalSaved = true;
+          }
+        }
+      } catch {} finally { if (releaseAdmission) { try { releaseAdmission(); } catch {} } }
+      if (!canonicalSaved) persistResumeFailureEvidence(resumeFailure);
       throw error;
     } finally { if (release) release(); }
   }

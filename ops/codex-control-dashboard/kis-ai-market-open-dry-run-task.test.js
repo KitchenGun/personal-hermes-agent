@@ -1914,11 +1914,14 @@ test('real KIS scheduler verifier accepts only the separate normal BUY and SELL 
           mutate(record);
           const statePath = path.join(scratch, 'state.json');
           const attestationDir = path.join(scratch, 'attestations');
-          fs.mkdirSync(attestationDir, { recursive: true });
-          fs.writeFileSync(statePath, JSON.stringify(stateCopy));
+          fs.mkdirSync(attestationDir, { recursive: true, mode: 0o700 });
+          if (process.platform !== 'win32') fs.chmodSync(attestationDir, 0o700);
+          fs.writeFileSync(statePath, JSON.stringify(stateCopy), { mode: 0o600 });
+          if (process.platform !== 'win32') fs.chmodSync(statePath, 0o600);
           const proofPath = path.join(attestationDir,
             `${crypto.createHash('sha256').update(dueKey).digest('hex')}.analysis.json`);
-          fs.writeFileSync(proofPath, JSON.stringify(record.pending_invocation));
+          fs.writeFileSync(proofPath, JSON.stringify(record.pending_invocation), { mode: 0o600 });
+          if (process.platform !== 'win32') fs.chmodSync(proofPath, 0o600);
           try {
             return runKisSchedulerVerifier({ statePath, attestationDir, dueKey, token: analysisToken,
               purpose: 'held_exit_analysis', contextPath: analysisRecord.context_path,
@@ -1944,10 +1947,13 @@ test('real KIS scheduler verifier accepts only the separate normal BUY and SELL 
           mutate(stateCopy.tasks[mod.TASKS[4].id], pendingCopy);
           const statePath = path.join(scratch, 'state.json');
           const attestationDir = path.join(scratch, 'attestations');
-          fs.mkdirSync(attestationDir, { recursive: true });
-          fs.writeFileSync(statePath, JSON.stringify(stateCopy));
+          fs.mkdirSync(attestationDir, { recursive: true, mode: 0o700 });
+          if (process.platform !== 'win32') fs.chmodSync(attestationDir, 0o700);
+          fs.writeFileSync(statePath, JSON.stringify(stateCopy), { mode: 0o600 });
+          if (process.platform !== 'win32') fs.chmodSync(statePath, 0o600);
           const proofPath = path.join(attestationDir, `${crypto.createHash('sha256').update(dueKey).digest('hex')}.json`);
-          fs.writeFileSync(proofPath, JSON.stringify(pendingCopy));
+          fs.writeFileSync(proofPath, JSON.stringify(pendingCopy), { mode: 0o600 });
+          if (process.platform !== 'win32') fs.chmodSync(proofPath, 0o600);
           try { return runKisSchedulerVerifier({ statePath, attestationDir, dueKey, token: normalToken }); }
           finally { fs.rmSync(scratch, { recursive: true, force: true }); }
         };
@@ -2261,6 +2267,19 @@ test('admission lock release requires the exact inode and owner payload', () => 
     pid: process.pid, owner_nonce: 'b'.repeat(32), created_at: new Date().toISOString() }), { mode: 0o600 });
   assert.throws(release, /admission_lock_release_unverified/);
   assert.equal(fs.existsSync(lockPath), true);
+});
+
+test('exclusive run-lock release preserves a replaced foreign inode', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kis-run-lock-owner-'));
+  const lockPath = path.join(root, 'run.lock');
+  const displacedPath = path.join(root, 'original.lock');
+  const release = mod.acquireExclusiveLock(lockPath);
+  const foreign = `${JSON.stringify({ pid: process.pid + 1, created_at: new Date().toISOString() })}\n`;
+  fs.renameSync(lockPath, displacedPath);
+  fs.writeFileSync(lockPath, foreign, { flag: 'wx', mode: 0o600 });
+  assert.throws(release, /scheduler_lock_release_unverified/);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), foreign);
+  assert.equal(fs.existsSync(displacedPath), true);
 });
 
 test('stop bounds an abort-ignoring analysis drain and retains scheduler ownership until it settles', async () => {
@@ -7053,6 +7072,137 @@ test('IO resume remains paused when health, writer lock, parity, or diagnosis fa
   }
   assert.equal(mod.APPROVED_SOURCE_TASK_PATH, '/home/ubuntu/work/personal-hermes-agent/ops/codex-control-dashboard/kis-ai-market-open-dry-run-task.js');
   assert.equal(typeof mod.defaultSourceParityCheck(), 'boolean');
+});
+
+test('resume catch records diagnostics without restoring registration after STOP revocation', async () => {
+  let duringResume = false;
+  let orderChildCalls = 0;
+  let value;
+  value = await active({
+    runtimeHealthCheck: async () => {
+      if (!duringResume) return true;
+      await value.task.stop();
+      return false;
+    },
+    execFile(command, args, options, callback) {
+      if (args.includes('run-once')) orderChildCalls += 1;
+      callback(null, orderGood());
+    },
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  paused.scheduler_registered = true; paused.server_registered = true;
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  duringResume = true;
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /runtime_health_unavailable/);
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(state.scheduler_registered, false);
+  assert.equal(state.server_registered, false);
+  assert.equal(state.last_resume_attempt.failure_phase, 'runtime_health');
+  assert.equal(orderChildCalls, 0);
+});
+
+test('resume run-lock contention leaves canonical state unchanged and writes one private attempt file', async () => {
+  let resumeExecCalls = 0;
+  const value = await active({ onExec() { resumeExecCalls += 1; } });
+  resumeExecCalls = 0;
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  paused.scheduler_registered = false; paused.server_registered = false;
+  paused.last_resume_attempt = { resume_attempt_id: 'c'.repeat(32), status: 'older' };
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const release = mod.acquireExclusiveLock(value.paths.runLockPath);
+  try {
+    await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /scheduler_lock_active/);
+  } finally { release(); }
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.deepEqual(state.last_resume_attempt, { resume_attempt_id: 'c'.repeat(32), status: 'older' });
+  assert.equal(state.scheduler_registered, false);
+  assert.equal(state.server_registered, false);
+  assert.equal(resumeExecCalls, 0);
+  const files = fs.readdirSync(value.root).filter((name) => /^state\.json\.resume-attempt-[a-f0-9]{32}\.json$/.test(name));
+  assert.equal(files.length, 1);
+  const evidencePath = path.join(value.root, files[0]);
+  const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+  assert.equal(path.basename(evidencePath), `state.json.resume-attempt-${evidence.resume_attempt_id}.json`);
+  assert.equal(evidence.status, 'failed');
+  assert.equal(evidence.failure_phase, 'lock_acquisition');
+  assert.equal(evidence.error_class, 'scheduler_lock_active');
+  assert.ok(Number.isFinite(Date.parse(evidence.resume_started_at_utc)));
+  assert.ok(Number.isFinite(Date.parse(evidence.resume_completed_at_utc)));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(evidencePath).mode & 0o777, 0o600);
+});
+
+test('resume admission-lock contention preserves persisted revocation and prior canonical attempt', async () => {
+  let failResume = false;
+  let resumeExecCalls = 0;
+  const value = await active({
+    runtimeHealthCheck: async () => !failResume,
+    onExec() { resumeExecCalls += 1; },
+  });
+  resumeExecCalls = 0;
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  paused.scheduler_registered = false; paused.server_registered = false;
+  paused.last_resume_attempt = { resume_attempt_id: 'd'.repeat(32), status: 'older' };
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  const releaseOtherWriter = mod.acquireAdmissionLock(`${value.paths.statePath}.admission.lock`);
+  failResume = true;
+  try {
+    await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /runtime_health_unavailable/);
+  } finally { releaseOtherWriter(); }
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.equal(state.scheduler_registered, false);
+  assert.equal(state.server_registered, false);
+  assert.deepEqual(state.last_resume_attempt, { resume_attempt_id: 'd'.repeat(32), status: 'older' });
+  assert.equal(resumeExecCalls, 0);
+  const evidence = fs.readdirSync(value.root).filter((name) => /^state\.json\.resume-attempt-[a-f0-9]{32}\.json$/.test(name));
+  assert.equal(evidence.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(value.root, evidence[0]), 'utf8')).failure_phase, 'runtime_health');
+});
+
+test('resume release preserves a foreign run-lock path replaced during health check', async () => {
+  let failResume = false;
+  let value;
+  let foreignLockContents;
+  value = await active({
+    runtimeHealthCheck: async () => {
+      if (!failResume) return true;
+      const lockPath = value.paths.runLockPath;
+      const displacedPath = `${lockPath}.original`;
+      fs.renameSync(lockPath, displacedPath);
+      foreignLockContents = `${JSON.stringify({ pid: process.pid + 1, created_at: new Date().toISOString() })}\n`;
+      fs.writeFileSync(lockPath, foreignLockContents, { flag: 'wx', mode: 0o600 });
+      return false;
+    },
+  });
+  const paused = value.task.status();
+  paused.state = 'PAUSED'; paused.pause_reason = 'runtime_io_failed';
+  paused.scheduler_registered = false; paused.server_registered = false;
+  paused.last_resume_attempt = { resume_attempt_id: 'e'.repeat(32), status: 'older' };
+  for (const item of Object.values(paused.tasks)) {
+    item.state = 'PAUSED'; item.pause_reason = 'peer_task_fail_closed'; item.next_run_at = null;
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  failResume = true;
+  await assert.rejects(value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL }), /scheduler_lock_release_unverified/);
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  assert.deepEqual(state.last_resume_attempt, { resume_attempt_id: 'e'.repeat(32), status: 'older' });
+  assert.equal(state.scheduler_registered, false);
+  assert.equal(state.server_registered, false);
+  assert.equal(fs.readFileSync(value.paths.runLockPath, 'utf8'), foreignLockContents);
+  const evidence = fs.readdirSync(value.root).find((name) => /^state\.json\.resume-attempt-[a-f0-9]{32}\.json$/.test(name));
+  assert.ok(evidence);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(value.root, evidence), 'utf8')).failure_phase, 'runtime_health');
 });
 
 test('failed IO resume durably preserves validated endpoint diagnostics and separates durations', async () => {
