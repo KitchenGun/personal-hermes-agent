@@ -1,5 +1,9 @@
 # KIS Prediction V2 Bounded Validation
 
+> Archived 2026-10-11: the Hermes v1/v2 prediction validation task modules,
+> their `/api/kis/prediction-*` routes and the server wiring were removed from
+> this repository. The legacy state files and DB tables are kept as data.
+
 > Historical rollout record. Model v2 is now `PAUSED` and its scheduler loop is
 > deliberately dormant. The Hermes Adaptive KIS manager
 > `kis-ai-market-open-dry-run-v1` is the only scheduler owner; the v2 status and

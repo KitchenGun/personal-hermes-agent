@@ -1,5 +1,9 @@
 # KIS Prediction Validation Discord Progress
 
+> Archived 2026-10-11: the Hermes v1/v2 prediction validation task modules,
+> their `/api/kis/prediction-*` routes and the server wiring were removed from
+> this repository. The legacy state files and DB tables are kept as data.
+
 ## Purpose
 
 Hermes owns the bounded scheduler for `kis-prediction-validation-cycle` and sends minimal Discord progress only after sanitized KIS CLI results are available.

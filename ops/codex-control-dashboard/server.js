@@ -4,8 +4,6 @@ const { execFile, execFileSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
-const kisPredictionValidationTask = require('./kis-prediction-validation-task');
-const kisPredictionV2ValidationTask = require('./kis-prediction-v2-validation-task');
 const kisAiMarketOpenDryRunTask = require('./kis-ai-market-open-dry-run-task');
 const kisLlmVerdictExecutor = require('./kis-llm-verdict-executor');
 const kisEmergencyStopExecutor = require('./kis-emergency-stop-executor');
@@ -70,14 +68,6 @@ const DISCORD_INTERACTION_REPLAY_STATE_PATH = '/home/ubuntu/.hermes/state/discor
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
-const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask({
-  progressSender: sendKisPredictionProgressViaDiscordRelay,
-});
-const kisPredictionV2TaskRuntime = kisPredictionV2ValidationTask.createKisPredictionV2ValidationTask({
-  schedulerRegistered: false,
-  serverRegistered: false,
-});
-kisPredictionV2TaskRuntime.enforceDormantOwnership();
 const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarketOpenDryRunTask({
   schedulerRegistered: true,
   serverRegistered: true,
@@ -2520,21 +2510,6 @@ async function queueKisSelfHealTask(incident = {}) {
   return { queued: true, task_id: String(createdTaskId) };
 }
 
-async function sendKisPredictionProgressViaDiscordRelay(message) {
-  const targetChannelId = String(message?.targetChannelId || '').trim();
-  if (targetChannelId !== kisPredictionValidationTask.PROGRESS_TARGET_CHANNEL_ID) {
-    return { discord_sent: false, error_class: 'invalid_target_channel' };
-  }
-  if (!discordRelay || typeof discordRelay.sendDiscordRelayMessage !== 'function') {
-    return { discord_sent: false, error_class: 'sender_missing' };
-  }
-  return discordRelay.sendDiscordRelayMessage({
-    targetChannelId,
-    content: message.content,
-    deliveryLayer: message.deliveryLayer,
-  });
-}
-
 async function apiKisReport(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method !== 'POST') {
@@ -2563,88 +2538,6 @@ async function apiKisReport(req, res) {
     message_preview: undefined,
     payload_text: undefined,
   });
-}
-
-
-async function apiKisPredictionValidation(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-validation/status') {
-    okJson(res, { ok: true, ...kisPredictionTaskRuntime.status() });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-validation/run-once') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    if (String(kisPredictionV2TaskRuntime.status().state || '').toUpperCase() === 'ACTIVE') {
-      errJson(res, 409, 'Model v2 prediction scheduler is active');
-      return;
-    }
-    const result = await kisPredictionTaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
-    okJson(res, {
-      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
-      ...result,
-    });
-    return;
-  }
-  errJson(res, 404, 'not found');
-}
-
-async function apiKisPredictionV2Validation(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-v2-validation/status') {
-    okJson(res, { ok: true, ...kisPredictionV2TaskRuntime.status() });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/activate') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    const result = kisPredictionV2TaskRuntime.activate({ invokedBy: 'hermes_api' });
-    okJson(res, { ok: result.state === 'ACTIVE', ...result });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/run-once') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    const legacyState = String(kisPredictionTaskRuntime.status().state || '').toUpperCase();
-    if (legacyState !== 'PAUSED') {
-      errJson(res, 409, 'legacy prediction scheduler must remain paused');
-      return;
-    }
-    const result = await kisPredictionV2TaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
-    okJson(res, {
-      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
-      ...result,
-    });
-    return;
-  }
-  errJson(res, 404, 'not found');
 }
 
 async function apiKisAiMarketOpenDryRun(req, res) {
@@ -2737,14 +2630,6 @@ const server = http.createServer(async (req, res) => {
       await apiTasks(req, res);
       return;
     }
-    if (req.url.startsWith('/api/kis/prediction-validation')) {
-      await apiKisPredictionValidation(req, res);
-      return;
-    }
-    if (req.url.startsWith('/api/kis/prediction-v2-validation')) {
-      await apiKisPredictionV2Validation(req, res);
-      return;
-    }
     if (req.url.startsWith('/api/kis/ai-market-open-dry-run')) {
       await apiKisAiMarketOpenDryRun(req, res);
       return;
@@ -2810,8 +2695,6 @@ module.exports = {
     assertKisSelfHealSourceClean,
     prepareKisSelfHealBranch,
     kisReportDelivery,
-    kisPredictionValidationTask,
-    kisPredictionTaskRuntime,
     kisAiMarketOpenDryRunTask,
     kisAiMarketOpenDryRunRuntime,
     kisLlmVerdictExecutor,
