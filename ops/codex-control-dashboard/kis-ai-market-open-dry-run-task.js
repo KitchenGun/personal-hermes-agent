@@ -6251,6 +6251,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     const safety = current.last_safety_monitor;
     const safetyClear = sameMinute(safety?.checked_at, checkedAt)
       && (safety.status === 'success'
+        || isReadonlyOnlySafety(safety)
         || (safety.status === 'skipped_non_trading_day' && current.tasks[ORDER_TASK.id]?.state === 'DISABLED'));
     if (current.state !== 'ACTIVE' || postClose?.state !== 'PAUSED'
       || !POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(reason)
