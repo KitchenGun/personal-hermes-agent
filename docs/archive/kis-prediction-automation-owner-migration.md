@@ -1,5 +1,9 @@
 # KIS Prediction Automation Owner Migration
 
+> Archived 2026-10-11: the Hermes v1/v2 prediction validation task modules,
+> their `/api/kis/prediction-*` routes and the server wiring were removed from
+> this repository. The legacy state files and DB tables are kept as data.
+
 > Historical migration record. This v1 task is now `PAUSED` and is not a current
 > scheduler. The canonical runtime owner is the Hermes Adaptive KIS manager
 > `kis-ai-market-open-dry-run-v1`; current state must be read from its status

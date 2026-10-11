@@ -1,11 +1,9 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
-const kisPredictionValidationTask = require('./kis-prediction-validation-task');
-const kisPredictionV2ValidationTask = require('./kis-prediction-v2-validation-task');
 const kisAiMarketOpenDryRunTask = require('./kis-ai-market-open-dry-run-task');
 const kisLlmVerdictExecutor = require('./kis-llm-verdict-executor');
 const kisEmergencyStopExecutor = require('./kis-emergency-stop-executor');
@@ -70,19 +68,10 @@ const DISCORD_INTERACTION_REPLAY_STATE_PATH = '/home/ubuntu/.hermes/state/discor
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const SENSITIVE_TEXT_RE = /\/home\/|\/mnt\/|\.env|client_secret|refresh_token|authorization|OPENAI_|DISCORD_|GOOGLE_|GITHUB_|COOKIE|BEARER|TOKEN|SECRET|KEY|stdout|stderr|body|workspace|path/ig;
 let kanbanListSupportsSort = true;
-const kisPredictionTaskRuntime = kisPredictionValidationTask.createKisPredictionValidationTask({
-  progressSender: sendKisPredictionProgressViaDiscordRelay,
-});
-const kisPredictionV2TaskRuntime = kisPredictionV2ValidationTask.createKisPredictionV2ValidationTask({
-  schedulerRegistered: false,
-  serverRegistered: false,
-});
-kisPredictionV2TaskRuntime.enforceDormantOwnership();
 const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarketOpenDryRunTask({
   schedulerRegistered: true,
   serverRegistered: true,
   reportSender: sendKisReportViaDiscordRelay,
-  repairTaskSender: queueKisSelfHealTask,
   llmExecutor: kisLlmVerdictExecutor.createHermesLlmVerdictExecutor({
     hermesBin: process.env.HERMES_KIS_LLM_BIN || '/home/ubuntu/.local/bin/hermes',
     execMode: HERMES_EXEC_MODE === 'direct' || process.platform !== 'win32' ? 'direct' : 'wsl',
@@ -2405,136 +2394,6 @@ async function sendKisReportViaDiscordRelay(message) {
   });
 }
 
-function buildKisSelfHealTaskCreateArgs(incident = {}) {
-  const notificationKey = String(incident.notificationKey || '');
-  const taskId = String(incident.taskId || '');
-  const errorClass = String(incident.errorClass || '');
-  const repairOwner = String(incident.repairOwner || '');
-  const failurePhase = String(incident.failurePhase || 'none');
-  const failureExceptionType = String(incident.failureExceptionType || 'none');
-  const failureExitCode = incident.failureExitCode ?? null;
-  const failureSignal = String(incident.failureSignal || 'none');
-  const failureFingerprint = String(incident.failureFingerprint || '');
-  if (!/^[a-f0-9]{64}$/.test(notificationKey)
-    || !/^kis-[a-z0-9-]{1,80}$/.test(taskId)
-    || !/^[a-z0-9_]{1,80}$/.test(errorClass)
-    || !/^(?:kis|hermes)$/.test(repairOwner)
-    || !/^[a-z0-9_]{1,40}$/.test(failurePhase)
-    || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(failureExceptionType)
-    || !(failureExitCode === null || (Number.isSafeInteger(failureExitCode) && failureExitCode >= 1 && failureExitCode <= 255))
-    || !/^(?:none|SIG[A-Z0-9]{1,16})$/.test(failureSignal)
-    || !/^(?:[a-f0-9]{64})?$/.test(failureFingerprint)) {
-    throw new Error('invalid_kis_self_heal_incident');
-  }
-  const workspaceRoot = repairOwner === 'kis'
-    ? kisAiMarketOpenDryRunTask.KIS_REPO
-    : '/home/ubuntu/work/personal-hermes-agent';
-  const branch = `codex/kis-self-heal-${notificationKey.slice(0, 12)}`;
-  const body = [
-    'Source: kis-runtime-self-heal',
-    `Incident: ${notificationKey}`,
-    `KIS task: ${taskId}`,
-    `Sanitized error: ${errorClass}`,
-    `Repair owner: ${repairOwner === 'kis' ? 'kis-trading-lab' : 'personal-hermes-agent'}`,
-    `Failure phase: ${failurePhase}`,
-    `Failure exception: ${failureExceptionType}`,
-    `Failure exit code: ${failureExitCode ?? 'none'}`,
-    `Failure signal: ${failureSignal}`,
-    `Failure fingerprint: ${failureFingerprint || 'none'}`,
-    '',
-    'Fix the root cause autonomously in isolated git worktrees.',
-    'Use the installed Ponytail skill in full mode: touch the fewest files and add no dependency or speculative abstraction.',
-    'Inspect current sanitized state and logs, reproduce, make the smallest code fix, run focused and full tests, commit and push a branch, and open a PR for operator review.',
-    ...(repairOwner === 'kis' ? [
-      'Before editing, verify that the deployed KIS source is reproducible from the pinned upstream commit.',
-      'If relevant runtime source differs from upstream, stop as runtime_source_uncommitted instead of copying dirty state or producing a stale PR.',
-    ] : []),
-    'Do not edit dirty canonical checkouts directly. Preserve unrelated files. Do not merge, deploy, restart services, or resume the KIS task.',
-    '',
-    'Hard stops:',
-    '- Never call broker order/account/balance/condition-search/WebSocket endpoints.',
-    '- Never access prod DB, secrets, tokens, raw responses, or private account values.',
-    '- Never weaken safety/risk/model/scheduler policy, enable a scheduler, retry an order, or force a market slot.',
-    '- Never merge or deploy the repair without separate operator approval.',
-    '- If a safe root-cause fix and PR cannot be proven, leave this task blocked for operator review.',
-    '',
-    'Required final notification:',
-    `Send exactly one sanitized result to discord:${KIS_DISCORD_CHANNEL_ID} with /home/ubuntu/.local/bin/hermes send -q.`,
-    'Use only: incident id prefix, fixed or blocked status, tests pass or fail, PR ready yes or no, and operator action required yes or no.',
-    'Do not include paths, source snippets, logs, symbols, prices, positions, secrets, or raw responses.',
-  ].join('\n');
-  return [
-    'kanban', '--board', 'codex-control', 'create', `KIS self-heal: ${errorClass}`,
-    '--body', body,
-    '--assignee', runtimeAssignee('coder'),
-    '--priority', '95',
-    '--workspace', `worktree:${workspaceRoot}`,
-    '--branch', branch,
-    '--max-runtime', '45m',
-    '--max-retries', '1',
-    '--created-by', 'Hermes KIS self-healing',
-    '--idempotency-key', `kis-self-heal:${notificationKey}`,
-    '--json',
-  ];
-}
-
-function selfHealRepoSpec(repairOwner) {
-  return repairOwner === 'kis'
-    ? { root: kisAiMarketOpenDryRunTask.KIS_REPO, upstream: 'origin/master', paths: ['kis_trading_lab', 'config'] }
-    : { root: '/home/ubuntu/work/personal-hermes-agent', upstream: 'origin/main', paths: ['ops/codex-control-dashboard'] };
-}
-
-function runSelfHealGit(root, args) {
-  return execFileSync('git', ['-C', root, ...args], {
-    encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-  });
-}
-
-function assertKisSelfHealSourceClean(repairOwner, gitRunner = runSelfHealGit) {
-  const { root, upstream, paths } = selfHealRepoSpec(repairOwner);
-  const tracked = gitRunner(root, ['diff', '--name-only', upstream, '--', ...paths]);
-  const untracked = gitRunner(root, ['ls-files', '--others', '--exclude-standard', '--', ...paths]);
-  if (`${tracked || ''}${untracked || ''}`.trim()) throw new Error('runtime_source_uncommitted');
-}
-
-function prepareKisSelfHealBranch(repairOwner, branch, gitRunner = runSelfHealGit) {
-  const { root, upstream } = selfHealRepoSpec(repairOwner);
-  const upstreamSha = String(gitRunner(root, ['rev-parse', upstream])).trim();
-  let branchSha = '';
-  try { branchSha = String(gitRunner(root, ['rev-parse', `refs/heads/${branch}`])).trim(); }
-  catch { branchSha = ''; }
-  if (!branchSha) gitRunner(root, ['branch', branch, upstream]);
-  else if (branchSha !== upstreamSha) throw new Error('self_heal_branch_base_mismatch');
-}
-
-async function queueKisSelfHealTask(incident = {}) {
-  const args = buildKisSelfHealTaskCreateArgs(incident);
-  assertKisSelfHealSourceClean(incident.repairOwner);
-  prepareKisSelfHealBranch(incident.repairOwner, args[args.indexOf('--branch') + 1]);
-  const output = await runHermesLong(args, 60000);
-  const created = JSON.parse(output);
-  const createdTaskId = created.id || created.task_id || created.task?.id;
-  if (!createdTaskId) throw new Error('kis_self_heal_task_create_failed');
-  resetSupervisorBackoff();
-  supervisorTick('kis-self-heal').catch(() => {});
-  return { queued: true, task_id: String(createdTaskId) };
-}
-
-async function sendKisPredictionProgressViaDiscordRelay(message) {
-  const targetChannelId = String(message?.targetChannelId || '').trim();
-  if (targetChannelId !== kisPredictionValidationTask.PROGRESS_TARGET_CHANNEL_ID) {
-    return { discord_sent: false, error_class: 'invalid_target_channel' };
-  }
-  if (!discordRelay || typeof discordRelay.sendDiscordRelayMessage !== 'function') {
-    return { discord_sent: false, error_class: 'sender_missing' };
-  }
-  return discordRelay.sendDiscordRelayMessage({
-    targetChannelId,
-    content: message.content,
-    deliveryLayer: message.deliveryLayer,
-  });
-}
-
 async function apiKisReport(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method !== 'POST') {
@@ -2563,88 +2422,6 @@ async function apiKisReport(req, res) {
     message_preview: undefined,
     payload_text: undefined,
   });
-}
-
-
-async function apiKisPredictionValidation(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-validation/status') {
-    okJson(res, { ok: true, ...kisPredictionTaskRuntime.status() });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-validation/run-once') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    if (String(kisPredictionV2TaskRuntime.status().state || '').toUpperCase() === 'ACTIVE') {
-      errJson(res, 409, 'Model v2 prediction scheduler is active');
-      return;
-    }
-    const result = await kisPredictionTaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
-    okJson(res, {
-      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
-      ...result,
-    });
-    return;
-  }
-  errJson(res, 404, 'not found');
-}
-
-async function apiKisPredictionV2Validation(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && url.pathname === '/api/kis/prediction-v2-validation/status') {
-    okJson(res, { ok: true, ...kisPredictionV2TaskRuntime.status() });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/activate') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    const result = kisPredictionV2TaskRuntime.activate({ invokedBy: 'hermes_api' });
-    okJson(res, { ok: result.state === 'ACTIVE', ...result });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/kis/prediction-v2-validation/run-once') {
-    try {
-      assertControlAuth(req);
-    } catch (controlError) {
-      assertSharedSecret(req);
-    }
-    try {
-      kisPredictionV2ValidationTask.readDormantAdaptiveTaskState(kisAiMarketOpenDryRunRuntime.statePath);
-    } catch {
-      errJson(res, 409, 'Adaptive KIS scheduler is not explicitly dormant');
-      return;
-    }
-    const legacyState = String(kisPredictionTaskRuntime.status().state || '').toUpperCase();
-    if (legacyState !== 'PAUSED') {
-      errJson(res, 409, 'legacy prediction scheduler must remain paused');
-      return;
-    }
-    const result = await kisPredictionV2TaskRuntime.runOnce({ invokedBy: 'hermes_api', force: true });
-    okJson(res, {
-      ok: ['ACTIVE', 'COMPLETED'].includes(String(result.state || '')),
-      ...result,
-    });
-    return;
-  }
-  errJson(res, 404, 'not found');
 }
 
 async function apiKisAiMarketOpenDryRun(req, res) {
@@ -2737,14 +2514,6 @@ const server = http.createServer(async (req, res) => {
       await apiTasks(req, res);
       return;
     }
-    if (req.url.startsWith('/api/kis/prediction-validation')) {
-      await apiKisPredictionValidation(req, res);
-      return;
-    }
-    if (req.url.startsWith('/api/kis/prediction-v2-validation')) {
-      await apiKisPredictionV2Validation(req, res);
-      return;
-    }
     if (req.url.startsWith('/api/kis/ai-market-open-dry-run')) {
       await apiKisAiMarketOpenDryRun(req, res);
       return;
@@ -2806,12 +2575,7 @@ module.exports = {
     duplicateReport,
     fingerprintComponents,
     planFingerprintSpec,
-    buildKisSelfHealTaskCreateArgs,
-    assertKisSelfHealSourceClean,
-    prepareKisSelfHealBranch,
     kisReportDelivery,
-    kisPredictionValidationTask,
-    kisPredictionTaskRuntime,
     kisAiMarketOpenDryRunTask,
     kisAiMarketOpenDryRunRuntime,
     kisLlmVerdictExecutor,
