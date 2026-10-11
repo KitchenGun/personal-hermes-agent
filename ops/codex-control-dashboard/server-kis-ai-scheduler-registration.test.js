@@ -20,6 +20,13 @@ test('AI market-open dry-run registers an in-process status-only scheduler', () 
   assert.doesNotMatch(serverSource, /ai-market-open-dry-run\/activate/);
 });
 
+test('AI scheduler is registered without a KIS self-heal repair task sender', () => {
+  assert.doesNotMatch(serverSource, /repairTaskSender/);
+  assert.doesNotMatch(serverSource, /SelfHeal|self-heal|self_heal/);
+  assert.doesNotMatch(serverSource, /runtime_source_uncommitted/);
+  assert.doesNotMatch(serverSource, /execFileSync/);
+});
+
 test('server no longer wires the retired v1/v2 prediction validation tasks', () => {
   assert.doesNotMatch(serverSource, /kis-prediction-(?:v2-)?validation-task/);
   assert.doesNotMatch(serverSource, /\/api\/kis\/prediction-(?:v2-)?validation/);

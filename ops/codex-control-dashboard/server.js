@@ -1,6 +1,6 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
-const { execFile, execFileSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const kisReportDelivery = require('./kis-report-delivery-adapter');
@@ -72,7 +72,6 @@ const kisAiMarketOpenDryRunRuntime = kisAiMarketOpenDryRunTask.createKisAiMarket
   schedulerRegistered: true,
   serverRegistered: true,
   reportSender: sendKisReportViaDiscordRelay,
-  repairTaskSender: queueKisSelfHealTask,
   llmExecutor: kisLlmVerdictExecutor.createHermesLlmVerdictExecutor({
     hermesBin: process.env.HERMES_KIS_LLM_BIN || '/home/ubuntu/.local/bin/hermes',
     execMode: HERMES_EXEC_MODE === 'direct' || process.platform !== 'win32' ? 'direct' : 'wsl',
@@ -2395,121 +2394,6 @@ async function sendKisReportViaDiscordRelay(message) {
   });
 }
 
-function buildKisSelfHealTaskCreateArgs(incident = {}) {
-  const notificationKey = String(incident.notificationKey || '');
-  const taskId = String(incident.taskId || '');
-  const errorClass = String(incident.errorClass || '');
-  const repairOwner = String(incident.repairOwner || '');
-  const failurePhase = String(incident.failurePhase || 'none');
-  const failureExceptionType = String(incident.failureExceptionType || 'none');
-  const failureExitCode = incident.failureExitCode ?? null;
-  const failureSignal = String(incident.failureSignal || 'none');
-  const failureFingerprint = String(incident.failureFingerprint || '');
-  if (!/^[a-f0-9]{64}$/.test(notificationKey)
-    || !/^kis-[a-z0-9-]{1,80}$/.test(taskId)
-    || !/^[a-z0-9_]{1,80}$/.test(errorClass)
-    || !/^(?:kis|hermes)$/.test(repairOwner)
-    || !/^[a-z0-9_]{1,40}$/.test(failurePhase)
-    || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(failureExceptionType)
-    || !(failureExitCode === null || (Number.isSafeInteger(failureExitCode) && failureExitCode >= 1 && failureExitCode <= 255))
-    || !/^(?:none|SIG[A-Z0-9]{1,16})$/.test(failureSignal)
-    || !/^(?:[a-f0-9]{64})?$/.test(failureFingerprint)) {
-    throw new Error('invalid_kis_self_heal_incident');
-  }
-  const workspaceRoot = repairOwner === 'kis'
-    ? kisAiMarketOpenDryRunTask.KIS_REPO
-    : '/home/ubuntu/work/personal-hermes-agent';
-  const branch = `codex/kis-self-heal-${notificationKey.slice(0, 12)}`;
-  const body = [
-    'Source: kis-runtime-self-heal',
-    `Incident: ${notificationKey}`,
-    `KIS task: ${taskId}`,
-    `Sanitized error: ${errorClass}`,
-    `Repair owner: ${repairOwner === 'kis' ? 'kis-trading-lab' : 'personal-hermes-agent'}`,
-    `Failure phase: ${failurePhase}`,
-    `Failure exception: ${failureExceptionType}`,
-    `Failure exit code: ${failureExitCode ?? 'none'}`,
-    `Failure signal: ${failureSignal}`,
-    `Failure fingerprint: ${failureFingerprint || 'none'}`,
-    '',
-    'Fix the root cause autonomously in isolated git worktrees.',
-    'Use the installed Ponytail skill in full mode: touch the fewest files and add no dependency or speculative abstraction.',
-    'Inspect current sanitized state and logs, reproduce, make the smallest code fix, run focused and full tests, commit and push a branch, and open a PR for operator review.',
-    ...(repairOwner === 'kis' ? [
-      'Before editing, verify that the deployed KIS source is reproducible from the pinned upstream commit.',
-      'If relevant runtime source differs from upstream, stop as runtime_source_uncommitted instead of copying dirty state or producing a stale PR.',
-    ] : []),
-    'Do not edit dirty canonical checkouts directly. Preserve unrelated files. Do not merge, deploy, restart services, or resume the KIS task.',
-    '',
-    'Hard stops:',
-    '- Never call broker order/account/balance/condition-search/WebSocket endpoints.',
-    '- Never access prod DB, secrets, tokens, raw responses, or private account values.',
-    '- Never weaken safety/risk/model/scheduler policy, enable a scheduler, retry an order, or force a market slot.',
-    '- Never merge or deploy the repair without separate operator approval.',
-    '- If a safe root-cause fix and PR cannot be proven, leave this task blocked for operator review.',
-    '',
-    'Required final notification:',
-    `Send exactly one sanitized result to discord:${KIS_DISCORD_CHANNEL_ID} with /home/ubuntu/.local/bin/hermes send -q.`,
-    'Use only: incident id prefix, fixed or blocked status, tests pass or fail, PR ready yes or no, and operator action required yes or no.',
-    'Do not include paths, source snippets, logs, symbols, prices, positions, secrets, or raw responses.',
-  ].join('\n');
-  return [
-    'kanban', '--board', 'codex-control', 'create', `KIS self-heal: ${errorClass}`,
-    '--body', body,
-    '--assignee', runtimeAssignee('coder'),
-    '--priority', '95',
-    '--workspace', `worktree:${workspaceRoot}`,
-    '--branch', branch,
-    '--max-runtime', '45m',
-    '--max-retries', '1',
-    '--created-by', 'Hermes KIS self-healing',
-    '--idempotency-key', `kis-self-heal:${notificationKey}`,
-    '--json',
-  ];
-}
-
-function selfHealRepoSpec(repairOwner) {
-  return repairOwner === 'kis'
-    ? { root: kisAiMarketOpenDryRunTask.KIS_REPO, upstream: 'origin/master', paths: ['kis_trading_lab', 'config'] }
-    : { root: '/home/ubuntu/work/personal-hermes-agent', upstream: 'origin/main', paths: ['ops/codex-control-dashboard'] };
-}
-
-function runSelfHealGit(root, args) {
-  return execFileSync('git', ['-C', root, ...args], {
-    encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-  });
-}
-
-function assertKisSelfHealSourceClean(repairOwner, gitRunner = runSelfHealGit) {
-  const { root, upstream, paths } = selfHealRepoSpec(repairOwner);
-  const tracked = gitRunner(root, ['diff', '--name-only', upstream, '--', ...paths]);
-  const untracked = gitRunner(root, ['ls-files', '--others', '--exclude-standard', '--', ...paths]);
-  if (`${tracked || ''}${untracked || ''}`.trim()) throw new Error('runtime_source_uncommitted');
-}
-
-function prepareKisSelfHealBranch(repairOwner, branch, gitRunner = runSelfHealGit) {
-  const { root, upstream } = selfHealRepoSpec(repairOwner);
-  const upstreamSha = String(gitRunner(root, ['rev-parse', upstream])).trim();
-  let branchSha = '';
-  try { branchSha = String(gitRunner(root, ['rev-parse', `refs/heads/${branch}`])).trim(); }
-  catch { branchSha = ''; }
-  if (!branchSha) gitRunner(root, ['branch', branch, upstream]);
-  else if (branchSha !== upstreamSha) throw new Error('self_heal_branch_base_mismatch');
-}
-
-async function queueKisSelfHealTask(incident = {}) {
-  const args = buildKisSelfHealTaskCreateArgs(incident);
-  assertKisSelfHealSourceClean(incident.repairOwner);
-  prepareKisSelfHealBranch(incident.repairOwner, args[args.indexOf('--branch') + 1]);
-  const output = await runHermesLong(args, 60000);
-  const created = JSON.parse(output);
-  const createdTaskId = created.id || created.task_id || created.task?.id;
-  if (!createdTaskId) throw new Error('kis_self_heal_task_create_failed');
-  resetSupervisorBackoff();
-  supervisorTick('kis-self-heal').catch(() => {});
-  return { queued: true, task_id: String(createdTaskId) };
-}
-
 async function apiKisReport(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method !== 'POST') {
@@ -2691,9 +2575,6 @@ module.exports = {
     duplicateReport,
     fingerprintComponents,
     planFingerprintSpec,
-    buildKisSelfHealTaskCreateArgs,
-    assertKisSelfHealSourceClean,
-    prepareKisSelfHealBranch,
     kisReportDelivery,
     kisAiMarketOpenDryRunTask,
     kisAiMarketOpenDryRunRuntime,
