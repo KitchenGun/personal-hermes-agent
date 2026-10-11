@@ -79,6 +79,8 @@ const POLL_INTERVAL_MS = 60_000;
 const COLLECTION_SLOT_WINDOW_MS = 10 * 60_000;
 const COLLECTION_SLOT_LEDGER_LIMIT = 68;
 const EXIT_ANALYSIS_LIMIT = COLLECTION_SLOT_LEDGER_LIMIT;
+const SAFETY_BLOCKED_DISPATCH_LEDGER_LIMIT = 100;
+const SAFETY_ROLE_KEYS = Object.freeze(['monitor_health', 'order_authority', 'readonly_dispatch_allowed', 'block_reason']);
 const EXIT_ANALYSIS_STATUSES = new Set(['RUNNING', 'READY', 'CONSUMED', 'BLOCKED', 'FAILED', 'CANCELLED', 'EXPIRED']);
 const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
@@ -589,6 +591,27 @@ function isVpsDailyLossEntryBlock(result) {
     && result.open_order_status === 'clear'
     && result.reconciliation_status === 'clear'
     && result.account_risk_status === 'active';
+}
+
+// A disabled owner holds no order authority: only the read-only AI tasks may run, and only on a clean check.
+function isReadonlyOnlySafety(result) {
+  return result?.status === 'blocked'
+    && result.execution_owner === 'disabled'
+    && result.order_authority === 'none'
+    && result.monitor_health === 'ok'
+    && result.readonly_dispatch_allowed === true
+    && result.block_reason === 'none'
+    && result.process_lock === 'clear'
+    && result.kill_state === 'clear'
+    && result.reconciliation_status === 'clear';
+}
+
+function safetyBlockReason(result) {
+  if (typeof result?.block_reason === 'string' && result.block_reason && result.block_reason !== 'none') {
+    return sanitizeErrorClass(result.block_reason);
+  }
+  return sanitizeErrorClass(result?.error_class && result.error_class !== 'none'
+    ? result.error_class : 'safety_monitor_not_clear');
 }
 
 function processFailureEvidence(error, stderr) {
@@ -2026,13 +2049,25 @@ function parseSafetyMonitorOutput(stdout) {
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_safety_output'); }
   const { broker_http_diagnostics: rawDiagnostics, ...safetyFields } = value || {};
   if (SECRET_LIKE_RE.test(JSON.stringify(safetyFields))) throw new Error('unsafe_safety_output');
-  const keys = ['task_id', 'status', 'action_type', 'execution_owner', 'process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status', 'order_api_calls', 'vps_live_orders', 'prod_orders', 'retry', 'catch_up', 'fail_closed', 'error_class'];
+  const baseKeys = ['task_id', 'status', 'action_type', 'execution_owner', 'process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status', 'order_api_calls', 'vps_live_orders', 'prod_orders', 'retry', 'catch_up', 'fail_closed', 'error_class'];
+  // Role fields are optional as a group so older KIS output stays readable.
+  const roleFields = Boolean(value) && !Array.isArray(value) && typeof value === 'object'
+    && SAFETY_ROLE_KEYS.some((key) => Object.hasOwn(value, key));
+  const keys = roleFields ? [...baseKeys, ...SAFETY_ROLE_KEYS] : baseKeys;
   if (!value || Array.isArray(value) || typeof value !== 'object' || Object.keys(value).length !== keys.length + (Object.hasOwn(value, 'broker_http_diagnostics') ? 1 : 0)
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
     || Object.keys(value).some((key) => !keys.includes(key) && key !== 'broker_http_diagnostics')
     || value.task_id !== 'kis-vps-safety-monitor-v1' || !['success', 'blocked'].includes(value.status)
     || value.action_type !== 'safety_monitor' || !['clear', 'active', 'unknown'].includes(value.process_lock)
-    || !['vps', 'prod', 'unknown'].includes(value.execution_owner)
+    || !['vps', 'prod', 'disabled', 'unknown'].includes(value.execution_owner)
+    || (value.execution_owner === 'disabled' && value.status !== 'blocked')
+    || (roleFields && (!['ok', 'degraded', 'failed'].includes(value.monitor_health)
+      || value.order_authority !== (['vps', 'prod'].includes(value.execution_owner) ? value.execution_owner : 'none')
+      || typeof value.readonly_dispatch_allowed !== 'boolean'
+      || typeof value.block_reason !== 'string' || !value.block_reason || value.block_reason.length > 80
+      || value.readonly_dispatch_allowed !== (value.block_reason === 'none')
+      || (value.readonly_dispatch_allowed && value.monitor_health !== 'ok')
+      || (value.status === 'success' && !value.readonly_dispatch_allowed)))
     || !['clear', 'active', 'unknown'].includes(value.kill_state)
     || !['clear', 'active', 'unknown'].includes(value.open_order_status)
     || !['clear', 'active', 'unknown'].includes(value.reconciliation_status)
@@ -5877,6 +5912,102 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (release) release();
     }
   }
+  // Every ACTIVE slot held back by the safety gate is recorded once. One alert per reason per KST day,
+  // held while the existing transient-safety confirmation window is open and skipped when the existing
+  // pause notification already reported the same reason today.
+  async function recordSafetyBlockedDispatches(state, blockReason, { orderOnly = false } = {}) {
+    const reason = sanitizeErrorClass(blockReason);
+    const recordedAt = now();
+    const blockedDue = (snapshot, task) => {
+      const item = snapshot.tasks?.[task.id];
+      return (!orderOnly || task.kind === 'order') && item?.state === 'ACTIVE' && Boolean(item.next_run_at)
+        && new Date(item.next_run_at).getTime() <= recordedAt.getTime();
+    };
+    if (state.state !== 'ACTIVE' || !TASKS.some((task) => blockedDue(state, task))) return state;
+    const withMonitor = (value) => (state.last_safety_monitor
+      ? { ...value, last_safety_monitor: state.last_safety_monitor } : value);
+    let release;
+    let saved;
+    let alert = null;
+    try {
+      release = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      const ledger = Array.isArray(latest.safety_blocked_dispatch_ledger) ? latest.safety_blocked_dispatch_ledger : [];
+      const entries = latest.state !== 'ACTIVE' ? [] : TASKS.filter((task) => blockedDue(latest, task))
+        .map((task) => ({
+          task_id: task.id,
+          due_key: dueKey(task, new Date(latest.tasks[task.id].next_run_at)),
+          block_reason: reason,
+          recorded_at: recordedAt.toISOString(),
+        }))
+        .filter((entry) => !ledger.some((prior) => prior.due_key === entry.due_key));
+      const kstDay = (value) => {
+        const date = new Date(value || '');
+        if (Number.isNaN(date.getTime())) return null;
+        const parts = seoulParts(date);
+        return `${parts.year}-${parts.month}-${parts.day}`;
+      };
+      const today = kstDay(recordedAt);
+      const alertKey = crypto.createHash('sha256')
+        .update(`safety_blocked_dispatch:${today}:${reason}`).digest('hex');
+      const unalerted = [...ledger, ...entries]
+        .filter((entry) => entry.block_reason === reason && kstDay(entry.recorded_at) === today);
+      const transientHold = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
+        && Number(latest.consecutive_safety_monitor_failures || 0)
+          < (reason === 'open_order_status_unavailable' ? OPEN_ORDER_STATUS_FAILURE_LIMIT : 2);
+      const pauseNotified = latest.last_error_notification?.error_class === reason
+        && kstDay(latest.last_error_notification.claimed_at) === today;
+      if (unalerted.length && latest.last_safety_block_alert?.key !== alertKey && !transientHold && !pauseNotified) {
+        alert = {
+          key: alertKey, block_reason: reason, task_ids: [...new Set(unalerted.map((entry) => entry.task_id))],
+          attempted: typeof reportSender === 'function', succeeded: false, retry: false,
+          claimed_at: recordedAt.toISOString(),
+        };
+      }
+      if (!entries.length && !alert) return withMonitor(latest);
+      saved = save({
+        ...latest,
+        safety_blocked_dispatch_ledger: [...ledger, ...entries].slice(-SAFETY_BLOCKED_DISPATCH_LEDGER_LIMIT),
+        ...(alert ? { last_safety_block_alert: alert } : {}),
+      });
+    } catch (error) {
+      if (error.message === 'scheduler_lock_active') return state;
+      throw error;
+    } finally { if (release) release(); }
+    if (!alert) return withMonitor(saved);
+    let succeeded = false;
+    if (alert.attempted) {
+      try {
+        const delivery = await reportSender({
+          targetChannelId: REPORT_TARGET_CHANNEL_ID,
+          content: [
+            '[KIS 자동운영 기능 제한]',
+            `작업: ${alert.task_ids.map((id) => TASK_ALERT_LABELS.get(id) || 'KIS 자동운영').join(', ')}`,
+            '상태: 안전 점검 차단으로 예정 실행 보류 (슬롯 기록됨)',
+            `원인: ${reason}`,
+            '자동 재시도: 없음',
+            '신규 주문: 중단',
+            '자동 복구: 매분 안전 점검 재확인, 해소되지 않으면 운영자 확인 필요',
+          ].join('\n'),
+          deliveryLayer: 'hermes_ai_market_open_error',
+          idempotencyKey: `kis-safety-blocked-dispatch:${alert.key}`,
+        });
+        succeeded = delivery?.discord_sent === true;
+      } catch { succeeded = false; }
+    }
+    let releaseAfter;
+    try {
+      releaseAfter = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      if (latest.last_safety_block_alert?.key === alert.key) {
+        saved = save({ ...latest, last_safety_block_alert: {
+          ...latest.last_safety_block_alert, succeeded, completed_at: now().toISOString(),
+        } });
+      }
+    } catch { /* Alert bookkeeping never retries the alert or changes dispatch. */ }
+    finally { if (releaseAfter) releaseAfter(); }
+    return withMonitor(saved);
+  }
   async function runSafetyMonitor(current, checkedAt) {
     const last = current.last_safety_monitor;
     if (!safetyMonitorEnabled || sameMinute(last?.checked_at, checkedAt)) return current;
@@ -5937,6 +6068,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         account_risk_status: value.account_risk_status,
         error_class: safeText(value.error_class, 80),
         broker_http_diagnostics: value.broker_http_diagnostics,
+        ...(Object.hasOwn(value, 'monitor_health') ? {
+          monitor_health: value.monitor_health,
+          order_authority: value.order_authority,
+          readonly_dispatch_allowed: value.readonly_dispatch_allowed,
+          block_reason: safeText(value.block_reason, 80),
+        } : {}),
       });
       capture(result);
       if (result.status === 'blocked') {
@@ -6174,14 +6311,18 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             fallbackSafetyMonitor: current.last_safety_monitor,
           });
         }
+        const readonlyOnly = safetyMonitorEnabled && isReadonlyOnlySafety(current.last_safety_monitor);
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
           && !isVpsDailyLossEntryBlock(current.last_safety_monitor)
+          && !readonlyOnly
           && !(current.last_safety_monitor?.status === 'skipped_non_trading_day'
             && current.tasks[ORDER_TASK.id]?.state === 'DISABLED')) {
-          return finalizeExpiredCollectionSlots(now(), {
+          const blockedMonitor = current.last_safety_monitor;
+          current = finalizeExpiredCollectionSlots(now(), {
             dueFrom: collectionDueAt, skipReason: 'safety_blocked',
-            fallbackSafetyMonitor: current.last_safety_monitor,
+            fallbackSafetyMonitor: blockedMonitor,
           });
+          return await recordSafetyBlockedDispatches(current, safetyBlockReason(blockedMonitor));
         }
         current = failInterruptedCollectionSlots();
         current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt });
@@ -6213,15 +6354,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           return current;
         }
         const dispatchTime = now();
+        let orderSlotHeld = false;
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= dispatchTime.getTime()) {
+            if (readonlyOnly && task.kind === 'order') { orderSlotHeld = true; continue; }
             current = await runOnce({
               taskId: task.id, dueAt: now(),
               ...(task.id === INTRADAY_SHADOW_TASK.id ? { collectionDispatch: true } : {}),
             });
             if (current.state !== 'ACTIVE') break;
           }
+        }
+        if (orderSlotHeld && current.state === 'ACTIVE') {
+          current = await recordSafetyBlockedDispatches(current, 'order_authority_none', { orderOnly: true });
         }
       }
       if (current.state !== 'ACTIVE') {
