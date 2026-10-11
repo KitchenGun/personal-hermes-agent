@@ -86,6 +86,13 @@ const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const LLM_RESPONSE_TIMEOUT_MS = 120_000;
 const DECISION_CONTEXT_TIMEOUT_MS = 120_000;
+// Model v3 candidate refresh chained after post-close learning (vps-autonomous-order --action refresh-shadow).
+// It used to share EXEC_TIMEOUT_MS with learning. hermes-vm: 2026-10-02 took 163.5 s; 2026-10-08, after a
+// 3-trading-day backfill catch-up, was killed at the shared 5-minute limit (>= 300 s, predictions already
+// committed). The backfill always re-reads a 200-day window, so catch-up days add rows and outcome
+// reconciliation, not API calls. 15 min is >= 3x the worst observed run and keeps learning (<= 5 min) plus
+// refresh inside the 16:20-17:50 KST post-close window and the 16:30 report's late start (until 17:30 KST).
+const MODEL_V3_REFRESH_TIMEOUT_MS = 15 * 60_000;
 const LLM_MODEL_ID = 'gpt-5.6-terra';
 const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   contract_version: 'runtime_contract_v1',
@@ -185,7 +192,13 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['model_v3_artifact_load_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_artifact_verify_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['scheduled_shadow_refresh_slot_invalid', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
-  ['post_close_shadow_process_error', { autoRepair: true }],
+  // Post-close Model v3 candidate refresh failures after successful learning.
+  // Recoverable: the task stays ACTIVE with a degraded refresh record and an alert, the refresh runs again at
+  // the next post-close slot, and a legacy pause with this reason auto-resumes once safety is clear.
+  ['post_close_shadow_timeout', { postCloseRecovery: true }],
+  // Operator approval required: a non-timeout refresh crash pauses the task with an alert and isolated
+  // self-heal; only the existing resume-after-io-fix approval (fresh safety monitor) clears it.
+  ['post_close_shadow_process_error', { autoRepair: true, resumable: true }],
   ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
@@ -1987,6 +2000,7 @@ function buildIndependentShadowRefreshCommand() {
       '--approval', MODEL_V3_RESEARCH_APPROVAL,
     ],
     cwd: KIS_REPO,
+    timeoutMs: MODEL_V3_REFRESH_TIMEOUT_MS,
   };
 }
 
@@ -5675,7 +5689,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           if (!POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(refreshBlocker)) {
             return pauseForTask(warningState, refreshBlocker, lastRun);
           }
-          const recordedRun = { ...lastRun, no_same_slot_retry: true };
+          const recordedRun = { ...lastRun, model_v3_candidate_refresh_degraded: true, no_same_slot_retry: true };
           const refreshedTask = warningState.tasks[taskId];
           const active = save({ ...warningState, tasks: { ...warningState.tasks, [taskId]: {
             ...refreshedTask,
@@ -6214,6 +6228,48 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { release(); }
   }
+  function resumeRecoverablePostCloseRefreshPause(current, checkedAt) {
+    // A post-close task paused only because its chained Model v3 refresh failed with a recoverable class
+    // (ERROR_POLICY postCloseRecovery) after successful learning is re-armed for its next due slot once this
+    // tick's safety result is clear. No same-slot retry, no catch-up, and the order task is never touched.
+    const postClose = current.tasks[POST_CLOSE_TASK.id];
+    const reason = postClose?.pause_reason;
+    const run = postClose?.last_run;
+    const safety = current.last_safety_monitor;
+    const safetyClear = sameMinute(safety?.checked_at, checkedAt)
+      && (safety.status === 'success'
+        || (safety.status === 'skipped_non_trading_day' && current.tasks[ORDER_TASK.id]?.state === 'DISABLED'));
+    if (current.state !== 'ACTIVE' || postClose?.state !== 'PAUSED'
+      || !POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(reason)
+      || sanitizeErrorClass(run?.model_v3_candidate_refresh_error_class) !== reason
+      || run?.status !== 'success' || run.action_type !== 'post_close_learning' || run.fail_closed !== false
+      || run.model_v3_candidate_refresh_status !== 'blocked' || run.model_v3_candidate_refresh_fail_closed !== true
+      || (postClose.pending_invocation ?? null) !== null
+      || !safetyClear || blockingIncident(current)) return current;
+    let release;
+    try { release = acquireExclusiveLock(runLockPath); }
+    catch (error) { if (error.message === 'scheduler_lock_active') return current; throw error; }
+    try {
+      const latest = loadStrict();
+      if (latest.state !== 'ACTIVE'
+        || JSON.stringify(latest.tasks[POST_CLOSE_TASK.id]) !== JSON.stringify(postClose)) return latest;
+      return save({ ...latest, tasks: { ...latest.tasks, [POST_CLOSE_TASK.id]: {
+        ...postClose,
+        state: 'ACTIVE',
+        pause_reason: undefined,
+        next_run_at: nextRunAt(POST_CLOSE_TASK, checkedAt),
+        consecutive_transport_failures: 0,
+        post_close_refresh_recovery: {
+          resumed_at: checkedAt.toISOString(),
+          resumed_by: 'hermes_safety_monitor',
+          pause_reason: reason,
+          safety_status: safety.status,
+          retry: false,
+          catch_up: false,
+        },
+      } } });
+    } finally { release(); }
+  }
   function tick() {
     if (schedulerStopping) return Promise.resolve(stateUnavailableStatus());
     const promise = tickInternal();
@@ -6328,6 +6384,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         }
         current = failInterruptedCollectionSlots();
         current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt });
+        current = resumeRecoverablePostCloseRefreshPause(current, time);
         const orderTask = current.tasks[ORDER_TASK.id];
         const pendingSlot = orderTask?.next_run_at ? new Date(orderTask.next_run_at) : null;
         const safety = current.last_safety_monitor;
@@ -6567,7 +6624,7 @@ module.exports = {
   ORDER_ATTESTATION_DIR,
   APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, DEFAULT_SCHEDULER_OWNER_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
-  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, DECISION_CONTEXT_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
+  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MODEL_V3_REFRESH_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, DECISION_CONTEXT_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
   REQUIRED_RUNTIME_CONTRACT, ERROR_POLICY, loadRuntimeContract, TASKS,
   parseKisAiMarketOpenOutput, parseKisVpsAutonomousOutput, parseOrderPrecheckOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
   parseAiVerdict, parseDecisionContextOutput, parseSafetyMonitorOutput, buildSanitizedAiPacket,
