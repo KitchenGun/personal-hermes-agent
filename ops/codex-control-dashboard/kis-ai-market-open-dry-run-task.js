@@ -5882,12 +5882,35 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
     if (!safetyMonitorEnabled || sameMinute(last?.checked_at, checkedAt)) return current;
     const parts = seoulParts(checkedAt);
     const officialTradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+    let nonTradingDaySkip = null;
     try {
       const proof = calendarProofResolver(officialTradeDate);
       const orderTask = current.tasks[ORDER_TASK.id];
       if (proof.isTradingDay === false && orderTask?.state === 'ACTIVE'
         && !orderTask.pending_invocation && !blockingIncident(current)) return current;
+      if (proof.isTradingDay === false && orderTask?.state === 'DISABLED'
+        && !orderTask.pending_invocation && !blockingIncident(current)) {
+        nonTradingDaySkip = {
+          checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false,
+          status: 'skipped_non_trading_day', official_trade_date: officialTradeDate,
+          official_calendar_source_hash: safeText(proof.sourceHash, 80), order_task_state: 'DISABLED',
+          broker_api_calls: 0,
+        };
+      }
     } catch { /* Unknown calendar coverage must continue through the fail-closed monitor. */ }
+    if (nonTradingDaySkip) {
+      // A DISABLED order pilot has no live order path on an official non-trading day: record a skip, no broker reads.
+      let release;
+      try { release = acquireExclusiveLock(runLockPath); }
+      catch (error) { if (error.message !== 'scheduler_lock_active') throw error; return current; }
+      try {
+        const latest = loadStrict();
+        const latestOrder = latest.tasks[ORDER_TASK.id];
+        if (latestOrder?.state === 'DISABLED' && !latestOrder.pending_invocation && !blockingIncident(latest)) {
+          return save({ ...latest, last_safety_monitor: nonTradingDaySkip });
+        }
+      } finally { release(); }
+    }
     const monitorRun = {
       checked_at: checkedAt.toISOString(), monitor_started_at: now().toISOString(),
       action_type: 'safety_monitor', retry: false, catch_up: false,
@@ -6152,7 +6175,9 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           });
         }
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
-          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) {
+          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)
+          && !(current.last_safety_monitor?.status === 'skipped_non_trading_day'
+            && current.tasks[ORDER_TASK.id]?.state === 'DISABLED')) {
           return finalizeExpiredCollectionSlots(now(), {
             dueFrom: collectionDueAt, skipReason: 'safety_blocked',
             fallbackSafetyMonitor: current.last_safety_monitor,
