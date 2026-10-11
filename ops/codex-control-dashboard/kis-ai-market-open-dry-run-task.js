@@ -6090,6 +6090,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
               emergency_execution_owner: safeText(emergency?.execution_owner || 'unknown', 16),
               emergency_positions_liquidated: Number(emergency?.positions_liquidated || 0),
               emergency_reconciliation_passed: emergency?.reconciliation_passed === true,
+              emergency_latch_persisted: emergency?.latch_persisted === true,
+              emergency_operator_action_required: emergency?.operator_action_required === true,
             });
             if (emergency?.status !== 'success' || emergency?.reconciliation_passed !== true) {
               throw new Error(`emergency_${sanitizeErrorClass(emergency?.error_class || 'stop_failed')}`);

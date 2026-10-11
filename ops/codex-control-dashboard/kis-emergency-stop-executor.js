@@ -13,7 +13,10 @@ const OUTPUT_KEYS = new Set([
   'positions_liquidated', 'order_api_calls', 'reconciliation_executed',
   'reconciliation_passed', 'retry', 'fail_closed', 'error_class',
   'execution_owner', 'prod_order_count', 'raw_response_persisted', 'secret_exposure',
+  'operator_action_required',
 ]);
+// Owners without order authority: the stop can only persist the latch, never act on the account.
+const LATCH_ONLY_OWNERS = new Set(['disabled', 'unknown']);
 
 function buildCommand({ automaticRiskOff = false } = {}) {
   const args = [
@@ -45,8 +48,19 @@ function parseOutput(stdout) {
   if (value.task_id !== 'kis-vps-emergency-stop-v1'
       || !['success', 'blocked'].includes(value.status)
       || value.fail_closed !== true
-      || !['vps', 'prod'].includes(value.execution_owner)
+      || !['vps', 'prod', ...LATCH_ONLY_OWNERS].includes(value.execution_owner)
       || !Number.isInteger(value.prod_order_count) || value.prod_order_count < 0
+      || (value.operator_action_required !== undefined && typeof value.operator_action_required !== 'boolean')
+      || (LATCH_ONLY_OWNERS.has(value.execution_owner) && (
+        value.status !== 'blocked'
+        || value.order_api_calls !== 0
+        || value.open_buys_cancelled !== 0
+        || value.positions_liquidated !== 0
+        || value.prod_order_count !== 0
+        || value.reconciliation_executed !== false
+        || value.reconciliation_passed !== false
+        || (value.latch_persisted === true && value.operator_action_required !== true)
+      ))
       || value.raw_response_persisted !== false
       || value.secret_exposure !== false
       || value.retry !== false
@@ -67,6 +81,7 @@ function parseOutput(stdout) {
     execution_owner: value.execution_owner,
     prod_order_count: value.prod_order_count,
     error_class: String(value.error_class || 'emergency_stop_failed').slice(0, 80),
+    operator_action_required: value.operator_action_required === true,
   });
 }
 
