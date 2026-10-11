@@ -10117,6 +10117,9 @@ test('scheduler tick adds recovery buttons to an already-notified reconciliation
       mod.TASKS[4].id, order.last_due_at, completedAt, 'order_not_fully_filled',
     ].join(':')).digest('hex'),
   };
+  // Intraday collection is current when the order pause is found (12:10 KST slot next), as in production.
+  // Left at the July fixture schedule, 09:10-12:00 would be unrecorded and now raises a collection-gap alert.
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-09-04T03:10:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
   value.setClock('2026-09-04T03:11:00.000Z');
 

@@ -78,6 +78,11 @@ const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
 const COLLECTION_SLOT_WINDOW_MS = 10 * 60_000;
 const COLLECTION_SLOT_LEDGER_LIMIT = 68;
+// Operator alert after this many consecutive intraday slots end FAILED or skipped without data.
+const COLLECTION_GAP_ALERT_STREAK = 2;
+const COLLECTION_GAP_ALERT_LIMIT = 30;
+// Normal no-op outcomes: they never count toward, and they end, a collection-gap streak.
+const NORMAL_COLLECTION_SKIP_REASONS = new Set(['market_closed', 'duplicate_slot', 'no_candidates']);
 const EXIT_ANALYSIS_LIMIT = COLLECTION_SLOT_LEDGER_LIMIT;
 const SAFETY_BLOCKED_DISPATCH_LEDGER_LIMIT = 100;
 const SAFETY_ROLE_KEYS = Object.freeze(['monitor_health', 'order_authority', 'readonly_dispatch_allowed', 'block_reason']);
@@ -3643,7 +3648,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         : '운영자 확인 필요'}`,
     ].join('\n');
     let succeeded = false;
-    const queuedClaim = save({ ...(incidentClaim?.state || claim), last_self_heal: selfHeal });
+    // Reload after the await: the claim snapshot would overwrite writes made meanwhile (e.g. the slot ledger).
+    const queuedClaim = save({ ...loadStrict(), last_self_heal: selfHeal });
     if (attempted) {
       try {
         const delivery = await reportSender({
@@ -5509,9 +5515,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (parsed.status === 'blocked' || parsed.failClosed) {
           collectionFinalStatus = 'FAILED';
           collectionFailureReason = parsed.errorClass || 'collector_blocked';
+        } else if (parsed.transportDegraded) {
+          // A quote/auth/DB transport no-op stored no new data: record its error class, not a completion.
+          collectionFinalStatus = 'FAILED';
+          collectionFailureReason = parsed.errorClass || 'transport_degraded';
         } else if (parsed.actionType === 'market_closed_no_op') {
           collectionFinalStatus = 'SKIPPED';
           collectionFailureReason = 'market_closed';
+        } else if (parsed.actionType === 'no_candidates_no_op') {
+          collectionFinalStatus = 'SKIPPED';
+          collectionFailureReason = 'no_candidates';
         } else if (['idempotent_no_op', 'duplicate_slot'].includes(parsed.actionType)) {
           collectionFinalStatus = 'SKIPPED';
           collectionFailureReason = 'duplicate_slot';
@@ -6270,9 +6283,106 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       } } });
     } finally { release(); }
   }
+
+  // Alert-only: never changes task state, never dispatches or backfills slots.
+  async function notifyCollectionGap(result) {
+    if (schedulerFaulted || schedulerStopping || ticking || recoveringIncident || result?.scheduler_faulted) return result;
+    let current;
+    try { current = loadStrict(); } catch { return result; }
+    const parts = seoulParts(now());
+    const tradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+    const minute = (Number(parts.hour) * 60) + Number(parts.minute);
+    const intraday = current.tasks[INTRADAY_SHADOW_TASK.id] || {};
+    const label = TASK_ALERT_LABELS.get(INTRADAY_SHADOW_TASK.id);
+    const alerts = [];
+    const windowEnd = INTRADAY_SHADOW_TASK.minutes[INTRADAY_SHADOW_TASK.minutes.length - 1]
+      + (COLLECTION_SLOT_WINDOW_MS / 60_000);
+    if (minute >= INTRADAY_SHADOW_TASK.minutes[0] && minute < windowEnd
+      && (current.state !== 'ACTIVE' || intraday.state !== 'ACTIVE')) {
+      const scope = current.state !== 'ACTIVE' ? 'scheduler' : 'intraday_task';
+      const holdState = safeText(scope === 'scheduler' ? current.state : intraday.state, 20);
+      const reason = sanitizeErrorClass((scope === 'scheduler' ? current.pause_reason : intraday.pause_reason)
+        || `${scope}_${holdState.toLowerCase()}`);
+      alerts.push({
+        kind: 'collection_not_dispatched', dedupe: `${tradeDate}:${scope}:${holdState}:${reason}`,
+        trade_date: tradeDate, scope, state: holdState, reason, due_keys: [],
+        content: [
+          '[KIS 장중 수집 공백]', `작업: ${label}`, `기준일: ${tradeDate} (정규 거래일)`,
+          `상태: ${scope === 'scheduler' ? '전체 자동운영' : label} ${holdState}, 장중 슬롯 미실행`,
+          `원인: ${reason}`, '과거 슬롯 보충: 없음', '자동 재시도: 없음', '조치: 운영자 확인 필요',
+        ].join('\n'),
+      });
+    }
+    const streak = [];
+    for (const entry of [...(intraday.collection_slot_ledger || [])].reverse()) {
+      // Today's slots only: a streak spanning days would move its dedupe key as the ledger is pruned.
+      if (String(entry.due_key).split(':')[1] !== tradeDate) break;
+      if (entry.status === 'RUNNING') continue;
+      if (entry.status === 'COMPLETED'
+        || (entry.status === 'SKIPPED' && NORMAL_COLLECTION_SKIP_REASONS.has(entry.skip_reason))) break;
+      streak.unshift(entry);
+    }
+    if (streak.length >= COLLECTION_GAP_ALERT_STREAK
+      && streak[streak.length - 1].due_key.split(':')[1] === tradeDate) {
+      const reason = [...new Set(streak.map((entry) => sanitizeErrorClass(
+        entry.failure_reason || entry.skip_reason || 'collector_failed')))].join(',');
+      const slotTime = (entry) => entry.due_key.split(':').slice(-2).join(':');
+      alerts.push({
+        kind: 'consecutive_slot_failures', dedupe: streak[0].due_key,
+        trade_date: tradeDate, reason, due_keys: streak.map((entry) => entry.due_key),
+        content: [
+          '[KIS 장중 수집 연속 실패]', `작업: ${label}`, `기준일: ${tradeDate}`,
+          `상태: 연속 ${streak.length}개 슬롯 실패 또는 미수집 (${slotTime(streak[0])}~${slotTime(streak[streak.length - 1])})`,
+          `원인: ${reason}`, '과거 슬롯 보충: 없음', '자동 재시도: 없음', '조치: 운영자 확인 필요',
+        ].join('\n'),
+      });
+    }
+    if (!alerts.length) return result;
+    try {
+      if (['Sat', 'Sun'].includes(parts.weekday) || calendarProofResolver(tradeDate)?.isTradingDay !== true) return result;
+    } catch { return result; }
+    let latest = result;
+    for (const { kind, dedupe, content, ...fields } of alerts) {
+      const key = crypto.createHash('sha256').update(`${kind}:${dedupe}`).digest('hex');
+      const attempted = typeof reportSender === 'function';
+      const claimedAt = now().toISOString();
+      try {
+        const state = loadStrict();
+        const prior = state.intraday_collection_alerts;
+        const known = prior && typeof prior === 'object' && !Array.isArray(prior) ? prior : {};
+        if (known[key]) continue;
+        const records = { ...known, [key]: {
+          key, kind, ...fields, attempted, succeeded: false, retry: false, claimed_at: claimedAt,
+        } };
+        const ordered = Object.keys(records).sort((left, right) => (
+          String(records[left].claimed_at).localeCompare(String(records[right].claimed_at))));
+        for (const stale of ordered.slice(0, Math.max(0, ordered.length - COLLECTION_GAP_ALERT_LIMIT))) delete records[stale];
+        latest = save({ ...state, intraday_collection_alerts: records });
+      } catch { return latest; }
+      let succeeded = false;
+      if (attempted) {
+        try {
+          const delivery = await reportSender({
+            targetChannelId: REPORT_TARGET_CHANNEL_ID, content,
+            deliveryLayer: 'hermes_ai_market_open_error', idempotencyKey: `kis-intraday-collection-gap:${key}`,
+          });
+          succeeded = delivery?.discord_sent === true;
+        } catch { succeeded = false; }
+      }
+      try {
+        const state = loadStrict();
+        const record = state.intraday_collection_alerts?.[key];
+        if (record?.claimed_at === claimedAt) {
+          latest = save({ ...state, intraday_collection_alerts: { ...state.intraday_collection_alerts,
+            [key]: { ...record, succeeded, completed_at: now().toISOString() } } });
+        }
+      } catch { /* The claim stays recorded; delivery is never retried. */ }
+    }
+    return latest;
+  }
   function tick() {
     if (schedulerStopping) return Promise.resolve(stateUnavailableStatus());
-    const promise = tickInternal();
+    const promise = tickInternal().then(notifyCollectionGap);
     activeTicks.add(promise);
     return promise.finally(() => {
       activeTicks.delete(promise);
