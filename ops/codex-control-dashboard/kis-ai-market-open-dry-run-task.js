@@ -78,12 +78,26 @@ const REPORT_TARGET_CHANNEL_ID = '1512691418605420634';
 const POLL_INTERVAL_MS = 60_000;
 const COLLECTION_SLOT_WINDOW_MS = 10 * 60_000;
 const COLLECTION_SLOT_LEDGER_LIMIT = 68;
+// Operator alert after this many consecutive intraday slots end FAILED or skipped without data.
+const COLLECTION_GAP_ALERT_STREAK = 2;
+const COLLECTION_GAP_ALERT_LIMIT = 30;
+// Normal no-op outcomes: they never count toward, and they end, a collection-gap streak.
+const NORMAL_COLLECTION_SKIP_REASONS = new Set(['market_closed', 'duplicate_slot', 'no_candidates']);
 const EXIT_ANALYSIS_LIMIT = COLLECTION_SLOT_LEDGER_LIMIT;
+const SAFETY_BLOCKED_DISPATCH_LEDGER_LIMIT = 100;
+const SAFETY_ROLE_KEYS = Object.freeze(['monitor_health', 'order_authority', 'readonly_dispatch_allowed', 'block_reason']);
 const EXIT_ANALYSIS_STATUSES = new Set(['RUNNING', 'READY', 'CONSUMED', 'BLOCKED', 'FAILED', 'CANCELLED', 'EXPIRED']);
 const EXEC_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const LLM_RESPONSE_TIMEOUT_MS = 120_000;
 const DECISION_CONTEXT_TIMEOUT_MS = 120_000;
+// Model v3 candidate refresh chained after post-close learning (vps-autonomous-order --action refresh-shadow).
+// It used to share EXEC_TIMEOUT_MS with learning. hermes-vm: 2026-10-02 took 163.5 s; 2026-10-08, after a
+// 3-trading-day backfill catch-up, was killed at the shared 5-minute limit (>= 300 s, predictions already
+// committed). The backfill always re-reads a 200-day window, so catch-up days add rows and outcome
+// reconciliation, not API calls. 15 min is >= 3x the worst observed run and keeps learning (<= 5 min) plus
+// refresh inside the 16:20-17:50 KST post-close window and the 16:30 report's late start (until 17:30 KST).
+const MODEL_V3_REFRESH_TIMEOUT_MS = 15 * 60_000;
 const LLM_MODEL_ID = 'gpt-5.6-terra';
 const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   contract_version: 'runtime_contract_v1',
@@ -183,7 +197,13 @@ const ERROR_POLICY = Object.freeze(Object.fromEntries([
   ['model_v3_artifact_load_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['model_v3_artifact_verify_failed', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
   ['scheduled_shadow_refresh_slot_invalid', { autoRepair: true, orderRecovery: true, postCloseRecovery: true }],
-  ['post_close_shadow_process_error', { autoRepair: true }],
+  // Post-close Model v3 candidate refresh failures after successful learning.
+  // Recoverable: the task stays ACTIVE with a degraded refresh record and an alert, the refresh runs again at
+  // the next post-close slot, and a legacy pause with this reason auto-resumes once safety is clear.
+  ['post_close_shadow_timeout', { postCloseRecovery: true }],
+  // Operator approval required: a non-timeout refresh crash pauses the task with an alert and isolated
+  // self-heal; only the existing resume-after-io-fix approval (fresh safety monitor) clears it.
+  ['post_close_shadow_process_error', { autoRepair: true, resumable: true }],
   ['safety_monitor_failed', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_unavailable', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
   ['open_order_status_active', { autoResume: true, resumable: true, safetyAwait: true, scope: 'order' }],
@@ -589,6 +609,27 @@ function isVpsDailyLossEntryBlock(result) {
     && result.open_order_status === 'clear'
     && result.reconciliation_status === 'clear'
     && result.account_risk_status === 'active';
+}
+
+// A disabled owner holds no order authority: only the read-only AI tasks may run, and only on a clean check.
+function isReadonlyOnlySafety(result) {
+  return result?.status === 'blocked'
+    && result.execution_owner === 'disabled'
+    && result.order_authority === 'none'
+    && result.monitor_health === 'ok'
+    && result.readonly_dispatch_allowed === true
+    && result.block_reason === 'none'
+    && result.process_lock === 'clear'
+    && result.kill_state === 'clear'
+    && result.reconciliation_status === 'clear';
+}
+
+function safetyBlockReason(result) {
+  if (typeof result?.block_reason === 'string' && result.block_reason && result.block_reason !== 'none') {
+    return sanitizeErrorClass(result.block_reason);
+  }
+  return sanitizeErrorClass(result?.error_class && result.error_class !== 'none'
+    ? result.error_class : 'safety_monitor_not_clear');
 }
 
 function processFailureEvidence(error, stderr) {
@@ -1964,6 +2005,7 @@ function buildIndependentShadowRefreshCommand() {
       '--approval', MODEL_V3_RESEARCH_APPROVAL,
     ],
     cwd: KIS_REPO,
+    timeoutMs: MODEL_V3_REFRESH_TIMEOUT_MS,
   };
 }
 
@@ -2026,13 +2068,25 @@ function parseSafetyMonitorOutput(stdout) {
   try { value = JSON.parse(raw); } catch { throw new Error('invalid_safety_output'); }
   const { broker_http_diagnostics: rawDiagnostics, ...safetyFields } = value || {};
   if (SECRET_LIKE_RE.test(JSON.stringify(safetyFields))) throw new Error('unsafe_safety_output');
-  const keys = ['task_id', 'status', 'action_type', 'execution_owner', 'process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status', 'order_api_calls', 'vps_live_orders', 'prod_orders', 'retry', 'catch_up', 'fail_closed', 'error_class'];
+  const baseKeys = ['task_id', 'status', 'action_type', 'execution_owner', 'process_lock', 'kill_state', 'open_order_status', 'reconciliation_status', 'account_risk_status', 'order_api_calls', 'vps_live_orders', 'prod_orders', 'retry', 'catch_up', 'fail_closed', 'error_class'];
+  // Role fields are optional as a group so older KIS output stays readable.
+  const roleFields = Boolean(value) && !Array.isArray(value) && typeof value === 'object'
+    && SAFETY_ROLE_KEYS.some((key) => Object.hasOwn(value, key));
+  const keys = roleFields ? [...baseKeys, ...SAFETY_ROLE_KEYS] : baseKeys;
   if (!value || Array.isArray(value) || typeof value !== 'object' || Object.keys(value).length !== keys.length + (Object.hasOwn(value, 'broker_http_diagnostics') ? 1 : 0)
     || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
     || Object.keys(value).some((key) => !keys.includes(key) && key !== 'broker_http_diagnostics')
     || value.task_id !== 'kis-vps-safety-monitor-v1' || !['success', 'blocked'].includes(value.status)
     || value.action_type !== 'safety_monitor' || !['clear', 'active', 'unknown'].includes(value.process_lock)
-    || !['vps', 'prod', 'unknown'].includes(value.execution_owner)
+    || !['vps', 'prod', 'disabled', 'unknown'].includes(value.execution_owner)
+    || (value.execution_owner === 'disabled' && value.status !== 'blocked')
+    || (roleFields && (!['ok', 'degraded', 'failed'].includes(value.monitor_health)
+      || value.order_authority !== (['vps', 'prod'].includes(value.execution_owner) ? value.execution_owner : 'none')
+      || typeof value.readonly_dispatch_allowed !== 'boolean'
+      || typeof value.block_reason !== 'string' || !value.block_reason || value.block_reason.length > 80
+      || value.readonly_dispatch_allowed !== (value.block_reason === 'none')
+      || (value.readonly_dispatch_allowed && value.monitor_health !== 'ok')
+      || (value.status === 'success' && !value.readonly_dispatch_allowed)))
     || !['clear', 'active', 'unknown'].includes(value.kill_state)
     || !['clear', 'active', 'unknown'].includes(value.open_order_status)
     || !['clear', 'active', 'unknown'].includes(value.reconciliation_status)
@@ -3594,7 +3648,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         : '운영자 확인 필요'}`,
     ].join('\n');
     let succeeded = false;
-    const queuedClaim = save({ ...(incidentClaim?.state || claim), last_self_heal: selfHeal });
+    // Reload after the await: the claim snapshot would overwrite writes made meanwhile (e.g. the slot ledger).
+    const queuedClaim = save({ ...loadStrict(), last_self_heal: selfHeal });
     if (attempted) {
       try {
         const delivery = await reportSender({
@@ -5460,9 +5515,16 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         if (parsed.status === 'blocked' || parsed.failClosed) {
           collectionFinalStatus = 'FAILED';
           collectionFailureReason = parsed.errorClass || 'collector_blocked';
+        } else if (parsed.transportDegraded) {
+          // A quote/auth/DB transport no-op stored no new data: record its error class, not a completion.
+          collectionFinalStatus = 'FAILED';
+          collectionFailureReason = parsed.errorClass || 'transport_degraded';
         } else if (parsed.actionType === 'market_closed_no_op') {
           collectionFinalStatus = 'SKIPPED';
           collectionFailureReason = 'market_closed';
+        } else if (parsed.actionType === 'no_candidates_no_op') {
+          collectionFinalStatus = 'SKIPPED';
+          collectionFailureReason = 'no_candidates';
         } else if (['idempotent_no_op', 'duplicate_slot'].includes(parsed.actionType)) {
           collectionFinalStatus = 'SKIPPED';
           collectionFailureReason = 'duplicate_slot';
@@ -5640,7 +5702,7 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           if (!POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(refreshBlocker)) {
             return pauseForTask(warningState, refreshBlocker, lastRun);
           }
-          const recordedRun = { ...lastRun, no_same_slot_retry: true };
+          const recordedRun = { ...lastRun, model_v3_candidate_refresh_degraded: true, no_same_slot_retry: true };
           const refreshedTask = warningState.tasks[taskId];
           const active = save({ ...warningState, tasks: { ...warningState.tasks, [taskId]: {
             ...refreshedTask,
@@ -5877,17 +5939,136 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       if (release) release();
     }
   }
+  // Every ACTIVE slot held back by the safety gate is recorded once. One alert per reason per KST day,
+  // held while the existing transient-safety confirmation window is open and skipped when the existing
+  // pause notification already reported the same reason today.
+  async function recordSafetyBlockedDispatches(state, blockReason, { orderOnly = false } = {}) {
+    const reason = sanitizeErrorClass(blockReason);
+    const recordedAt = now();
+    const blockedDue = (snapshot, task) => {
+      const item = snapshot.tasks?.[task.id];
+      return (!orderOnly || task.kind === 'order') && item?.state === 'ACTIVE' && Boolean(item.next_run_at)
+        && new Date(item.next_run_at).getTime() <= recordedAt.getTime();
+    };
+    if (state.state !== 'ACTIVE' || !TASKS.some((task) => blockedDue(state, task))) return state;
+    const withMonitor = (value) => (state.last_safety_monitor
+      ? { ...value, last_safety_monitor: state.last_safety_monitor } : value);
+    let release;
+    let saved;
+    let alert = null;
+    try {
+      release = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      const ledger = Array.isArray(latest.safety_blocked_dispatch_ledger) ? latest.safety_blocked_dispatch_ledger : [];
+      const entries = latest.state !== 'ACTIVE' ? [] : TASKS.filter((task) => blockedDue(latest, task))
+        .map((task) => ({
+          task_id: task.id,
+          due_key: dueKey(task, new Date(latest.tasks[task.id].next_run_at)),
+          block_reason: reason,
+          recorded_at: recordedAt.toISOString(),
+        }))
+        .filter((entry) => !ledger.some((prior) => prior.due_key === entry.due_key));
+      const kstDay = (value) => {
+        const date = new Date(value || '');
+        if (Number.isNaN(date.getTime())) return null;
+        const parts = seoulParts(date);
+        return `${parts.year}-${parts.month}-${parts.day}`;
+      };
+      const today = kstDay(recordedAt);
+      const alertKey = crypto.createHash('sha256')
+        .update(`safety_blocked_dispatch:${today}:${reason}`).digest('hex');
+      const unalerted = [...ledger, ...entries]
+        .filter((entry) => entry.block_reason === reason && kstDay(entry.recorded_at) === today);
+      const transientHold = TRANSIENT_SAFETY_MONITOR_ERRORS.has(reason)
+        && Number(latest.consecutive_safety_monitor_failures || 0)
+          < (reason === 'open_order_status_unavailable' ? OPEN_ORDER_STATUS_FAILURE_LIMIT : 2);
+      const pauseNotified = latest.last_error_notification?.error_class === reason
+        && kstDay(latest.last_error_notification.claimed_at) === today;
+      if (unalerted.length && latest.last_safety_block_alert?.key !== alertKey && !transientHold && !pauseNotified) {
+        alert = {
+          key: alertKey, block_reason: reason, task_ids: [...new Set(unalerted.map((entry) => entry.task_id))],
+          attempted: typeof reportSender === 'function', succeeded: false, retry: false,
+          claimed_at: recordedAt.toISOString(),
+        };
+      }
+      if (!entries.length && !alert) return withMonitor(latest);
+      saved = save({
+        ...latest,
+        safety_blocked_dispatch_ledger: [...ledger, ...entries].slice(-SAFETY_BLOCKED_DISPATCH_LEDGER_LIMIT),
+        ...(alert ? { last_safety_block_alert: alert } : {}),
+      });
+    } catch (error) {
+      if (error.message === 'scheduler_lock_active') return state;
+      throw error;
+    } finally { if (release) release(); }
+    if (!alert) return withMonitor(saved);
+    let succeeded = false;
+    if (alert.attempted) {
+      try {
+        const delivery = await reportSender({
+          targetChannelId: REPORT_TARGET_CHANNEL_ID,
+          content: [
+            '[KIS 자동운영 기능 제한]',
+            `작업: ${alert.task_ids.map((id) => TASK_ALERT_LABELS.get(id) || 'KIS 자동운영').join(', ')}`,
+            '상태: 안전 점검 차단으로 예정 실행 보류 (슬롯 기록됨)',
+            `원인: ${reason}`,
+            '자동 재시도: 없음',
+            '신규 주문: 중단',
+            '자동 복구: 매분 안전 점검 재확인, 해소되지 않으면 운영자 확인 필요',
+          ].join('\n'),
+          deliveryLayer: 'hermes_ai_market_open_error',
+          idempotencyKey: `kis-safety-blocked-dispatch:${alert.key}`,
+        });
+        succeeded = delivery?.discord_sent === true;
+      } catch { succeeded = false; }
+    }
+    let releaseAfter;
+    try {
+      releaseAfter = acquireExclusiveLock(runLockPath);
+      const latest = loadStrict();
+      if (latest.last_safety_block_alert?.key === alert.key) {
+        saved = save({ ...latest, last_safety_block_alert: {
+          ...latest.last_safety_block_alert, succeeded, completed_at: now().toISOString(),
+        } });
+      }
+    } catch { /* Alert bookkeeping never retries the alert or changes dispatch. */ }
+    finally { if (releaseAfter) releaseAfter(); }
+    return withMonitor(saved);
+  }
   async function runSafetyMonitor(current, checkedAt) {
     const last = current.last_safety_monitor;
     if (!safetyMonitorEnabled || sameMinute(last?.checked_at, checkedAt)) return current;
     const parts = seoulParts(checkedAt);
     const officialTradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+    let nonTradingDaySkip = null;
     try {
       const proof = calendarProofResolver(officialTradeDate);
       const orderTask = current.tasks[ORDER_TASK.id];
       if (proof.isTradingDay === false && orderTask?.state === 'ACTIVE'
         && !orderTask.pending_invocation && !blockingIncident(current)) return current;
+      if (proof.isTradingDay === false && orderTask?.state === 'DISABLED'
+        && !orderTask.pending_invocation && !blockingIncident(current)) {
+        nonTradingDaySkip = {
+          checked_at: checkedAt.toISOString(), action_type: 'safety_monitor', retry: false, catch_up: false,
+          status: 'skipped_non_trading_day', official_trade_date: officialTradeDate,
+          official_calendar_source_hash: safeText(proof.sourceHash, 80), order_task_state: 'DISABLED',
+          broker_api_calls: 0,
+        };
+      }
     } catch { /* Unknown calendar coverage must continue through the fail-closed monitor. */ }
+    if (nonTradingDaySkip) {
+      // A DISABLED order pilot has no live order path on an official non-trading day: record a skip, no broker reads.
+      let release;
+      try { release = acquireExclusiveLock(runLockPath); }
+      catch (error) { if (error.message !== 'scheduler_lock_active') throw error; return current; }
+      try {
+        const latest = loadStrict();
+        const latestOrder = latest.tasks[ORDER_TASK.id];
+        if (latestOrder?.state === 'DISABLED' && !latestOrder.pending_invocation && !blockingIncident(latest)) {
+          return save({ ...latest, last_safety_monitor: nonTradingDaySkip });
+        }
+      } finally { release(); }
+    }
     const monitorRun = {
       checked_at: checkedAt.toISOString(), monitor_started_at: now().toISOString(),
       action_type: 'safety_monitor', retry: false, catch_up: false,
@@ -5914,6 +6095,12 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
         account_risk_status: value.account_risk_status,
         error_class: safeText(value.error_class, 80),
         broker_http_diagnostics: value.broker_http_diagnostics,
+        ...(Object.hasOwn(value, 'monitor_health') ? {
+          monitor_health: value.monitor_health,
+          order_authority: value.order_authority,
+          readonly_dispatch_allowed: value.readonly_dispatch_allowed,
+          block_reason: safeText(value.block_reason, 80),
+        } : {}),
       });
       capture(result);
       if (result.status === 'blocked') {
@@ -5930,6 +6117,8 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
               emergency_execution_owner: safeText(emergency?.execution_owner || 'unknown', 16),
               emergency_positions_liquidated: Number(emergency?.positions_liquidated || 0),
               emergency_reconciliation_passed: emergency?.reconciliation_passed === true,
+              emergency_latch_persisted: emergency?.latch_persisted === true,
+              emergency_operator_action_required: emergency?.operator_action_required === true,
             });
             if (emergency?.status !== 'success' || emergency?.reconciliation_passed !== true) {
               throw new Error(`emergency_${sanitizeErrorClass(emergency?.error_class || 'stop_failed')}`);
@@ -6052,9 +6241,149 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
       });
     } finally { release(); }
   }
+  function resumeRecoverablePostCloseRefreshPause(current, checkedAt) {
+    // A post-close task paused only because its chained Model v3 refresh failed with a recoverable class
+    // (ERROR_POLICY postCloseRecovery) after successful learning is re-armed for its next due slot once this
+    // tick's safety result is clear. No same-slot retry, no catch-up, and the order task is never touched.
+    const postClose = current.tasks[POST_CLOSE_TASK.id];
+    const reason = postClose?.pause_reason;
+    const run = postClose?.last_run;
+    const safety = current.last_safety_monitor;
+    const safetyClear = sameMinute(safety?.checked_at, checkedAt)
+      && (safety.status === 'success'
+        || isReadonlyOnlySafety(safety)
+        || (safety.status === 'skipped_non_trading_day' && current.tasks[ORDER_TASK.id]?.state === 'DISABLED'));
+    if (current.state !== 'ACTIVE' || postClose?.state !== 'PAUSED'
+      || !POST_CLOSE_REFRESH_RECOVERY_PAUSE_REASONS.has(reason)
+      || sanitizeErrorClass(run?.model_v3_candidate_refresh_error_class) !== reason
+      || run?.status !== 'success' || run.action_type !== 'post_close_learning' || run.fail_closed !== false
+      || run.model_v3_candidate_refresh_status !== 'blocked' || run.model_v3_candidate_refresh_fail_closed !== true
+      || (postClose.pending_invocation ?? null) !== null
+      || !safetyClear || blockingIncident(current)) return current;
+    let release;
+    try { release = acquireExclusiveLock(runLockPath); }
+    catch (error) { if (error.message === 'scheduler_lock_active') return current; throw error; }
+    try {
+      const latest = loadStrict();
+      if (latest.state !== 'ACTIVE'
+        || JSON.stringify(latest.tasks[POST_CLOSE_TASK.id]) !== JSON.stringify(postClose)) return latest;
+      return save({ ...latest, tasks: { ...latest.tasks, [POST_CLOSE_TASK.id]: {
+        ...postClose,
+        state: 'ACTIVE',
+        pause_reason: undefined,
+        next_run_at: nextRunAt(POST_CLOSE_TASK, checkedAt),
+        consecutive_transport_failures: 0,
+        post_close_refresh_recovery: {
+          resumed_at: checkedAt.toISOString(),
+          resumed_by: 'hermes_safety_monitor',
+          pause_reason: reason,
+          safety_status: safety.status,
+          retry: false,
+          catch_up: false,
+        },
+      } } });
+    } finally { release(); }
+  }
+
+  // Alert-only: never changes task state, never dispatches or backfills slots.
+  async function notifyCollectionGap(result) {
+    if (schedulerFaulted || schedulerStopping || ticking || recoveringIncident || result?.scheduler_faulted) return result;
+    let current;
+    try { current = loadStrict(); } catch { return result; }
+    const parts = seoulParts(now());
+    const tradeDate = `${parts.year}-${parts.month}-${parts.day}`;
+    const minute = (Number(parts.hour) * 60) + Number(parts.minute);
+    const intraday = current.tasks[INTRADAY_SHADOW_TASK.id] || {};
+    const label = TASK_ALERT_LABELS.get(INTRADAY_SHADOW_TASK.id);
+    const alerts = [];
+    const windowEnd = INTRADAY_SHADOW_TASK.minutes[INTRADAY_SHADOW_TASK.minutes.length - 1]
+      + (COLLECTION_SLOT_WINDOW_MS / 60_000);
+    if (minute >= INTRADAY_SHADOW_TASK.minutes[0] && minute < windowEnd
+      && (current.state !== 'ACTIVE' || intraday.state !== 'ACTIVE')) {
+      const scope = current.state !== 'ACTIVE' ? 'scheduler' : 'intraday_task';
+      const holdState = safeText(scope === 'scheduler' ? current.state : intraday.state, 20);
+      const reason = sanitizeErrorClass((scope === 'scheduler' ? current.pause_reason : intraday.pause_reason)
+        || `${scope}_${holdState.toLowerCase()}`);
+      alerts.push({
+        kind: 'collection_not_dispatched', dedupe: `${tradeDate}:${scope}:${holdState}:${reason}`,
+        trade_date: tradeDate, scope, state: holdState, reason, due_keys: [],
+        content: [
+          '[KIS 장중 수집 공백]', `작업: ${label}`, `기준일: ${tradeDate} (정규 거래일)`,
+          `상태: ${scope === 'scheduler' ? '전체 자동운영' : label} ${holdState}, 장중 슬롯 미실행`,
+          `원인: ${reason}`, '과거 슬롯 보충: 없음', '자동 재시도: 없음', '조치: 운영자 확인 필요',
+        ].join('\n'),
+      });
+    }
+    const streak = [];
+    for (const entry of [...(intraday.collection_slot_ledger || [])].reverse()) {
+      // Today's slots only: a streak spanning days would move its dedupe key as the ledger is pruned.
+      if (String(entry.due_key).split(':')[1] !== tradeDate) break;
+      if (entry.status === 'RUNNING') continue;
+      if (entry.status === 'COMPLETED'
+        || (entry.status === 'SKIPPED' && NORMAL_COLLECTION_SKIP_REASONS.has(entry.skip_reason))) break;
+      streak.unshift(entry);
+    }
+    if (streak.length >= COLLECTION_GAP_ALERT_STREAK
+      && streak[streak.length - 1].due_key.split(':')[1] === tradeDate) {
+      const reason = [...new Set(streak.map((entry) => sanitizeErrorClass(
+        entry.failure_reason || entry.skip_reason || 'collector_failed')))].join(',');
+      const slotTime = (entry) => entry.due_key.split(':').slice(-2).join(':');
+      alerts.push({
+        kind: 'consecutive_slot_failures', dedupe: streak[0].due_key,
+        trade_date: tradeDate, reason, due_keys: streak.map((entry) => entry.due_key),
+        content: [
+          '[KIS 장중 수집 연속 실패]', `작업: ${label}`, `기준일: ${tradeDate}`,
+          `상태: 연속 ${streak.length}개 슬롯 실패 또는 미수집 (${slotTime(streak[0])}~${slotTime(streak[streak.length - 1])})`,
+          `원인: ${reason}`, '과거 슬롯 보충: 없음', '자동 재시도: 없음', '조치: 운영자 확인 필요',
+        ].join('\n'),
+      });
+    }
+    if (!alerts.length) return result;
+    try {
+      if (['Sat', 'Sun'].includes(parts.weekday) || calendarProofResolver(tradeDate)?.isTradingDay !== true) return result;
+    } catch { return result; }
+    let latest = result;
+    for (const { kind, dedupe, content, ...fields } of alerts) {
+      const key = crypto.createHash('sha256').update(`${kind}:${dedupe}`).digest('hex');
+      const attempted = typeof reportSender === 'function';
+      const claimedAt = now().toISOString();
+      try {
+        const state = loadStrict();
+        const prior = state.intraday_collection_alerts;
+        const known = prior && typeof prior === 'object' && !Array.isArray(prior) ? prior : {};
+        if (known[key]) continue;
+        const records = { ...known, [key]: {
+          key, kind, ...fields, attempted, succeeded: false, retry: false, claimed_at: claimedAt,
+        } };
+        const ordered = Object.keys(records).sort((left, right) => (
+          String(records[left].claimed_at).localeCompare(String(records[right].claimed_at))));
+        for (const stale of ordered.slice(0, Math.max(0, ordered.length - COLLECTION_GAP_ALERT_LIMIT))) delete records[stale];
+        latest = save({ ...state, intraday_collection_alerts: records });
+      } catch { return latest; }
+      let succeeded = false;
+      if (attempted) {
+        try {
+          const delivery = await reportSender({
+            targetChannelId: REPORT_TARGET_CHANNEL_ID, content,
+            deliveryLayer: 'hermes_ai_market_open_error', idempotencyKey: `kis-intraday-collection-gap:${key}`,
+          });
+          succeeded = delivery?.discord_sent === true;
+        } catch { succeeded = false; }
+      }
+      try {
+        const state = loadStrict();
+        const record = state.intraday_collection_alerts?.[key];
+        if (record?.claimed_at === claimedAt) {
+          latest = save({ ...state, intraday_collection_alerts: { ...state.intraday_collection_alerts,
+            [key]: { ...record, succeeded, completed_at: now().toISOString() } } });
+        }
+      } catch { /* The claim stays recorded; delivery is never retried. */ }
+    }
+    return latest;
+  }
   function tick() {
     if (schedulerStopping) return Promise.resolve(stateUnavailableStatus());
-    const promise = tickInternal();
+    const promise = tickInternal().then(notifyCollectionGap);
     activeTicks.add(promise);
     return promise.finally(() => {
       activeTicks.delete(promise);
@@ -6151,15 +6480,22 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
             fallbackSafetyMonitor: current.last_safety_monitor,
           });
         }
+        const readonlyOnly = safetyMonitorEnabled && isReadonlyOnlySafety(current.last_safety_monitor);
         if (safetyMonitorEnabled && current.last_safety_monitor?.status !== 'success'
-          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)) {
-          return finalizeExpiredCollectionSlots(now(), {
+          && !isVpsDailyLossEntryBlock(current.last_safety_monitor)
+          && !readonlyOnly
+          && !(current.last_safety_monitor?.status === 'skipped_non_trading_day'
+            && current.tasks[ORDER_TASK.id]?.state === 'DISABLED')) {
+          const blockedMonitor = current.last_safety_monitor;
+          current = finalizeExpiredCollectionSlots(now(), {
             dueFrom: collectionDueAt, skipReason: 'safety_blocked',
-            fallbackSafetyMonitor: current.last_safety_monitor,
+            fallbackSafetyMonitor: blockedMonitor,
           });
+          return await recordSafetyBlockedDispatches(current, safetyBlockReason(blockedMonitor));
         }
         current = failInterruptedCollectionSlots();
         current = finalizeExpiredCollectionSlots(now(), { dueFrom: collectionDueAt });
+        current = resumeRecoverablePostCloseRefreshPause(current, time);
         const orderTask = current.tasks[ORDER_TASK.id];
         const pendingSlot = orderTask?.next_run_at ? new Date(orderTask.next_run_at) : null;
         const safety = current.last_safety_monitor;
@@ -6188,15 +6524,20 @@ function createKisAiMarketOpenDryRunTask(options = {}) {
           return current;
         }
         const dispatchTime = now();
+        let orderSlotHeld = false;
         for (const task of TASKS) {
           const item = current.tasks[task.id];
           if (item?.state === 'ACTIVE' && item.next_run_at && new Date(item.next_run_at).getTime() <= dispatchTime.getTime()) {
+            if (readonlyOnly && task.kind === 'order') { orderSlotHeld = true; continue; }
             current = await runOnce({
               taskId: task.id, dueAt: now(),
               ...(task.id === INTRADAY_SHADOW_TASK.id ? { collectionDispatch: true } : {}),
             });
             if (current.state !== 'ACTIVE') break;
           }
+        }
+        if (orderSlotHeld && current.state === 'ACTIVE') {
+          current = await recordSafetyBlockedDispatches(current, 'order_authority_none', { orderOnly: true });
         }
       }
       if (current.state !== 'ACTIVE') {
@@ -6394,7 +6735,7 @@ module.exports = {
   ORDER_ATTESTATION_DIR,
   APPROVED_SOURCE_TASK_PATH,
   LEGACY_V1_STATE_PATH, LEGACY_V2_STATE_PATH, DEFAULT_RUN_LOCK_PATH, DEFAULT_SCHEDULER_OWNER_LOCK_PATH, REPORT_TARGET_CHANNEL_ID,
-  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, DECISION_CONTEXT_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
+  TIMEZONE, POLL_INTERVAL_MS, EXEC_TIMEOUT_MS, MODEL_V3_REFRESH_TIMEOUT_MS, MAX_BUFFER_BYTES, LLM_RESPONSE_TIMEOUT_MS, DECISION_CONTEXT_TIMEOUT_MS, LLM_MODEL_ID, MAX_AI_CANDIDATES,
   REQUIRED_RUNTIME_CONTRACT, ERROR_POLICY, loadRuntimeContract, TASKS,
   parseKisAiMarketOpenOutput, parseKisVpsAutonomousOutput, parseOrderPrecheckOutput, parseQuoteTransportDiagnosticOutput, loadOfficialCalendarProof,
   parseAiVerdict, parseDecisionContextOutput, parseSafetyMonitorOutput, buildSanitizedAiPacket,

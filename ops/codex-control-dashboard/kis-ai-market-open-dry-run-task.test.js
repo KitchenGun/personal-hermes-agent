@@ -9394,6 +9394,56 @@ test('failed automatic risk-off is not retried and records sanitized blocker', a
   assert.equal(state.tasks[mod.TASKS[4].id].activation_artifact_hash, null);
 });
 
+test('latch-only automatic risk-off keeps every task paused, alerts the operator once, and is not retried', async () => {
+  let emergencyCalls = 0;
+  const reports = [];
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', {
+      kill_state: 'active', error_class: 'kill_switch_liquidation_required',
+    }),
+    reportSender: async (message) => { reports.push(message); return { discord_sent: true }; },
+    emergencyStopExecutor: async ({ automaticRiskOff }) => {
+      emergencyCalls += 1;
+      assert.equal(automaticRiskOff, true);
+      return {
+        status: 'blocked', latch_persisted: true, operator_action_required: true,
+        execution_owner: 'disabled', open_buys_cancelled: 0, positions_liquidated: 0,
+        reconciliation_executed: false, reconciliation_passed: false, prod_order_count: 0,
+        error_class: 'emergency_stop_latch_only_no_order_authority',
+      };
+    },
+  });
+  reports.length = 0;
+  value.setClock('2026-07-21T00:01:00Z');
+  const state = await value.task.tick();
+  const reason = 'emergency_emergency_stop_latch_only_no_order_authority';
+  assert.equal(emergencyCalls, 1);
+  assert.equal(state.state, 'PAUSED');
+  assert.equal(state.pause_reason, reason);
+  for (const task of mod.TASKS) assert.notEqual(state.tasks[task.id].state, 'ACTIVE', task.id);
+  assert.equal(state.last_safety_monitor.status, 'blocked');
+  assert.equal(state.last_safety_monitor.error_class, reason);
+  assert.equal(reports.length, 1);
+  assert.match(reports[0].content, new RegExp(reason));
+  assert.match(reports[0].content, /운영자 확인 필요/);
+
+  value.setClock('2026-07-21T00:02:00Z');
+  const next = await value.task.tick();
+  value.setClock('2026-07-21T00:03:00Z');
+  const later = await value.task.tick();
+  assert.equal(emergencyCalls, 1);
+  assert.equal(reports.length, 1);
+  assert.equal(next.state, 'PAUSED');
+  assert.equal(later.state, 'PAUSED');
+  assert.equal(later.pause_reason, reason);
+
+  const monitor = state.last_safety_monitor;
+  assert.equal(monitor.emergency_execution_owner, 'disabled');
+  assert.equal(monitor.emergency_latch_persisted, true);
+  assert.equal(monitor.emergency_operator_action_required, true);
+});
+
 test('runtime contract is required for production construction and governs slot, quote, and position limits', () => {
   assert.throws(() => mod.loadRuntimeContract('/missing/runtime-contract.json'), /runtime_contract_unavailable/);
   assert.equal(mod.REQUIRED_RUNTIME_CONTRACT.slot_review_limit, 20);
@@ -10067,6 +10117,9 @@ test('scheduler tick adds recovery buttons to an already-notified reconciliation
       mod.TASKS[4].id, order.last_due_at, completedAt, 'order_not_fully_filled',
     ].join(':')).digest('hex'),
   };
+  // Intraday collection is current when the order pause is found (12:10 KST slot next), as in production.
+  // Left at the July fixture schedule, 09:10-12:00 would be unrecorded and now raises a collection-gap alert.
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-09-04T03:10:00.000Z';
   fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
   value.setClock('2026-09-04T03:11:00.000Z');
 
@@ -10753,4 +10806,942 @@ test('market-closed collector no-op is terminally skipped, not completed', async
   const slot = value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger.at(-1);
   assert.equal(slot.status, 'SKIPPED', JSON.stringify(slot));
   assert.equal(slot.skip_reason, 'market_closed');
+});
+
+function holdNonTradingDayFixtureSchedules(value, supervisorNextRunAt) {
+  const state = value.task.status();
+  for (const task of mod.TASKS) {
+    if (state.tasks[task.id].next_run_at) state.tasks[task.id].next_run_at = '2026-07-28T07:30:00.000Z';
+  }
+  state.tasks[mod.TASKS[0].id].next_run_at = supervisorNextRunAt;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  return state;
+}
+
+test('non-trading-day safety monitor skips broker reads while the order pilot is disabled', async (t) => {
+  let safetyCalls = 0;
+  const taskRuns = [];
+  const options = {
+    schedulerRegistered: true,
+    calendarProofResolver: (date) => calendarProof(!['2026-07-25', '2026-07-27'].includes(date)),
+    get safetyOutput() { safetyCalls += 1; return safetyOutput(); },
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      taskRuns.push(taskId);
+      callback(null, good(taskId, 'no_op', {
+        action_type: 'market_closed_no_op', official_session_state: 'closed', official_trade_date: '2026-07-27',
+      }));
+    },
+  };
+  const value = await active(options);
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  const before = holdNonTradingDayFixtureSchedules(value, '2026-07-27T00:00:00.000Z');
+  assert.equal(before.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  safetyCalls = 0;
+  taskRuns.length = 0;
+
+  value.setClock('2026-07-25T05:40:10Z');
+  const saturday = await value.task.tick();
+  assert.equal(safetyCalls, 0);
+  assert.equal(saturday.state, 'ACTIVE');
+  assert.equal(saturday.last_safety_monitor.status, 'skipped_non_trading_day');
+  assert.equal(saturday.last_safety_monitor.checked_at, '2026-07-25T05:40:10.000Z');
+  assert.equal(saturday.last_safety_monitor.official_trade_date, '2026-07-25');
+  assert.equal(saturday.last_safety_monitor.order_task_state, 'DISABLED');
+  assert.equal(saturday.last_safety_monitor.broker_api_calls, 0);
+  assert.equal(saturday.consecutive_safety_monitor_failures ?? 0, 0);
+  assert.equal(JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).last_safety_monitor.status,
+    'skipped_non_trading_day');
+
+  value.setClock('2026-07-25T05:41:10Z');
+  const refreshed = await value.task.tick();
+  assert.equal(safetyCalls, 0);
+  assert.equal(refreshed.last_safety_monitor.checked_at, '2026-07-25T05:41:10.000Z');
+  assert.deepEqual(taskRuns, []);
+
+  value.setClock('2026-07-27T00:00:10Z');
+  const holiday = await value.task.tick();
+  assert.equal(safetyCalls, 0);
+  assert.equal(holiday.last_safety_monitor.status, 'skipped_non_trading_day');
+  assert.equal(holiday.last_safety_monitor.official_trade_date, '2026-07-27');
+  assert.deepEqual(taskRuns, [mod.TASKS[0].id]);
+  assert.equal(holiday.state, 'ACTIVE');
+  assert.equal(holiday.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('non-trading-day safety monitor still runs when the calendar is unknown or the order pilot is not disabled', async (t) => {
+  let safetyCalls = 0;
+  let calendarKnown = false;
+  const options = {
+    schedulerRegistered: true,
+    calendarProofResolver: (date) => {
+      if (date === '2026-07-25' && !calendarKnown) throw new Error('official_calendar_proof_unavailable');
+      return calendarProof(date !== '2026-07-25');
+    },
+    get safetyOutput() { safetyCalls += 1; return safetyOutput(); },
+    execFile(command, args, execOptions, callback) {
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  };
+  const value = await active(options);
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  holdNonTradingDayFixtureSchedules(value, '2026-07-28T00:00:00.000Z');
+  safetyCalls = 0;
+
+  value.setClock('2026-07-25T05:40:10Z');
+  const unknownCalendar = await value.task.tick();
+  assert.ok(safetyCalls >= 1);
+  assert.equal(unknownCalendar.last_safety_monitor.status, 'success');
+  assert.equal(unknownCalendar.last_safety_monitor.checked_at, '2026-07-25T05:40:10.000Z');
+
+  calendarKnown = true;
+  const paused = value.task.status();
+  paused.tasks[mod.TASKS[4].id].state = 'PAUSED';
+  paused.tasks[mod.TASKS[4].id].pause_reason = 'process_error';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+  safetyCalls = 0;
+  value.setClock('2026-07-25T05:41:10Z');
+  const pausedPilot = await value.task.tick();
+  assert.ok(safetyCalls >= 1);
+  assert.equal(pausedPilot.last_safety_monitor.status, 'success');
+  assert.equal(pausedPilot.last_safety_monitor.checked_at, '2026-07-25T05:41:10.000Z');
+  assert.equal(pausedPilot.tasks[mod.TASKS[4].id].state, 'PAUSED');
+});
+
+const SAFETY_ROLE_KEYS = ['monitor_health', 'order_authority', 'readonly_dispatch_allowed', 'block_reason'];
+
+function disabledSafetyOutput(extra = {}) {
+  return safetyOutput('blocked', {
+    execution_owner: 'disabled', open_order_status: 'unknown', account_risk_status: 'unknown',
+    error_class: 'execution_owner_disabled', monitor_health: 'ok', order_authority: 'none',
+    readonly_dispatch_allowed: true, block_reason: 'none', ...extra,
+  });
+}
+
+function roleLessDisabledSafetyOutput() {
+  const value = JSON.parse(disabledSafetyOutput());
+  for (const key of SAFETY_ROLE_KEYS) delete value[key];
+  return JSON.stringify(value);
+}
+
+test('safety parser accepts a disabled owner only as a non-order state', () => {
+  const parsed = mod.parseSafetyMonitorOutput(disabledSafetyOutput());
+  assert.equal(parsed.execution_owner, 'disabled');
+  assert.equal(parsed.status, 'blocked');
+  assert.equal(parsed.order_authority, 'none');
+  assert.equal(parsed.monitor_health, 'ok');
+  assert.equal(parsed.readonly_dispatch_allowed, true);
+  assert.equal(parsed.block_reason, 'none');
+  assert.equal(mod.parseSafetyMonitorOutput(roleLessDisabledSafetyOutput()).execution_owner, 'disabled');
+  assert.equal(mod.parseSafetyMonitorOutput(safetyOutput('success', {
+    monitor_health: 'ok', order_authority: 'vps', readonly_dispatch_allowed: true, block_reason: 'none',
+  })).order_authority, 'vps');
+  for (const drift of [
+    { status: 'success', fail_closed: false, error_class: 'none', open_order_status: 'clear', account_risk_status: 'clear' },
+    { order_authority: 'vps' },
+    { order_authority: 'prod' },
+    { readonly_dispatch_allowed: true, block_reason: 'kill_state_active' },
+    { readonly_dispatch_allowed: false, block_reason: 'none' },
+    { monitor_health: 'failed' },
+    { monitor_health: 'unknown' },
+    { readonly_dispatch_allowed: 'true' },
+  ]) {
+    assert.throws(() => mod.parseSafetyMonitorOutput(disabledSafetyOutput(drift)), /invalid_safety_output/);
+  }
+  const partial = JSON.parse(disabledSafetyOutput());
+  delete partial.block_reason;
+  assert.throws(() => mod.parseSafetyMonitorOutput(JSON.stringify(partial)), /invalid_safety_output/);
+});
+
+test('disabled owner with a clean read-only safety result dispatches active read-only AI tasks', async (t) => {
+  const runs = [];
+  let llmCalls = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: disabledSafetyOutput(),
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    execFile(command, args, execOptions, callback) {
+      runs.push(args);
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  value.setClock('2026-07-21T00:10:00Z');
+  const state = await value.task.tick();
+  const dispatched = runs.map((args) => args[args.indexOf('--task-id') + 1]);
+  assert.equal(dispatched.includes(mod.TASKS[1].id), true);
+  assert.equal(runs.some((args) => args.includes('vps-autonomous-order')), false);
+  assert.equal(llmCalls, 0);
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.last_safety_monitor.execution_owner, 'disabled');
+  assert.equal(state.last_safety_monitor.order_authority, 'none');
+  assert.equal(state.last_safety_monitor.readonly_dispatch_allowed, true);
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  const slot = state.tasks[mod.TASKS[1].id].collection_slot_ledger
+    .find((entry) => entry.due_key === `${mod.TASKS[1].id}:2026-07-21:09:10`);
+  assert.notEqual(slot?.skip_reason, 'safety_blocked');
+});
+
+test('disabled owner never dispatches the order pilot even when it is marked active', async (t) => {
+  const runs = [];
+  const reports = [];
+  let llmCalls = 0;
+  let decisionContexts = 0;
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: disabledSafetyOutput(),
+    reportSender: async (message) => { reports.push(message); return { discord_sent: true }; },
+    llmExecutor: async () => { llmCalls += 1; throw new Error('must not run'); },
+    onDecisionContext: () => { decisionContexts += 1; },
+    execFile(command, args, execOptions, callback) {
+      runs.push(args);
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  markOrderActive(value);
+
+  value.setClock('2026-07-21T00:15:00Z');
+  const paused = await value.task.tick();
+  assert.equal(paused.tasks[mod.TASKS[4].id].state, 'PAUSED');
+  assert.equal(paused.tasks[mod.TASKS[4].id].pause_reason, 'execution_owner_disabled');
+
+  const edited = value.task.status();
+  edited.tasks[mod.TASKS[4].id].state = 'ACTIVE';
+  edited.tasks[mod.TASKS[4].id].pause_reason = undefined;
+  edited.tasks[mod.TASKS[4].id].next_run_at = '2026-07-21T00:15:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(edited));
+  value.setClock('2026-07-21T00:15:30Z');
+  const state = await value.task.tick();
+
+  assert.equal(runs.some((args) => args.includes('vps-autonomous-order')), false);
+  assert.equal(decisionContexts, 0);
+  assert.equal(llmCalls, 0);
+  assert.equal(state.tasks[mod.TASKS[4].id].promotion_preflight_trade_date, undefined);
+  assert.equal(state.tasks[mod.TASKS[4].id].pending_invocation, null);
+  const entry = (state.safety_blocked_dispatch_ledger || []).find((item) => item.task_id === mod.TASKS[4].id);
+  assert.equal(entry?.due_key, `${mod.TASKS[4].id}:2026-07-21:09:15`);
+  assert.equal(entry?.block_reason, 'order_authority_none');
+  assert.equal(reports.some((message) => message.content.includes('order_authority_none')), true);
+});
+
+for (const [label, output, reason] of [
+  ['unparseable', 'not-json', 'invalid_safety_output'],
+  ['role-less disabled-owner', roleLessDisabledSafetyOutput(), 'execution_owner_disabled'],
+  ['disabled-owner kill switch', disabledSafetyOutput({
+    kill_state: 'active', readonly_dispatch_allowed: false, block_reason: 'kill_state_active',
+  }), 'kill_state_active'],
+]) {
+  test(`${label} safety output records every blocked active slot and sends one deduplicated alert`, async (t) => {
+    const runs = [];
+    const reports = [];
+    const value = await active({
+      schedulerRegistered: true,
+      safetyOutput: output,
+      reportSender: async (message) => { reports.push(message); return { discord_sent: true }; },
+      execFile(command, args, execOptions, callback) {
+        runs.push(args);
+        callback(null, good(args[args.indexOf('--task-id') + 1]));
+      },
+    });
+    t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+    const slots = (state) => (state.safety_blocked_dispatch_ledger || [])
+      .map(({ task_id: taskId, due_key: key, block_reason: blockReason }) => [taskId, key, blockReason]);
+
+    value.setClock('2026-07-21T00:00:00Z');
+    let state = await value.task.tick();
+    assert.equal(runs.length, 0);
+    assert.deepEqual(slots(state), [[mod.TASKS[0].id, `${mod.TASKS[0].id}:2026-07-21:09:00`, reason]]);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].deliveryLayer, 'hermes_ai_market_open_error');
+    assert.match(reports[0].content, new RegExp(reason));
+
+    value.setClock('2026-07-21T00:01:00Z');
+    state = await value.task.tick();
+    assert.equal(slots(state).length, 1);
+    assert.equal(reports.length, 1);
+
+    value.setClock('2026-07-21T00:10:00Z');
+    state = await value.task.tick();
+    assert.deepEqual(slots(state), [
+      [mod.TASKS[0].id, `${mod.TASKS[0].id}:2026-07-21:09:00`, reason],
+      [mod.TASKS[1].id, `${mod.TASKS[1].id}:2026-07-21:09:10`, reason],
+    ]);
+    assert.equal(reports.length, 1);
+    assert.equal(runs.length, 0);
+    assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+    const persisted = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+    assert.equal(persisted.safety_blocked_dispatch_ledger.length, 2);
+    assert.equal(persisted.last_safety_block_alert.block_reason, reason);
+    assert.equal(persisted.last_safety_block_alert.succeeded, true);
+  });
+}
+
+test('persistent transient safety outage with the order pilot disabled records slots and alerts once after confirmation', async (t) => {
+  const runs = [];
+  const reports = [];
+  const value = await active({
+    schedulerRegistered: true,
+    safetyOutput: safetyOutput('blocked', { open_order_status: 'unknown', error_class: 'timeout' }),
+    reportSender: async (message) => { reports.push(message); return { discord_sent: true }; },
+    execFile(command, args, execOptions, callback) {
+      runs.push(args);
+      callback(null, good(args[args.indexOf('--task-id') + 1]));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  const slots = (state) => (state.safety_blocked_dispatch_ledger || [])
+    .map(({ task_id: taskId, due_key: key, block_reason: blockReason }) => [taskId, key, blockReason]);
+
+  value.setClock('2026-07-21T00:00:00Z');
+  let state = await value.task.tick();
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.deepEqual(slots(state), [[mod.TASKS[0].id, `${mod.TASKS[0].id}:2026-07-21:09:00`, 'timeout']]);
+  assert.equal(reports.length, 0);
+
+  value.setClock('2026-07-21T00:01:00Z');
+  state = await value.task.tick();
+  assert.equal(state.consecutive_safety_monitor_failures, 2);
+  assert.equal(slots(state).length, 1);
+  assert.equal(reports.length, 1);
+  assert.match(reports[0].content, /timeout/);
+
+  value.setClock('2026-07-21T00:10:00Z');
+  state = await value.task.tick();
+  assert.equal(slots(state).length, 2);
+  assert.equal(reports.length, 1);
+  assert.equal(runs.length, 0);
+});
+
+// WS3: post-close learning stays alive when the chained Model v3 candidate refresh fails.
+const WS3_CANDIDATE_COUNTS = Object.freeze({
+  analyzed: 0, observation_ready: 0, data_excluded: 0, model_unavailable: 0, risk_excluded: 0, llm_eligible: 0,
+});
+
+function ws3RefreshSuccess(tradeDate) {
+  return orderGood('success', {
+    action_type: 'shadow_refreshed', official_trade_date: tradeDate,
+    previous_artifact_hash: 'a'.repeat(64), artifact_hash: 'a'.repeat(64),
+    shadow_predictions_inserted: 34, intraday_candidate_counts: { ...WS3_CANDIDATE_COUNTS },
+  });
+}
+
+function ws3RefreshTimeoutError() {
+  // child_process.execFile marks a child it killed at its own `timeout` with killed=true.
+  return Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGTERM', code: null });
+}
+
+// Post-close task exactly as read from hermes-vm state on 2026-10-11 (EVIDENCE: paused since 2026-10-08).
+const WS3_VM_POST_CLOSE_TASK_20261011 = Object.freeze({
+  state: 'PAUSED',
+  schedule: 'weekdays 16:20 KST',
+  next_run_at: null,
+  last_due_at: 'kis-ai-post-close-learning-v1:2026-10-08:16:20',
+  last_run: {
+    invoked_by: 'hermes_scheduler',
+    started_at: '2026-10-08T07:20:03.907Z',
+    completed_at: '2026-10-08T07:26:58.552Z',
+    status: 'success',
+    fail_closed: false,
+    official_trade_date: '2026-10-08',
+    action_type: 'post_close_learning',
+    error_class: 'none',
+    calendar_refresh_summary: {
+      attempted_at: null, coverage_end: '2026-10-31', coverage_start: '2026-06-23', error_class: 'none',
+      remaining_days: 23, source: 'KRX_KIND_OFFICIAL',
+      source_hash: 'sha256:ef1432aed340d25452de495a47c96cc99450cc3300e6525db87d575b979abb06',
+      status: 'not_due', succeeded_at: null,
+    },
+    model_v3_candidate_refresh_status: 'blocked',
+    model_v3_candidate_refresh_action_type: 'paused',
+    model_v3_candidate_predictions_inserted: 0,
+    model_v3_candidate_duplicates_skipped: 0,
+    model_v3_candidate_refresh_fail_closed: true,
+    model_v3_candidate_refresh_error_class: 'post_close_shadow_timeout',
+    model_v3_candidate_artifact_hash: null,
+  },
+  consecutive_transport_failures: 0,
+  pending_invocation: null,
+  pause_reason: 'post_close_shadow_timeout',
+});
+
+function ws3WriteVmLikeState(value, postCloseTask = WS3_VM_POST_CLOSE_TASK_20261011) {
+  const state = value.task.status();
+  delete state.aggregate_state;
+  delete state.critical_task_pauses;
+  Object.assign(state, {
+    state: 'ACTIVE',
+    resumed_at: '2026-10-08T07:17:23.798Z',
+    resumed_by: 'hermes_cli',
+    resume_reason: 'io_fix_verified',
+    paused_at: '2026-09-11T03:58:56.324Z',
+    order_activated_at: '2026-10-02T04:21:07.636Z',
+    order_activated_by: 'hermes_cli',
+    consecutive_safety_monitor_failures: 0,
+    last_safety_monitor: {
+      checked_at: '2026-10-10T16:59:01.098Z', action_type: 'safety_monitor', retry: false, catch_up: false,
+      status: 'skipped_non_trading_day', official_trade_date: '2026-10-11',
+      official_calendar_source_hash: 'sha256:ef1432aed340d25452de495a47c96cc99450cc3300e6525db87d575b979abb06',
+      order_task_state: 'DISABLED', broker_api_calls: 0,
+    },
+    last_error_notification: {
+      key: '72e6fbd032373a24b7302f602fa635c688fab69656eb0402ba528596aba8ab14',
+      task_id: mod.TASKS[2].id, error_class: 'post_close_shadow_timeout', attempted: true, succeeded: true,
+      retry: false, claimed_at: '2026-10-08T07:26:58.973Z', completed_at: '2026-10-08T07:27:00.306Z',
+    },
+    last_self_heal: {
+      key: '72e6fbd032373a24b7302f602fa635c688fab69656eb0402ba528596aba8ab14',
+      attempted: false, queued: false, status: 'manual_review_required',
+    },
+    incidents: {
+      ['f'.repeat(64)]: {
+        incident_id: 'f'.repeat(64), task_id: mod.TASKS[4].id, error_class: 'account_risk_evidence_missing',
+        status: 'resolved', scope: 'verified_io_resume',
+      },
+    },
+  });
+  state.tasks[mod.TASKS[0].id].next_run_at = '2026-10-12T00:00:00.000Z';
+  state.tasks[mod.TASKS[1].id].next_run_at = '2026-10-12T00:10:00.000Z';
+  state.tasks[mod.TASKS[2].id] = JSON.parse(JSON.stringify(postCloseTask));
+  state.tasks[mod.TASKS[3].id].next_run_at = '2026-10-12T07:30:00.000Z';
+  Object.assign(state.tasks[mod.TASKS[4].id], {
+    state: 'DISABLED', pause_reason: undefined, next_run_at: null,
+    last_due_at: `${mod.TASKS[4].id}:2026-10-02:16:20`, pending_invocation: null,
+    refresh_only_pending: false, activation_artifact_hash: '4af51d32e588cfd37beacec6d830ce4b01ba18dbc94f0b059e5e608b8f9a0024',
+  });
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  return state;
+}
+
+function ws3VmCalendar(date) {
+  // KRX: 2026-10-09 Hangul Day holiday; 2026-10-10/11 weekend.
+  return calendarProof(!['2026-10-09', '2026-10-10', '2026-10-11'].includes(date));
+}
+
+test('ws3: post-close learning and the chained Model v3 refresh use separate time limits', async (t) => {
+  const limits = [];
+  const value = await active({
+    onIndependentShadowRefresh({ execOptions }) { limits.push(['model_v3_refresh', execOptions.timeout]); },
+    independentShadowRefreshOutput: ws3RefreshSuccess('2026-07-21'),
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      limits.push([taskId, execOptions.timeout]);
+      callback(null, good(taskId));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  limits.length = 0;
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+
+  assert.equal(mod.EXEC_TIMEOUT_MS, 5 * 60_000);
+  assert.equal(mod.MODEL_V3_REFRESH_TIMEOUT_MS, 15 * 60_000);
+  assert.equal(mod.buildIndependentShadowRefreshCommand().timeoutMs, mod.MODEL_V3_REFRESH_TIMEOUT_MS);
+  assert.deepEqual(limits, [
+    [mod.TASKS[2].id, mod.EXEC_TIMEOUT_MS],
+    ['model_v3_refresh', mod.MODEL_V3_REFRESH_TIMEOUT_MS],
+  ]);
+  assert.equal(after.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_status, 'success');
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('ws3: a Model v3 refresh timeout after successful learning records a degraded refresh instead of pausing', async (t) => {
+  const messages = [];
+  let refreshCalls = 0;
+  const options = {
+    independentShadowRefreshError: ws3RefreshTimeoutError(),
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+    reportSender: async (message) => { messages.push(message); return { discord_sent: true }; },
+  };
+  const value = await active(options);
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  const due = '2026-07-21T07:20:00.000Z';
+  const state = value.task.status();
+  state.tasks[mod.TASKS[2].id].next_run_at = due;
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+  value.setClock(due);
+
+  const after = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  const postClose = after.tasks[mod.TASKS[2].id];
+
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(postClose.state, 'ACTIVE');
+  assert.equal(postClose.pause_reason, undefined);
+  assert.equal(postClose.next_run_at, '2026-07-22T07:20:00.000Z');
+  assert.equal(postClose.last_run.status, 'success');
+  assert.equal(postClose.last_run.action_type, 'post_close_learning');
+  assert.equal(postClose.last_run.fail_closed, false);
+  assert.equal(postClose.last_run.model_v3_candidate_refresh_status, 'blocked');
+  assert.equal(postClose.last_run.model_v3_candidate_refresh_fail_closed, true);
+  assert.equal(postClose.last_run.model_v3_candidate_refresh_error_class, 'post_close_shadow_timeout');
+  assert.equal(postClose.last_run.model_v3_candidate_refresh_degraded, true);
+  assert.equal(postClose.last_run.no_same_slot_retry, true);
+  assert.equal(after.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(after.tasks[mod.TASKS[4].id].next_run_at, null);
+  assert.equal(after.last_error_notification.error_class, 'post_close_shadow_timeout');
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].content, /post_close_shadow_timeout/);
+  assert.equal(refreshCalls, 1);
+
+  // No same-slot retry: the consumed 16:20 slot does not run learning or the refresh again.
+  const repeated = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(due) });
+  assert.equal(refreshCalls, 1);
+  assert.equal(repeated.tasks[mod.TASKS[2].id].next_run_at, '2026-07-22T07:20:00.000Z');
+
+  // Bounded retry: the next post-close slot runs learning and the refresh exactly once more.
+  options.independentShadowRefreshError = null;
+  options.independentShadowRefreshOutput = ws3RefreshSuccess('2026-07-22');
+  const nextDue = '2026-07-22T07:20:00.000Z';
+  value.setClock(nextDue);
+  const nextDay = await value.task.runOnce({ taskId: mod.TASKS[2].id, dueAt: new Date(nextDue) });
+  assert.equal(refreshCalls, 2);
+  assert.equal(nextDay.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(nextDay.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_status, 'success');
+  assert.equal(nextDay.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_degraded, undefined);
+  assert.equal(nextDay.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('ws3: post-close refresh failure classes are explicitly recoverable or operator-approval-required', () => {
+  const timeout = mod.ERROR_POLICY.post_close_shadow_timeout;
+  assert.equal(timeout.postCloseRecovery, true);
+  assert.equal(timeout.autoRepair, false);
+  const processError = mod.ERROR_POLICY.post_close_shadow_process_error;
+  assert.equal(processError.postCloseRecovery, undefined);
+  assert.equal(processError.autoRepair, true);
+  assert.equal(processError.resumable, true);
+  for (const policy of [timeout, processError]) {
+    assert.equal(policy.autoResume, false);
+    assert.equal(policy.orderRecovery, undefined);
+    assert.equal(policy.scope, 'task');
+  }
+});
+
+test('ws3: the VM post-close task paused for post_close_shadow_timeout auto-resumes on its next due slot when safety is ok', async (t) => {
+  let safetyCalls = 0;
+  let refreshCalls = 0;
+  const taskRuns = [];
+  const value = await active({
+    schedulerRegistered: true,
+    calendarProofResolver: ws3VmCalendar,
+    get safetyOutput() { safetyCalls += 1; return safetyOutput(); },
+    onIndependentShadowRefresh() { refreshCalls += 1; },
+    independentShadowRefreshOutput: ws3RefreshSuccess('2026-10-12'),
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      taskRuns.push(taskId);
+      callback(null, good(taskId, 'success', { official_trade_date: '2026-10-12' }));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  ws3WriteVmLikeState(value);
+  safetyCalls = 0;
+
+  // First scheduler tick after deployment (Sunday): no broker reads, no dispatch, task re-armed.
+  value.setClock('2026-10-11T01:00:00Z');
+  const resumed = await value.task.tick();
+  const postClose = resumed.tasks[mod.TASKS[2].id];
+  assert.equal(resumed.state, 'ACTIVE');
+  assert.equal(resumed.last_safety_monitor.status, 'skipped_non_trading_day');
+  assert.equal(safetyCalls, 0);
+  assert.equal(postClose.state, 'ACTIVE');
+  assert.equal(postClose.pause_reason, undefined);
+  assert.equal(postClose.next_run_at, '2026-10-12T07:20:00.000Z');
+  assert.equal(postClose.last_run.model_v3_candidate_refresh_error_class, 'post_close_shadow_timeout');
+  assert.equal(postClose.post_close_refresh_recovery.pause_reason, 'post_close_shadow_timeout');
+  assert.equal(postClose.post_close_refresh_recovery.resumed_at, '2026-10-11T01:00:00.000Z');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].next_run_at, null);
+  assert.deepEqual(taskRuns, []);
+  assert.equal(refreshCalls, 0);
+  assert.equal(JSON.parse(fs.readFileSync(value.paths.legacyV1StatePath, 'utf8')).state, 'PAUSED');
+  assert.equal(JSON.parse(fs.readFileSync(value.paths.legacyV2StatePath, 'utf8')).state, 'PAUSED');
+
+  // Its next due slot (Monday 16:20 KST) runs learning and the bounded refresh once.
+  const hold = value.task.status();
+  hold.tasks[mod.TASKS[0].id].next_run_at = '2026-10-13T00:00:00.000Z';
+  hold.tasks[mod.TASKS[1].id].next_run_at = '2026-10-13T00:10:00.000Z';
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(hold));
+  value.setClock('2026-10-12T07:20:05Z');
+  const ran = await value.task.tick();
+  assert.equal(ran.last_safety_monitor.status, 'success');
+  assert.deepEqual(taskRuns, [mod.TASKS[2].id]);
+  assert.equal(refreshCalls, 1);
+  assert.equal(ran.state, 'ACTIVE');
+  assert.equal(ran.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(ran.tasks[mod.TASKS[2].id].last_due_at, `${mod.TASKS[2].id}:2026-10-12:16:20`);
+  assert.equal(ran.tasks[mod.TASKS[2].id].next_run_at, '2026-10-13T07:20:00.000Z');
+  assert.equal(ran.tasks[mod.TASKS[2].id].last_run.model_v3_candidate_refresh_status, 'success');
+  assert.equal(ran.tasks[mod.TASKS[4].id].state, 'DISABLED');
+});
+
+test('ws3: post-close refresh pauses stay paused without clear safety, matching evidence, or a recoverable class', async (t) => {
+  const vmTask = WS3_VM_POST_CLOSE_TASK_20261011;
+  const cases = [
+    { name: 'safety_blocked', clock: '2026-10-12T01:00:00Z', safety: safetyOutput('blocked'), task: vmTask },
+    { name: 'operator_class', clock: '2026-10-11T01:00:00Z', task: {
+      ...vmTask, pause_reason: 'post_close_shadow_process_error',
+      last_run: { ...vmTask.last_run, model_v3_candidate_refresh_error_class: 'post_close_shadow_process_error' },
+    } },
+    { name: 'invalid_refresh_output', clock: '2026-10-11T01:00:00Z', task: {
+      ...vmTask, pause_reason: 'invalid_independent_shadow_refresh',
+      last_run: { ...vmTask.last_run, model_v3_candidate_refresh_error_class: 'invalid_independent_shadow_refresh' },
+    } },
+    { name: 'learning_not_successful', clock: '2026-10-11T01:00:00Z', task: {
+      ...vmTask, last_run: { ...vmTask.last_run, status: 'blocked', fail_closed: true },
+    } },
+    { name: 'reason_mismatch', clock: '2026-10-11T01:00:00Z', task: {
+      ...vmTask, last_run: { ...vmTask.last_run, model_v3_candidate_refresh_error_class: 'model_v3_shadow_failed' },
+    } },
+  ];
+  for (const item of cases) {
+    const taskRuns = [];
+    const value = await active({
+      schedulerRegistered: true,
+      calendarProofResolver: ws3VmCalendar,
+      safetyOutput: item.safety || safetyOutput(),
+      execFile(command, args, execOptions, callback) {
+        const taskId = args[args.indexOf('--task-id') + 1];
+        taskRuns.push(taskId);
+        callback(null, good(taskId));
+      },
+    });
+    t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+    ws3WriteVmLikeState(value, item.task);
+    if (item.name === 'safety_blocked') {
+      const hold = value.task.status();
+      for (const task of mod.TASKS.slice(0, 4)) {
+        if (hold.tasks[task.id].next_run_at) hold.tasks[task.id].next_run_at = '2026-10-13T00:00:00.000Z';
+      }
+      fs.writeFileSync(value.paths.statePath, JSON.stringify(hold));
+    }
+    value.setClock(item.clock);
+
+    const after = await value.task.tick();
+
+    assert.equal(after.tasks[mod.TASKS[2].id].state, 'PAUSED', item.name);
+    assert.equal(after.tasks[mod.TASKS[2].id].pause_reason, item.task.pause_reason, item.name);
+    assert.equal(after.tasks[mod.TASKS[2].id].next_run_at, null, item.name);
+    assert.equal(after.tasks[mod.TASKS[2].id].post_close_refresh_recovery, undefined, item.name);
+    assert.equal(after.tasks[mod.TASKS[4].id].state, 'DISABLED', item.name);
+    assert.deepEqual(taskRuns, [], item.name);
+  }
+});
+
+test('ws3: an operator-approved IO resume clears a post-close refresh process-error pause without enabling orders', async (t) => {
+  const value = await active({ calendarProofResolver: ws3VmCalendar });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  ws3WriteVmLikeState(value, {
+    ...WS3_VM_POST_CLOSE_TASK_20261011,
+    pause_reason: 'post_close_shadow_process_error',
+    last_run: {
+      ...WS3_VM_POST_CLOSE_TASK_20261011.last_run,
+      model_v3_candidate_refresh_error_class: 'post_close_shadow_process_error',
+    },
+  });
+  value.setClock('2026-10-11T01:00:00Z');
+
+  const state = await value.task.resumeAfterIoFix({ approval: mod.RESUME_AFTER_IO_FIX_APPROVAL });
+
+  assert.equal(state.state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[2].id].state, 'ACTIVE');
+  assert.equal(state.tasks[mod.TASKS[2].id].next_run_at, '2026-10-12T07:20:00.000Z');
+  assert.equal(state.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.equal(state.tasks[mod.TASKS[4].id].next_run_at, null);
+});
+
+function collectionGapAlerts(sent) {
+  return sent.filter((message) => /^\[KIS 장중 수집/.test(message.content));
+}
+
+function intradayLedger(value) {
+  return value.task.status().tasks[mod.TASKS[1].id].collection_slot_ledger;
+}
+
+function collectionAlertRecords(value) {
+  return Object.values(JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8')).intraday_collection_alerts || {});
+}
+
+test('trading-day global pause inside the intraday window sends one collection-gap alert per trading day', async (t) => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    calendarProofResolver: (date) => calendarProof(date !== '2026-07-22'),
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  // A pause carried over from an earlier day (as on 2026-10-05..08): nothing is due, so no slot is dispatched.
+  const paused = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  paused.state = 'PAUSED';
+  paused.pause_reason = 'scheduler_lock_stale';
+  for (const task of mod.TASKS) {
+    paused.tasks[task.id] = {
+      ...paused.tasks[task.id], state: 'PAUSED', next_run_at: null,
+      pause_reason: task.id === mod.TASKS[0].id ? 'scheduler_lock_stale' : 'peer_task_fail_closed',
+    };
+  }
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(paused));
+
+  value.setClock('2026-07-21T00:05:00Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 0);
+
+  for (const at of ['2026-07-21T00:15:00Z', '2026-07-21T02:15:00Z', '2026-07-21T06:00:00Z']) {
+    value.setClock(at);
+    await value.task.tick();
+  }
+  assert.equal(collectionGapAlerts(sent).length, 1);
+  assert.match(collectionGapAlerts(sent)[0].content, /scheduler_lock_stale/);
+  assert.match(collectionGapAlerts(sent)[0].content, /2026-07-21/);
+  assert.equal(collectionGapAlerts(sent)[0].deliveryLayer, 'hermes_ai_market_open_error');
+  const records = collectionAlertRecords(value);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].kind, 'collection_not_dispatched');
+  assert.equal(records[0].trade_date, '2026-07-21');
+  assert.equal(records[0].reason, 'scheduler_lock_stale');
+  assert.equal(records[0].succeeded, true);
+  const after = value.task.status();
+  assert.equal(after.state, 'PAUSED');
+  assert.equal(after.pause_reason, 'scheduler_lock_stale');
+  assert.deepEqual(after.tasks[mod.TASKS[1].id].collection_slot_ledger, []);
+
+  value.setClock('2026-07-22T00:15:00Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 1);
+  value.setClock('2026-07-23T00:15:00Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 2);
+  assert.match(collectionGapAlerts(sent)[1].content, /2026-07-23/);
+});
+
+test('a paused intraday task under an active scheduler sends one collection-gap alert in the window', async (t) => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  const state = JSON.parse(fs.readFileSync(value.paths.statePath, 'utf8'));
+  state.tasks[mod.TASKS[1].id] = {
+    ...state.tasks[mod.TASKS[1].id], state: 'PAUSED', pause_reason: 'runtime_unhandled_error', next_run_at: null,
+  };
+  fs.writeFileSync(value.paths.statePath, JSON.stringify(state));
+
+  for (const at of ['2026-07-21T00:15:00Z', '2026-07-21T00:25:00Z']) {
+    value.setClock(at);
+    await value.task.tick();
+  }
+  assert.equal(collectionGapAlerts(sent).length, 1);
+  assert.match(collectionGapAlerts(sent)[0].content, /runtime_unhandled_error/);
+  const after = value.task.status();
+  assert.equal(after.state, 'ACTIVE');
+  assert.equal(after.tasks[mod.TASKS[1].id].state, 'PAUSED');
+});
+
+test('two consecutive failed intraday slots send one collection-gap alert with the reason', async (t) => {
+  const sent = [];
+  let mode = 'timeout';
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      if (taskId === mod.TASKS[1].id && mode === 'timeout') {
+        callback(Object.assign(new Error('timeout'), { killed: true, code: null }), '');
+        return;
+      }
+      callback(null, taskId === mod.TASKS[1].id ? good(taskId, 'success', {
+        intraday_mode: 'ml_champion', intraday_model_version: `intraday_ml_logistic_${'a'.repeat(12)}`,
+        intraday_candidate_counts: {
+          analyzed: 5, observation_ready: 5, data_excluded: 0, model_unavailable: 0, risk_excluded: 2, llm_eligible: 3,
+        },
+      }) : good(taskId));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  value.setClock('2026-07-21T00:10:30Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 0);
+  value.setClock('2026-07-21T00:20:30Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 1);
+  assert.match(collectionGapAlerts(sent)[0].content, /timeout/);
+  value.setClock('2026-07-21T00:30:30Z');
+  await value.task.tick();
+  assert.equal(collectionGapAlerts(sent).length, 1);
+  assert.deepEqual(intradayLedger(value).map((entry) => [entry.status, entry.failure_reason]),
+    [['FAILED', 'timeout'], ['FAILED', 'timeout'], ['FAILED', 'timeout']]);
+  const records = collectionAlertRecords(value);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].kind, 'consecutive_slot_failures');
+  assert.equal(records[0].reason, 'timeout');
+  assert.deepEqual(records[0].due_keys, [
+    `${mod.TASKS[1].id}:2026-07-21:09:10`, `${mod.TASKS[1].id}:2026-07-21:09:20`,
+  ]);
+
+  mode = 'success';
+  value.setClock('2026-07-21T00:40:30Z');
+  await value.task.tick();
+  assert.equal(intradayLedger(value).at(-1).status, 'COMPLETED');
+  mode = 'timeout';
+  for (const at of ['2026-07-21T00:50:30Z', '2026-07-21T01:00:30Z']) {
+    value.setClock(at);
+    await value.task.tick();
+  }
+  assert.equal(collectionGapAlerts(sent).length, 2);
+});
+
+test('no-candidate intraday slots are normal no-ops while transport-degraded slots are recorded as failed', async (t) => {
+  const sent = [];
+  let mode = 'no_candidates';
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      if (taskId !== mod.TASKS[1].id) { callback(null, good(taskId)); return; }
+      if (mode === 'no_candidates') {
+        callback(null, good(taskId, 'no_op', { action_type: 'no_candidates_no_op' }));
+        return;
+      }
+      callback(null, good(taskId, 'no_op', {
+        action_type: 'transport_degraded_no_op', error_class: 'connection_failed', transport_degraded: true,
+        api_calls: 1, quote_api_calls: 1, failure_phase: 'quote_request', failure_symbol: '005930',
+        failure_exception_type: 'ConnectionRefusedError', failure_errno: null, failure_attempt_number: 1,
+      }));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  for (const at of ['2026-07-21T00:10:30Z', '2026-07-21T00:20:30Z', '2026-07-21T00:30:30Z']) {
+    value.setClock(at);
+    await value.task.tick();
+  }
+  assert.deepEqual(intradayLedger(value).map((entry) => [entry.status, entry.skip_reason, entry.failure_reason]),
+    [['SKIPPED', 'no_candidates', null], ['SKIPPED', 'no_candidates', null], ['SKIPPED', 'no_candidates', null]]);
+  assert.equal(sent.length, 0);
+  assert.equal(collectionAlertRecords(value).length, 0);
+  assert.equal(value.task.status().tasks[mod.TASKS[1].id].state, 'ACTIVE');
+
+  mode = 'degraded';
+  value.setClock('2026-07-21T00:40:30Z');
+  await value.task.tick();
+  const last = intradayLedger(value).at(-1);
+  assert.equal(last.status, 'FAILED');
+  assert.equal(last.failure_reason, 'connection_failed');
+  assert.equal(collectionGapAlerts(sent).length, 0);
+});
+
+test('a task-pausing intraday failure keeps its own reason in the collection ledger', async (t) => {
+  const sent = [];
+  const value = await active({
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      if (taskId === mod.TASKS[1].id) {
+        callback(Object.assign(new Error('blocked'), { code: 2 }),
+          good(taskId, 'blocked', { error_class: 'quote_api_budget_exceeded' }));
+        return;
+      }
+      callback(null, good(taskId));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+
+  value.setClock('2026-07-21T00:10:30Z');
+  await value.task.tick();
+  let state = value.task.status();
+  assert.equal(state.tasks[mod.TASKS[1].id].state, 'PAUSED');
+  assert.equal(state.tasks[mod.TASKS[1].id].pause_reason, 'quote_api_budget_exceeded');
+  assert.equal(sent.filter((message) => /^\[KIS 자동운영 기능 제한\]/.test(message.content)).length, 1);
+  assert.deepEqual(intradayLedger(value).map((entry) => [entry.status, entry.failure_reason]),
+    [['FAILED', 'quote_api_budget_exceeded']]);
+
+  value.setClock('2026-07-21T00:11:30Z');
+  await value.task.tick();
+  assert.deepEqual(intradayLedger(value).map((entry) => [entry.status, entry.failure_reason]),
+    [['FAILED', 'quote_api_budget_exceeded']]);
+});
+
+async function consecutiveFailureAlertsPerDay(options, dates) {
+  const sent = [];
+  const value = await active({
+    ...options,
+    reportSender: async (message) => { sent.push(message); return { discord_sent: true }; },
+  });
+  try {
+    options.afterActivate?.();
+    for (const date of dates) {
+      for (const minute of mod.TASKS[1].minutes) {
+        const utc = minute - 540;
+        value.setClock(`${date}T${String(Math.floor(utc / 60)).padStart(2, '0')}:${String(utc % 60).padStart(2, '0')}:30Z`);
+        await value.task.tick();
+      }
+    }
+    const alerts = sent.filter((message) => /^\[KIS 장중 수집 연속 실패\]/.test(message.content));
+    return Object.fromEntries(dates.map((date) => [
+      date, alerts.filter((message) => message.content.includes(`기준일: ${date}`)).length,
+    ]));
+  } finally {
+    fs.rmSync(value.root, { recursive: true, force: true });
+  }
+}
+
+const GAP_ALERT_DATES = ['2026-07-21', '2026-07-22', '2026-07-23'];
+const ONE_GAP_ALERT_PER_DAY = Object.fromEntries(GAP_ALERT_DATES.map((date) => [date, 1]));
+
+test('persistent intraday slot timeouts across trading days send one consecutive-failure alert per trading day', async () => {
+  // The ledger keeps two days of slots, so a streak spanning days would keep moving its oldest key.
+  assert.deepEqual(await consecutiveFailureAlertsPerDay({
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      if (taskId === mod.TASKS[1].id) {
+        callback(Object.assign(new Error('timeout'), { killed: true, code: null }), '');
+        return;
+      }
+      callback(null, good(taskId));
+    },
+  }, GAP_ALERT_DATES), ONE_GAP_ALERT_PER_DAY);
+});
+
+test('a persistently invalid safety monitor across trading days sends one consecutive-failure alert per trading day', async () => {
+  // execution_owner 'disabled' fails the safety-output parser, so every slot is skipped as safety_blocked.
+  let owner = 'vps';
+  assert.deepEqual(await consecutiveFailureAlertsPerDay({
+    schedulerRegistered: true,
+    safetyOutput: () => safetyOutput('success', { execution_owner: owner }),
+    afterActivate() { owner = 'disabled'; },
+  }, GAP_ALERT_DATES), ONE_GAP_ALERT_PER_DAY);
+});
+
+
+test('integration: a disabled-owner read-only safety result also re-arms the paused post-close task on a trading day', async (t) => {
+  const taskRuns = [];
+  const value = await active({
+    schedulerRegistered: true,
+    calendarProofResolver: ws3VmCalendar,
+    safetyOutput: disabledSafetyOutput(),
+    independentShadowRefreshOutput: ws3RefreshSuccess('2026-10-12'),
+    execFile(command, args, execOptions, callback) {
+      const taskId = args[args.indexOf('--task-id') + 1];
+      taskRuns.push(taskId);
+      callback(null, good(taskId, 'success', { official_trade_date: '2026-10-12' }));
+    },
+  });
+  t.after(() => fs.rmSync(value.root, { recursive: true, force: true }));
+  ws3WriteVmLikeState(value);
+
+  // Monday 10:05 KST, owner disabled: the read-only safety gate is clear, so the post-close pause is re-armed.
+  value.setClock('2026-10-12T01:05:00Z');
+  const resumed = await value.task.tick();
+  const postClose = resumed.tasks[mod.TASKS[2].id];
+  assert.equal(resumed.last_safety_monitor.execution_owner, 'disabled');
+  assert.equal(resumed.last_safety_monitor.readonly_dispatch_allowed, true);
+  assert.equal(postClose.state, 'ACTIVE');
+  assert.equal(postClose.next_run_at, '2026-10-12T07:20:00.000Z');
+  assert.equal(postClose.post_close_refresh_recovery.pause_reason, 'post_close_shadow_timeout');
+  assert.equal(resumed.tasks[mod.TASKS[4].id].state, 'DISABLED');
+  assert.ok(!taskRuns.includes(mod.TASKS[4].id));
 });
